@@ -2395,6 +2395,18 @@ impl eframe::App for PacketlyApp {
     }
 }
 
+/// Window/taskbar icon, embedded at compile time so every build (GNU or MSVC)
+/// shows the Packetly mark instead of egui's default.
+fn app_icon() -> std::sync::Arc<egui::IconData> {
+    const PNG: &[u8] = include_bytes!("../../assets/packetly.png");
+    let img = image::load_from_memory(PNG).expect("embedded packetly.png").to_rgba8();
+    std::sync::Arc::new(egui::IconData {
+        width: img.width(),
+        height: img.height(),
+        rgba: img.into_raw(),
+    })
+}
+
 fn main() -> eframe::Result {
     let guard = std::net::TcpListener::bind("127.0.0.1:8913");
     if guard.is_err() {
@@ -2540,7 +2552,8 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1240.0, 820.0])
             .with_min_inner_size([940.0, 640.0])
-            .with_title("Packetly"),
+            .with_title("Packetly")
+            .with_icon(app_icon()),
         ..Default::default()
     };
 
