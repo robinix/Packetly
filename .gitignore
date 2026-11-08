@@ -1,0 +1,23 @@
+# build outputs
+gwlite/src/GWLite/bin/
+gwlite/src/GWLite/obj/
+gwlite-ui/target/
+
+# runtime data (stays on the machine, never published)
+*.db
+*.db-shm
+*.db-wal
+service.log
+ui-prefs.txt
+ui-theme.txt
+
+# workspace-only working docs & artifacts (not part of the published project)
+PROJECT-STATUS.md
+glasswire-architecture-report.md
+tools/
+*.png
+*.bak
+
+# dotnet/rust noise
+*.user
+*.suo

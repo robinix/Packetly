@@ -1,0 +1,50 @@
+name: Release
+
+# Builds Windows binaries and attaches an install-ready zip to the GitHub
+# Release whenever a v* tag is pushed. Publish an update: bump the version,
+# commit, tag (e.g. v1.0.1), push the tag - this workflow does the rest.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build collector
+        run: dotnet build gwlite/src/GWLite -c Release
+
+      - name: Build UI
+        run: cargo build --release --manifest-path gwlite-ui/Cargo.toml
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $stage = "GWLite"
+          New-Item -ItemType Directory -Path "$stage/scripts" -Force | Out-Null
+          Copy-Item gwlite/src/GWLite/bin/Release/net8.0-windows/gwlite.exe $stage/
+          Copy-Item gwlite-ui/target/release/gwlite-ui.exe $stage/
+          Copy-Item assets/gwlite.ico $stage/
+          Copy-Item scripts/install.ps1 $stage/scripts/
+          Copy-Item INSTALL.txt $stage/
+          Compress-Archive -Path $stage -DestinationPath "GWLite-$tag-win-x64.zip"
+          Get-Item "GWLite-$tag-win-x64.zip" | Select-Object Name, Length
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: GWLite-*-win-x64.zip
+          generate_release_notes: true
