@@ -1,7 +1,7 @@
 # build outputs
-gwlite/src/GWLite/bin/
-gwlite/src/GWLite/obj/
-gwlite-ui/target/
+packetly/src/Packetly/bin/
+packetly/src/Packetly/obj/
+packetly-ui/target/
 
 # runtime data (stays on the machine, never published)
 *.db
@@ -15,6 +15,7 @@ ui-theme.txt
 PROJECT-STATUS.md
 glasswire-architecture-report.md
 tools/
+packtest/
 *.png
 *.bak
 

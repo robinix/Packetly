@@ -24,27 +24,28 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Build collector
-        run: dotnet build gwlite/src/GWLite -c Release
+        run: dotnet publish packetly/src/Packetly -c Release
 
       - name: Build UI
-        run: cargo build --release --manifest-path gwlite-ui/Cargo.toml
+        run: cargo build --release --manifest-path packetly-ui/Cargo.toml
 
       - name: Package
         shell: pwsh
         run: |
           $tag = "${{ github.ref_name }}"
-          $stage = "GWLite"
+          $stage = "Packetly"
           New-Item -ItemType Directory -Path "$stage/scripts" -Force | Out-Null
-          Copy-Item gwlite/src/GWLite/bin/Release/net8.0-windows/gwlite.exe $stage/
-          Copy-Item gwlite-ui/target/release/gwlite-ui.exe $stage/
-          Copy-Item assets/gwlite.ico $stage/
+          $pub = 'packetly/src/Packetly/bin/Release/net8.0-windows/publish'
+          Get-ChildItem $pub | Copy-Item -Destination $stage -Recurse -Force
+          Copy-Item packetly-ui/target/release/packetly-ui.exe $stage/
+          Copy-Item assets/packetly.ico $stage/
           Copy-Item scripts/install.ps1 $stage/scripts/
           Copy-Item INSTALL.txt $stage/
-          Compress-Archive -Path $stage -DestinationPath "GWLite-$tag-win-x64.zip"
-          Get-Item "GWLite-$tag-win-x64.zip" | Select-Object Name, Length
+          Compress-Archive -Path $stage -DestinationPath "Packetly-$tag-win-x64.zip" -Force
+          Get-Item "Packetly-$tag-win-x64.zip" | Select-Object Name, Length
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
-          files: GWLite-*-win-x64.zip
+          files: Packetly-*-win-x64.zip
           generate_release_notes: true
