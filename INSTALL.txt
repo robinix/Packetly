@@ -1,10 +1,10 @@
-# GWLite <version> - Windows x64
+# Packetly <version> - Windows x64
 #
 # Quick install:
 #   1. Right-click scripts\install.ps1 -> "Run with PowerShell"
 #      (or:  powershell -ExecutionPolicy Bypass -File scripts\install.ps1 )
 #      Approve the UAC prompt once (the collector needs admin for ETW).
-#   2. The app installs to %LOCALAPPDATA%\GWLite, registers the "GWLite"
+#   2. The app installs to %LOCALAPPDATA%\Packetly, registers the "Packetly"
 #      scheduled task (starts at logon) and starts it. The dashboard window
 #      opens automatically; a tray icon appears.
 #
@@ -13,13 +13,13 @@
 #   - .NET 8 Desktop Runtime (x64): https://dotnet.microsoft.com/download/dotnet/8.0
 #
 # Manual install (alternative to the script), from an elevated prompt:
-#     mkdir "$env:LOCALAPPDATA\GWLite"
-#     copy gwlite.exe, gwlite-ui.exe there
-#     .\gwlite.exe --install-autostart
+#     mkdir "$env:LOCALAPPDATA\Packetly"
+#     copy packetly.exe, packetly-ui.exe there
+#     .\packetly.exe --install-autostart
 #
 # Uninstall:
-#     gwlite.exe --uninstall-autostart
-#     remove "%LOCALAPPDATA%\GWLite" and the "GWLite Dashboard" shortcuts
+#     packetly.exe --uninstall-autostart
+#     remove "%LOCALAPPDATA%\Packetly" and the "Packetly Dashboard" shortcuts
 #
-# Data lives only in %LOCALAPPDATA%\GWLite\gwlite.db - nothing is sent anywhere.
+# Data lives only in %LOCALAPPDATA%\Packetly\packetly.db - nothing is sent anywhere.
 # GeoIP lookups (ip-api.com) happen only if you enable them in the UI.
