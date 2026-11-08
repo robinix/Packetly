@@ -22,3 +22,6 @@ packtest/
 # dotnet/rust noise
 *.user
 *.suo
+
+# the UI embeds the icon PNG at compile time - keep it tracked
+!assets/packetly.png
