@@ -24,7 +24,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Build collector
-        run: dotnet publish packetly/src/Packetly -c Release
+        run: dotnet publish packetly/src/Packetly -c Release -r win-x64 --self-contained false
 
       - name: Build UI
         run: cargo build --release --manifest-path packetly-ui/Cargo.toml
@@ -35,7 +35,7 @@ jobs:
           $tag = "${{ github.ref_name }}"
           $stage = "Packetly"
           New-Item -ItemType Directory -Path "$stage/scripts" -Force | Out-Null
-          $pub = 'packetly/src/Packetly/bin/Release/net8.0-windows/publish'
+          $pub = 'packetly/src/Packetly/bin/Release/net8.0-windows/win-x64/publish'
           Get-ChildItem $pub | Copy-Item -Destination $stage -Recurse -Force
           Copy-Item packetly-ui/target/release/packetly-ui.exe $stage/
           Copy-Item assets/packetly.ico $stage/
