@@ -399,6 +399,22 @@ async Task<int> RunServeAsync(string dbPath, string mode, int port, bool elevate
 {
     Log($"Packetly serve starting | db={Path.GetFullPath(dbPath)} | elevated={elevated}");
 
+    // Another instance already serving? Open its dashboard and exit BEFORE
+    // touching ETW — starting a second pipeline would fight the first one
+    // over the single NT Kernel Logger session.
+    try
+    {
+        using var probe = new System.Net.Http.HttpClient { Timeout = TimeSpan.FromSeconds(2) };
+        var status = probe.GetStringAsync($"http://127.0.0.1:{port}/api/status").Result;
+        if (status.Contains("\"app\""))
+        {
+            Log("another Packetly instance is already serving — opening its dashboard");
+            OpenDashboard(port);
+            return 0;
+        }
+    }
+    catch { /* nothing serving - continue with a fresh pipeline */ }
+
     var (db, _, tracker, _, writer, etw, poll, usedMode) = StartPipeline(dbPath, mode);
     Log($"collector: {usedMode}");
     var aggregator = new Aggregator(db);
@@ -595,6 +611,7 @@ async Task<int> RunServeAsync(string dbPath, string mode, int port, bool elevate
     catch (IOException ex) when (ex.Message.Contains("already in use") || ex.Message.Contains("address already"))
     {
         Log("another Packetly instance is already serving — opening its dashboard");
+        StopPipeline(etw, poll);
         OpenDashboard(port);
         return 0;
     }
