@@ -398,6 +398,7 @@ enum SortKey {
     Down,
     Up,
     Name,
+    Hosts,
 }
 
 impl SortKey {
@@ -407,10 +408,15 @@ impl SortKey {
             SortKey::Down => "Download",
             SortKey::Up => "Upload",
             SortKey::Name => "Name",
+            SortKey::Hosts => "Hosts",
         }
     }
     fn all() -> [SortKey; 4] {
         [SortKey::Total, SortKey::Down, SortKey::Up, SortKey::Name]
+    }
+
+    fn detail_keys() -> [SortKey; 4] {
+        [SortKey::Name, SortKey::Hosts, SortKey::Down, SortKey::Up]
     }
 }
 
@@ -433,11 +439,48 @@ fn sort_rows(
                 .unwrap_or(std::cmp::Ordering::Equal)
         }),
         SortKey::Name => rows.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase())),
+        SortKey::Hosts => rows.sort_by(|a, b| {
+            (b.4 + b.5)
+                .partial_cmp(&(a.4 + a.5))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }),
     }
 }
 
 #[derive(Clone, Default)]
+struct SelApp {
+    app_id: i64,
+    name: String,
+    host_count: i64,
+    in_bytes: f64,
+    out_bytes: f64,
+}
+
+#[derive(Clone, Default)]
+struct AppHostRow {
+    label: String,
+    region: Option<String>,
+    in_bytes: f64,
+    out_bytes: f64,
+}
+
+#[derive(Clone, Default)]
+struct AppDetail {
+    app_id: i64,
+    name: String,
+    path: Option<String>,
+    publisher: Option<String>,
+    version: Option<String>,
+    in_bytes: f64,
+    out_bytes: f64,
+    alert_count: i64,
+    hosts: Vec<AppHostRow>,
+    range: (i64, i64),
+}
+
+#[derive(Clone, Default)]
 struct SelData {
+    apps: Vec<SelApp>,
     t0: f64,
     t1: f64,
     hosts: Vec<HostRow>,
@@ -462,6 +505,8 @@ struct Snapshot {
     status_ok: bool,
     error: Option<String>,
     sel: Option<SelData>,
+    app_detail: Option<AppDetail>,
+    usage_range: (i64, i64),
 }
 
 struct Rendered {
@@ -900,6 +945,10 @@ fn fetch_snapshot(tab: &Tab, sel: &RangeSel, period: UsagePeriod) -> Snapshot {
             };
             if let Ok(d) = fetch_json(&format!("{}/api/usage?{}", API, usage_q)) {
                 snap.usage_total = d["total"].as_f64().unwrap_or(0.0);
+                snap.usage_range = (
+                    d["start"].as_i64().unwrap_or(0),
+                    d["now"].as_i64().unwrap_or(0),
+                );
                 if let Some(arr) = d["perApp"].as_array() {
                     snap.usage_per_app = arr
                         .iter()
@@ -1082,12 +1131,16 @@ struct PacketlyApp {
     show_scale: bool,
     sel_drag: Option<(f64, f64)>,
     traffic_sort: SortKey,
+    sel_sort: SortKey,
+    detail_tab: usize,
+    detail_sort: SortKey,
 }
 
 #[derive(Clone)]
 enum UiMsg {
     Refresh(Tab, RangeSel, UsagePeriod),
     Selection(Option<(f64, f64)>),
+    AppDetail(Option<(i64, i64, i64)>),
 }
 
 impl PacketlyApp {
@@ -1762,37 +1815,37 @@ impl PacketlyApp {
 
                                 if let Some(sd) = &snap.sel {
                                     if self.sel_drag.is_none() {
-                                        let mut m: HashMap<i64, (f64, f64)> = HashMap::new();
-                                        if let Some(tr) = &snap.traffic {
-                                            let bucket = p.bucket.max(0.001);
-                                            for (ts2, app, i, o) in &tr.rows {
-                                                if *ts2 + bucket > sd.t0 && *ts2 <= sd.t1 {
-                                                    let e = m.entry(*app).or_default();
-                                                    e.0 += i;
-                                                    e.1 += o;
-                                                }
-                                            }
+                                        let mut apps: Vec<SelApp> = sd.apps.clone();
+                                        match self.sel_sort {
+                                            SortKey::Name => apps.sort_by(|a, b| {
+                                                a.name.to_lowercase()
+                                                    .cmp(&b.name.to_lowercase())
+                                            }),
+                                            SortKey::Hosts => apps.sort_by(|a, b| {
+                                                b.host_count.cmp(&a.host_count)
+                                            }),
+                                            SortKey::Down => apps.sort_by(|a, b| {
+                                                b.in_bytes
+                                                    .partial_cmp(&a.in_bytes)
+                                                    .unwrap_or(std::cmp::Ordering::Equal)
+                                            }),
+                                            _ => apps.sort_by(|a, b| {
+                                                (b.in_bytes + b.out_bytes)
+                                                    .partial_cmp(&(a.in_bytes + a.out_bytes))
+                                                    .unwrap_or(std::cmp::Ordering::Equal)
+                                            }),
                                         }
-                                        let mut apps: Vec<(i64, f64, f64)> = m
-                                            .into_iter()
-                                            .map(|(id, (i2, o2))| (id, i2, o2))
-                                            .collect();
-                                        apps.sort_by(|a, b| {
-                                            (b.1 + b.2)
-                                                .partial_cmp(&(a.1 + a.2))
-                                                .unwrap_or(std::cmp::Ordering::Equal)
-                                        });
                                         let fr = presp.transform.frame();
                                         let pos = egui::Pos2::new(
                                             fr.left() + 12.0,
-                                            (fr.bottom() - 230.0).max(fr.top() + 8.0),
+                                            (fr.bottom() - 300.0).max(fr.top() + 8.0),
                                         );
                                         egui::Area::new(egui::Id::new("sel-popup"))
                                             .order(egui::Order::Foreground)
                                             .fixed_pos(pos)
                                             .show(ctx, |ui| {
                                                 egui::Frame::popup(ui.style()).show(ui, |ui| {
-                                                    ui.set_min_width(290.0);
+                                                    ui.set_min_width(330.0);
                                                     ui.horizontal(|ui| {
                                                         ui.weak(
                                                             egui::RichText::new(format!(
@@ -1816,56 +1869,111 @@ impl PacketlyApp {
                                                         );
                                                     });
                                                     ui.separator();
-                                                    for (id, i2, o2) in apps.iter().take(6) {
-                                                        let name = snap
-                                                            .traffic
-                                                            .as_ref()
-                                                            .and_then(|t| t.names.get(id).cloned())
-                                                            .unwrap_or_else(|| format!("app {id}"));
-                                                        ui.horizontal(|ui| {
-                                                            if let Some(tex) =
-                                                                self.icon_texture(ctx, *id)
-                                                            {
-                                                                ui.add(
-                                                                    egui::Image::from_texture(&tex)
-                                                                        .max_size(egui::vec2(
-                                                                            15.0, 15.0,
-                                                                        )),
+                                                    ui.horizontal(|ui| {
+                                                        ui.weak(
+                                                            egui::RichText::new("App")
+                                                                .size(10.5)
+                                                                .color(t.dim),
+                                                        );
+                                                        ui.with_layout(
+                                                            egui::Layout::right_to_left(
+                                                                egui::Align::Center,
+                                                            ),
+                                                            |ui| {
+                                                                ui.weak(
+                                                                    egui::RichText::new("Sort")
+                                                                        .size(10.5)
+                                                                        .color(t.dim),
                                                                 );
-                                                            } else {
-                                                                ui.weak("·");
+                                                                egui::ComboBox::from_id_source(
+                                                                    "sel_sort",
+                                                                )
+                                                                .selected_text(
+                                                                    self.sel_sort.label(),
+                                                                )
+                                                                .width(86.0)
+                                                                .show_ui(ui, |ui| {
+                                                                    for k in SortKey::detail_keys() {
+                                                                        ui.selectable_value(
+                                                                            &mut self.sel_sort,
+                                                                            k,
+                                                                            k.label(),
+                                                                        );
+                                                                    }
+                                                                });
+                                                            },
+                                                        );
+                                                    });
+                                                    ui.separator();
+                                                    egui::ScrollArea::vertical()
+                                                        .max_height(190.0)
+                                                        .show(ui, |ui| {
+                                                            for a in apps.iter().take(20) {
+                                                                ui.horizontal(|ui| {
+                                                                    if let Some(tex) = self
+                                                                        .icon_texture(
+                                                                            ctx, a.app_id,
+                                                                        )
+                                                                    {
+                                                                        ui.add(
+                                                                            egui::Image::from_texture(&tex)
+                                                                                .max_size(egui::vec2(15.0, 15.0)),
+                                                                        );
+                                                                    } else {
+                                                                        ui.weak("·");
+                                                                    }
+                                                                    let lbl = ui.add(
+                                                                        egui::Label::new(
+                                                                            egui::RichText::new(&a.name).size(12.0),
+                                                                        )
+                                                                        .truncate()
+                                                                        .sense(egui::Sense::click()),
+                                                                    );
+                                                                    if lbl.hovered() {
+                                                                        ui.ctx().set_cursor_icon(
+                                                                            egui::CursorIcon::PointingHand,
+                                                                        );
+                                                                    }
+                                                                    if lbl.clicked() {
+                                                                        let _ = self.tx.send(
+                                                                            UiMsg::AppDetail(Some((
+                                                                                a.app_id,
+                                                                                sd.t0 as i64,
+                                                                                sd.t1 as i64,
+                                                                            ))),
+                                                                        );
+                                                                    }
+                                                                    ui.weak(
+                                                                        egui::RichText::new(format!(
+                                                                            "+{}",
+                                                                            a.host_count
+                                                                        ))
+                                                                        .size(10.5)
+                                                                        .color(t.dim),
+                                                                    );
+                                                                    ui.with_layout(
+                                                                        egui::Layout::right_to_left(
+                                                                            egui::Align::Center,
+                                                                        ),
+                                                                        |ui| {
+                                                                            ui.weak(
+                                                                                egui::RichText::new(
+                                                                                    format!("↑ {}", fmt_b(a.out_bytes)),
+                                                                                )
+                                                                                .color(t.out_c),
+                                                                            );
+                                                                            ui.weak(
+                                                                                egui::RichText::new(
+                                                                                    format!("↓ {}", fmt_b(a.in_bytes)),
+                                                                                )
+                                                                                .color(t.in_c),
+                                                                            );
+                                                                        },
+                                                                    );
+                                                                });
                                                             }
-                                                            ui.label(
-                                                                egui::RichText::new(name).size(12.0),
-                                                            );
-                                                            ui.with_layout(
-                                                                egui::Layout::right_to_left(
-                                                                    egui::Align::Center,
-                                                                ),
-                                                                |ui| {
-                                                                    ui.weak(
-                                                                        egui::RichText::new(
-                                                                            format!(
-                                                                                "↑ {}",
-                                                                                fmt_b(*o2)
-                                                                            ),
-                                                                        )
-                                                                        .color(t.out_c),
-                                                                    );
-                                                                    ui.weak(
-                                                                        egui::RichText::new(
-                                                                            format!(
-                                                                                "↓ {}",
-                                                                                fmt_b(*i2)
-                                                                            ),
-                                                                        )
-                                                                        .color(t.in_c),
-                                                                    );
-                                                                },
-                                                            );
                                                         });
-                                                    }
-                                                    if !sd.hosts.is_empty() {
+                                                                                                        if !sd.hosts.is_empty() {
                                                         ui.separator();
                                                         for h in sd.hosts.iter().take(3) {
                                                             ui.horizontal(|ui| {
@@ -1949,6 +2057,10 @@ impl PacketlyApp {
                                 }
                                 let max =
                                     rows.iter().map(|r| r.4 + r.5).fold(1.0_f64, f64::max);
+                                let range = snap
+                                    .traffic
+                                    .as_ref()
+                                    .map(|tr| (tr.from as i64, tr.to as i64));
                                 for (name, sub, color, icon_id, i, o) in rows {
                                     ui.horizontal(|ui| {
                                         if let Some(tex) =
@@ -1965,12 +2077,29 @@ impl PacketlyApp {
                                         let name_w = (aw - 84.0).max(60.0);
                                         ui.vertical(|ui| {
                                             ui.set_max_width(name_w);
-                                            ui.add(
+                                            let lbl = ui.add(
                                                 egui::Label::new(
                                                     egui::RichText::new(&name).color(t.text),
                                                 )
-                                                .truncate(),
+                                                .truncate()
+                                                .sense(egui::Sense::click()),
                                             );
+                                            if icon_id.is_some() {
+                                                if lbl.hovered() {
+                                                    ui.ctx().set_cursor_icon(
+                                                        egui::CursorIcon::PointingHand,
+                                                    );
+                                                }
+                                                if lbl.clicked() {
+                                                    if let Some(id) = icon_id {
+                                                        let (f, tt) =
+                                                            range.unwrap_or((0, 0));
+                                                        let _ = app.tx.send(UiMsg::AppDetail(
+                                                            Some((id, f, tt)),
+                                                        ));
+                                                    }
+                                                }
+                                            }
                                             if let Some(s) = &sub {
                                                 ui.weak(egui::RichText::new(s.as_str())
                                                     .size(10.5)
@@ -2240,6 +2369,7 @@ impl PacketlyApp {
                             .iter()
                             .map(|r| r.2)
                             .fold(1.0_f64, f64::max);
+                        let (ur_f, ur_t) = snap.usage_range;
                         for (id, name, bytes) in &snap.usage_per_app {
                             let c = color_for(&id.to_string());
                             ui.horizontal(|ui| {
@@ -2251,7 +2381,18 @@ impl PacketlyApp {
                                 } else {
                                     ui.colored_label(c, "●");
                                 }
-                                ui.label(egui::RichText::new(name).color(t.text));
+                                let lbl = ui.add(
+                                    egui::Label::new(egui::RichText::new(name).color(t.text))
+                                        .sense(egui::Sense::click()),
+                                );
+                                if lbl.hovered() {
+                                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                }
+                                if lbl.clicked() {
+                                    let _ = self.tx.send(UiMsg::AppDetail(Some((
+                                        *id, ur_f, ur_t,
+                                    ))));
+                                }
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
@@ -2371,6 +2512,8 @@ fn prefs_file() -> std::path::PathBuf {
     dir.join("ui-prefs.txt")
 }
 
+
+
 impl eframe::App for PacketlyApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let t = self.theme();
@@ -2392,7 +2535,10 @@ impl eframe::App for PacketlyApp {
             }
             Tab::Alerts => self.alerts_tab(ctx),
         }
+        self.app_detail_popup(ctx);
     }
+
+
 }
 
 /// Window/taskbar icon, embedded at compile time so every build (GNU or MSVC)
@@ -2448,6 +2594,7 @@ fn main() -> eframe::Result {
             let mut sel = RangeSel::Preset(Range::M5);
             let mut period = UsagePeriod::Today;
             let mut sel_data: Option<SelData> = None;
+            let mut app_detail_req: Option<(i64, i64, i64)> = None;
             loop {
                 let timeout = sel.refresh();
                 match rx.recv_timeout(timeout) {
@@ -2457,9 +2604,15 @@ fn main() -> eframe::Result {
                             sel = s;
                             period = p;
                             sel_data = None;
+                            app_detail_req = None;
+                        }
+                        UiMsg::AppDetail(s) => {
+                            app_detail_req = s;
                         }
                         UiMsg::Selection(s) => match s {
-                            None => sel_data = None,
+                            None => {
+                                sel_data = None;
+                            }
                             Some((t0, t1)) => {
                                 let hosts = fetch_json(&format!(
                                     "{}/api/hosts?from={}&to={}&limit=4",
@@ -2486,7 +2639,27 @@ fn main() -> eframe::Result {
                                     })
                                 })
                                 .unwrap_or_default();
-                                sel_data = Some(SelData { t0, t1, hosts });
+                                // apps with host counts for the selection table
+                                let apps = fetch_json(&format!(
+                                    "{}/api/applist?from={}&to={}&limit=50",
+                                    API, t0 as i64, t1 as i64
+                                ))
+                                .ok()
+                                .and_then(|d| {
+                                    d["apps"].as_array().map(|arr| {
+                                        arr.iter()
+                                            .map(|a| SelApp {
+                                                app_id: a["appId"].as_i64().unwrap_or(0),
+                                                name: a["name"].as_str().unwrap_or("?").to_string(),
+                                                host_count: a["hostCount"].as_i64().unwrap_or(0),
+                                                in_bytes: a["inBytes"].as_f64().unwrap_or(0.0),
+                                                out_bytes: a["outBytes"].as_f64().unwrap_or(0.0),
+                                            })
+                                            .collect()
+                                    })
+                                })
+                                .unwrap_or_default();
+                                sel_data = Some(SelData { t0, t1, hosts, apps });
                             }
                         },
                     },
@@ -2495,6 +2668,42 @@ fn main() -> eframe::Result {
                 }
                 let mut fresh = fetch_snapshot(&tab, &sel, period);
                 fresh.sel = sel_data.clone();
+                if let Some((aid, f, t)) = app_detail_req {
+                    fresh.app_detail = fetch_json(&format!(
+                        "{}/api/appinfo?app_id={}&from={}&to={}",
+                        API, aid, f, t
+                    ))
+                    .ok()
+                    .map(|d| AppDetail {
+                        app_id: aid,
+                        name: d["name"].as_str().unwrap_or("?").to_string(),
+                        path: d["path"].as_str().map(|x| x.to_string()),
+                        publisher: d["publisher"].as_str().map(|x| x.to_string()),
+                        version: d["version"].as_str().map(|x| x.to_string()),
+                        in_bytes: d["inBytes"].as_f64().unwrap_or(0.0),
+                        out_bytes: d["outBytes"].as_f64().unwrap_or(0.0),
+                        alert_count: d["alertCount"].as_i64().unwrap_or(0),
+                        hosts: d["hosts"]
+                            .as_array()
+                            .map(|arr| {
+                                arr.iter()
+                                    .map(|h| AppHostRow {
+                                        label: h["hostname"]
+                                            .as_str()
+                                            .map(|x| x.to_string())
+                                            .unwrap_or_else(|| {
+                                                h["ip"].as_str().unwrap_or("?").to_string()
+                                            }),
+                                        region: h["region"].as_str().map(|x| x.to_string()),
+                                        in_bytes: h["inBytes"].as_f64().unwrap_or(0.0),
+                                        out_bytes: h["outBytes"].as_f64().unwrap_or(0.0),
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
+                        range: (f, t),
+                    });
+                }
 
                 let mut want: Vec<i64> = fresh.apps.iter().map(|a| a.id).collect();
                 want.extend(fresh.usage_per_app.iter().map(|r| r.0));
@@ -2594,6 +2803,9 @@ fn main() -> eframe::Result {
                 show_scale: false,
                 sel_drag: None,
                 traffic_sort: SortKey::Total,
+                sel_sort: SortKey::Total,
+                detail_tab: 0,
+                detail_sort: SortKey::Down,
             }))
         }),
     )
@@ -2629,4 +2841,263 @@ fn install_fonts(ctx: &egui::Context) {
             .push("segoe_sym".into());
     }
     ctx.set_fonts(fonts);
+}
+
+impl PacketlyApp {
+    /// App details: click any app row (Traffic, Usage, selection popup) to open
+    /// bandwidth / name / path / version / publisher plus the app's hosts and
+    /// alerts for the selected period.
+    fn app_detail_popup(&mut self, ctx: &egui::Context) {
+        let detail = {
+            let snap = self.snap.lock().unwrap().clone();
+            snap.app_detail.clone()
+        };
+        let Some(d) = detail else { return };
+        let t = self.theme();
+        egui::Area::new(egui::Id::new("app-detail"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::LEFT_BOTTOM, [14.0, -14.0])
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style())
+                    .fill(t.card)
+                    .stroke(egui::Stroke::new(1.0, t.border))
+                    .show(ui, |ui| {
+                        ui.set_min_width(470.0);
+                        ui.set_max_width(470.0);
+
+                        // header
+                        ui.horizontal(|ui| {
+                            if let Some(tex) = self.icon_texture(ctx, d.app_id) {
+                                ui.add(
+                                    egui::Image::from_texture(&tex)
+                                        .max_size(egui::vec2(24.0, 24.0)),
+                                );
+                            }
+                            ui.strong(egui::RichText::new(&d.name).size(14.0).color(t.text));
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.small_button("✕").clicked() {
+                                        let _ = self.tx.send(UiMsg::AppDetail(None));
+                                    }
+                                },
+                            );
+                        });
+
+                        // tabs
+                        ui.horizontal(|ui| {
+                            let tabs: [(String, usize); 3] = [
+                                ("Info".to_string(), 0),
+                                (format!("Hosts ({})", d.hosts.len()), 1),
+                                (format!("Alerts ({})", d.alert_count), 2),
+                            ];
+                            for (label, idx) in &tabs {
+                                if ui
+                                    .selectable_label(self.detail_tab == *idx, label.as_str())
+                                    .clicked()
+                                {
+                                    self.detail_tab = *idx;
+                                }
+                            }
+                        });
+                        ui.separator();
+
+                        match self.detail_tab {
+                            0 => {
+                                // Info
+                                let row = |ui: &mut egui::Ui, k: &str, v: egui::RichText| {
+                                    ui.horizontal(|ui| {
+                                        ui.set_min_width(430.0);
+                                        ui.weak(
+                                            egui::RichText::new(k).size(11.5).color(t.dim),
+                                        );
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                ui.add(
+                                                    egui::Label::new(v.size(11.5))
+                                                        .truncate(),
+                                                );
+                                            },
+                                        );
+                                    });
+                                };
+                                ui.add_space(2.0);
+                                row(
+                                    ui,
+                                    "Bandwidth:",
+                                    egui::RichText::new(format!(
+                                        "↓ {}   ↑ {}",
+                                        fmt_b(d.in_bytes),
+                                        fmt_b(d.out_bytes)
+                                    ))
+                                    .color(t.text),
+                                );
+                                row(
+                                    ui,
+                                    "Name:",
+                                    egui::RichText::new(&d.name).color(t.text),
+                                );
+                                row(
+                                    ui,
+                                    "Path:",
+                                    egui::RichText::new(
+                                        d.path.as_deref().unwrap_or("—"),
+                                    )
+                                    .color(t.text),
+                                );
+                                row(
+                                    ui,
+                                    "Version:",
+                                    egui::RichText::new(
+                                        d.version.as_deref().unwrap_or("—"),
+                                    )
+                                    .color(t.text),
+                                );
+                                row(
+                                    ui,
+                                    "Publisher:",
+                                    egui::RichText::new(
+                                        d.publisher.as_deref().unwrap_or("—"),
+                                    )
+                                    .color(t.text),
+                                );
+                                ui.add_space(4.0);
+                            }
+                            1 => {
+                                // Hosts
+                                let mut hosts = d.hosts.clone();
+                                match self.detail_sort {
+                                    SortKey::Name => hosts.sort_by(|a, b| {
+                                        a.label.to_lowercase()
+                                            .cmp(&b.label.to_lowercase())
+                                    }),
+                                    SortKey::Up => hosts.sort_by(|a, b| {
+                                        b.out_bytes
+                                            .partial_cmp(&a.out_bytes)
+                                            .unwrap_or(std::cmp::Ordering::Equal)
+                                    }),
+                                    SortKey::Down => hosts.sort_by(|a, b| {
+                                        b.in_bytes
+                                            .partial_cmp(&a.in_bytes)
+                                            .unwrap_or(std::cmp::Ordering::Equal)
+                                    }),
+                                    _ => hosts.sort_by(|a, b| {
+                                        (b.in_bytes + b.out_bytes)
+                                            .partial_cmp(&(a.in_bytes + a.out_bytes))
+                                            .unwrap_or(std::cmp::Ordering::Equal)
+                                    }),
+                                }
+                                ui.horizontal(|ui| {
+                                    ui.weak(
+                                        egui::RichText::new("Sort")
+                                            .size(10.5)
+                                            .color(t.dim),
+                                    );
+                                    egui::ComboBox::from_id_source("detail_host_sort")
+                                        .selected_text(self.detail_sort.label())
+                                        .width(86.0)
+                                        .show_ui(ui, |ui| {
+                                            for k in SortKey::detail_keys() {
+                                                ui.selectable_value(
+                                                    &mut self.detail_sort,
+                                                    k,
+                                                    k.label(),
+                                                );
+                                            }
+                                        });
+                                });
+                                egui::ScrollArea::vertical()
+                                    .max_height(210.0)
+                                    .show(ui, |ui| {
+                                        if hosts.is_empty() {
+                                            ui.weak("no hosts in this period");
+                                        }
+                                        for h in &hosts {
+                                            ui.horizontal(|ui| {
+                                                ui.set_min_width(430.0);
+                                                ui.weak(
+                                                    egui::RichText::new(
+                                                        h.region
+                                                            .clone()
+                                                            .unwrap_or_default(),
+                                                    )
+                                                    .size(10.5)
+                                                    .color(t.dim),
+                                                );
+                                                ui.add(
+                                                    egui::Label::new(
+                                                        egui::RichText::new(&h.label)
+                                                            .size(11.5)
+                                                            .color(t.text),
+                                                    )
+                                                    .truncate(),
+                                                );
+                                                ui.with_layout(
+                                                    egui::Layout::right_to_left(
+                                                        egui::Align::Center,
+                                                    ),
+                                                    |ui| {
+                                                        ui.weak(
+                                                            egui::RichText::new(format!(
+                                                                "↑ {}",
+                                                                fmt_b(h.out_bytes)
+                                                            ))
+                                                            .color(t.out_c),
+                                                        );
+                                                        ui.weak(
+                                                            egui::RichText::new(format!(
+                                                                "↓ {}",
+                                                                fmt_b(h.in_bytes)
+                                                            ))
+                                                            .color(t.in_c),
+                                                        );
+                                                    },
+                                                );
+                                            });
+                                        }
+                                    });
+                                ui.add_space(2.0);
+                            }
+                            _ => {
+                                // Alerts for this app
+                                let snap = self.snap.lock().unwrap().clone();
+                                let mine: Vec<&EventRow> = snap
+                                    .events
+                                    .iter()
+                                    .filter(|e| {
+                                        e.app_name.as_deref() == Some(d.name.as_str())
+                                    })
+                                    .collect();
+                                egui::ScrollArea::vertical()
+                                    .max_height(210.0)
+                                    .show(ui, |ui| {
+                                        if mine.is_empty() {
+                                            ui.weak("no alerts for this app");
+                                        }
+                                        for e in mine {
+                                            ui.horizontal(|ui| {
+                                                ui.set_min_width(430.0);
+                                                ui.weak(
+                                                    egui::RichText::new(rel_time(e.ts))
+                                                        .size(10.5)
+                                                        .color(t.dim),
+                                                );
+                                                ui.add(
+                                                    egui::Label::new(
+                                                        egui::RichText::new(&e.data)
+                                                            .size(11.0)
+                                                            .color(t.text),
+                                                    )
+                                                    .truncate(),
+                                                );
+                                            });
+                                        }
+                                    });
+                                ui.add_space(2.0);
+                            }
+                        }
+                    });
+            });
+    }
 }

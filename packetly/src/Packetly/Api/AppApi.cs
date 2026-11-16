@@ -54,7 +54,7 @@ internal static class AppApi
             return new
             {
                 app = "packetly",
-                version = "1.0.0",
+                version = "1.1.0",
                 now,
                 startedAt = svc.StartedAt,
                 uptimeSeconds = now - svc.StartedAt,
@@ -86,10 +86,10 @@ internal static class AppApi
             };
         });
 
-        app.MapGet("/api/traffic", (string? range, long? from, long? to, int? appId, string? breakdown, string? group) =>
+        app.MapGet("/api/traffic", (string? range, long? from, long? to, int? app_id, string? breakdown, string? group) =>
         {
             var now = Now();
-            var r = ResolveRange(range, from, to, now, appId);
+            var r = ResolveRange(range, from, to, now, app_id);
             if (r == null) return Results.BadRequest(new { error = "range must be 5m|3h|24h|30d|unlimited|custom (custom requires from)" });
 
             var (f, t, table, bucket, _) = r.Value;
@@ -166,7 +166,7 @@ internal static class AppApi
             object payload;
             if (byApp)
             {
-                var rows = svc.Db.SeriesByApp(table, f, t, appId);
+                var rows = svc.Db.SeriesByApp(table, f, t, app_id);
                 var names = svc.Db.AppsInWindow(table, f, t, 5000).ToDictionary(a => a.Id, a => a.Name);
                 payload = new
                 {
@@ -176,7 +176,7 @@ internal static class AppApi
             }
             else
             {
-                var rows = svc.Db.SeriesTotals(table, f, t, appId);
+                var rows = svc.Db.SeriesTotals(table, f, t, app_id);
                 payload = new
                 {
                     totals = rows.Select(x => new[] { x.Ts, x.In, x.Out }),
@@ -189,7 +189,7 @@ internal static class AppApi
                 bucketSeconds = bucket,
                 from = f,
                 to = t,
-                appId,
+                app_id,
                 data = payload,
             });
         });
@@ -223,6 +223,68 @@ internal static class AppApi
                 to = t,
                 tier = table,
                 hosts = rows.Select(h => new { ip = HexToIp(h.Ip), hostname = h.Hostname, region = h.Region, inBytes = h.In, outBytes = h.Out }),
+            });
+        });
+
+        static string TierFor(long f, long t)
+        {
+            var span = Math.Max(1, t - f);
+            return span <= 3L * 3600 ? "traffic_1s"
+                 : span <= 62L * 86400 ? "traffic_60s"
+                 : span <= 400L * 86400 ? "traffic_3600s"
+                 : "traffic_86400s";
+        }
+
+        // ---- app detail (click an app anywhere) ----
+
+        app.MapGet("/api/appinfo", (int app_id, long from, long to) =>
+        {
+            var app = svc.Db.GetAppById(app_id);
+            if (app == null) return Results.NotFound(new { error = "unknown app" });
+            var (name, path, dbPublisher) = app.Value;
+            var tier = TierFor(from, to);
+
+            string? version = null, publisher = dbPublisher;
+            try
+            {
+                if (!string.IsNullOrEmpty(path) && System.IO.File.Exists(path))
+                {
+                    var vi = System.Diagnostics.FileVersionInfo.GetVersionInfo(path);
+                    version = string.IsNullOrEmpty(vi.FileVersion) ? vi.ProductVersion : vi.FileVersion;
+                    if (string.IsNullOrEmpty(publisher)) publisher = vi.CompanyName;
+                }
+            }
+            catch { /* exe moved/unreadable - fields stay null */ }
+
+            var (inB, outB) = svc.Db.AppBytesBetween(tier, app_id, from, to);
+            var hosts = svc.Db.AppHostsBetween(tier, app_id, from, to, 100)
+                .Select(h => new { ip = HexToIp(h.Ip), hostname = h.Hostname, region = h.Region, inBytes = h.In, outBytes = h.Out });
+            return Results.Json(new
+            {
+                app_id,
+                name = name ?? path ?? $"app {app_id}",
+                path,
+                publisher,
+                version,
+                from,
+                to,
+                inBytes = inB,
+                outBytes = outB,
+                alertCount = svc.Db.AppAlertCount(app_id),
+                hosts,
+            });
+        });
+
+        app.MapGet("/api/applist", (long from, long to, int? limit) =>
+        {
+            var tier = TierFor(from, to);
+            var rows = svc.Db.AppsHostsBetween(tier, from, to, Math.Clamp(limit ?? 100, 1, 500));
+            return Results.Json(new
+            {
+                from,
+                to,
+                tier,
+                apps = rows.Select(a => new { appId = a.Id, name = a.Name, hostCount = a.HostCount, inBytes = a.In, outBytes = a.Out }),
             });
         });
 

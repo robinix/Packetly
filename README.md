@@ -15,6 +15,8 @@ themes. (It is purely a traffic monitor: no firewall, no network scanner.)
   (PID resolution + TCP owner-table fallback)
 - **Traffic tab** — top apps, remote hosts, traffic types (HTTPS/DNS/QUIC/…) and
   countries in four sortable columns
+- **App details** — click any app (Traffic, Usage, or a graph selection) for its
+  bandwidth, name, path, version, publisher, per-host breakdown and alerts
 - **Usage & quotas** — per-app or global usage over 5 minutes/3 hours/24 hours/
   7 days/30 days/all time/custom, daily/weekly/monthly quotas with 75/90/100 % alerts
 - **Alerts** — new-app-on-the-network notifications, quota threshold alerts

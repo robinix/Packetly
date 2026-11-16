@@ -207,6 +207,92 @@ internal sealed class Db : IDisposable
         return list;
     }
 
+    public (string? Name, string? Path, string? Publisher)? GetAppById(int id)
+    {
+        lock (_gate)
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = "SELECT name, path, publisher FROM apps WHERE id = $id";
+            cmd.Parameters.AddWithValue("$id", id);
+            using var r = cmd.ExecuteReader();
+            if (!r.Read()) return null;
+            return (r.IsDBNull(0) ? null : r.GetString(0), r.IsDBNull(1) ? null : r.GetString(1), r.IsDBNull(2) ? null : r.GetString(2));
+        }
+    }
+
+    /// <summary>Per-host traffic for one app in the window (top by total).</summary>
+    public List<(string Ip, string? Hostname, string? Region, long In, long Out)> AppHostsBetween(string table, int appId, long from, long to, int limit)
+    {
+        var list = new List<(string, string?, string?, long, long)>();
+        lock (_gate)
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = $"""
+                SELECT hex(t.host) AS iphex, h.hostname, h.region, SUM(t.inb), SUM(t.outb)
+                FROM {table} t LEFT JOIN hosts h ON h.ip = t.host
+                WHERE t.ts >= $f AND t.ts < $t AND t.app_id = $id
+                GROUP BY t.host ORDER BY SUM(t.inb + t.outb) DESC LIMIT $l
+                """;
+            cmd.Parameters.AddWithValue("$f", from);
+            cmd.Parameters.AddWithValue("$t", to);
+            cmd.Parameters.AddWithValue("$id", appId);
+            cmd.Parameters.AddWithValue("$l", limit);
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+                list.Add((r.GetString(0), r.IsDBNull(1) ? null : r.GetString(1), r.IsDBNull(2) ? null : r.GetString(2), r.GetInt64(3), r.GetInt64(4)));
+        }
+        return list;
+    }
+
+    public (long In, long Out) AppBytesBetween(string table, int appId, long from, long to)
+    {
+        lock (_gate)
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = $"SELECT SUM(inb), SUM(outb) FROM {table} WHERE ts >= $f AND ts < $t AND app_id = $id";
+            cmd.Parameters.AddWithValue("$f", from);
+            cmd.Parameters.AddWithValue("$t", to);
+            cmd.Parameters.AddWithValue("$id", appId);
+            using var r = cmd.ExecuteReader();
+            if (!r.Read()) return (0, 0);
+            return (r.IsDBNull(0) ? 0 : r.GetInt64(0), r.IsDBNull(1) ? 0 : r.GetInt64(1));
+        }
+    }
+
+    public int AppAlertCount(int appId)
+    {
+        lock (_gate)
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = "SELECT COUNT(*) FROM events WHERE app_id = $id";
+            cmd.Parameters.AddWithValue("$id", appId);
+            using var r = cmd.ExecuteReader();
+            return r.Read() ? r.GetInt32(0) : 0;
+        }
+    }
+
+    /// <summary>Per-app totals + distinct host counts in the window (for the detail table).</summary>
+    public List<(int Id, string Name, int HostCount, long In, long Out)> AppsHostsBetween(string table, long from, long to, int limit)
+    {
+        var list = new List<(int, string, int, long, long)>();
+        lock (_gate)
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = $"""
+                SELECT a.id, COALESCE(a.name, a.path), COUNT(DISTINCT t.host), SUM(t.inb), SUM(t.outb)
+                FROM {table} t JOIN apps a ON a.id = t.app_id
+                WHERE t.ts >= $f AND t.ts < $t
+                GROUP BY a.id ORDER BY SUM(t.inb + t.outb) DESC LIMIT $l
+                """;
+            cmd.Parameters.AddWithValue("$f", from);
+            cmd.Parameters.AddWithValue("$t", to);
+            cmd.Parameters.AddWithValue("$l", limit);
+            using var r = cmd.ExecuteReader();
+            while (r.Read()) list.Add((r.GetInt32(0), r.GetString(1), r.GetInt32(2), r.GetInt64(3), r.GetInt64(4)));
+        }
+        return list;
+    }
+
     public Dictionary<int, string> AppNames()
     {
         var map = new Dictionary<int, string>();
