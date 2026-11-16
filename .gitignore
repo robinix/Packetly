@@ -25,3 +25,5 @@ packtest/
 
 # the UI embeds the icon PNG at compile time - keep it tracked
 !assets/packetly.png
+!assets/unknown.png
+.zcode/

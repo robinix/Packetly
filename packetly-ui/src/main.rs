@@ -1071,6 +1071,295 @@ fn pivot(traffic: &TrafficData, in_c: egui::Color32, out_c: egui::Color32) -> Pi
     p
 }
 
+// ---- procedural country flags (painted shapes only: zero RAM/storage cost) ----
+
+/// True when we can draw a small flag for this ISO-3166 alpha-2 code.
+fn flag_known(code: &str) -> bool {
+    matches!(
+        code,
+        "DE" | "FR" | "IT" | "NL" | "BE" | "RU" | "IE" | "AT" | "BG" | "HU" | "RO" | "PL"
+            | "UA" | "EE" | "LT" | "LV" | "LU" | "US" | "GB" | "CN" | "JP" | "TR" | "IR"
+            | "IN" | "ES" | "PT" | "SE" | "NO" | "FI" | "DK" | "GR" | "CA"
+    )
+}
+
+fn hstripe(p: &egui::Painter, rect: &egui::Rect, frac: f32, y0: f32, color: egui::Color32) {
+    let h = (rect.height() * frac).ceil().max(1.0);
+    p.rect_filled(
+        egui::Rect::from_min_size(
+            egui::Pos2::new(rect.left(), rect.top() + rect.height() * y0),
+            egui::vec2(rect.width(), h),
+        ),
+        0.0,
+        color,
+    );
+}
+
+fn vstripe(p: &egui::Painter, rect: &egui::Rect, frac: f32, x0: f32, color: egui::Color32) {
+    let w = (rect.width() * frac).ceil().max(1.0);
+    p.rect_filled(
+        egui::Rect::from_min_size(
+            egui::Pos2::new(rect.left() + rect.width() * x0, rect.top()),
+            egui::vec2(w, rect.height()),
+        ),
+        0.0,
+        color,
+    );
+}
+
+fn disc(p: &egui::Painter, c: egui::Pos2, r: f32, color: egui::Color32) {
+    p.circle_filled(c, r, color);
+}
+
+/// Draw a small simplified flag for `code` inside `rect`.
+fn draw_flag(p: &egui::Painter, rect: &egui::Rect, code: &str) {
+    use egui::Color32;
+    let red = Color32::from_rgb(206, 60, 58);
+    let white = Color32::from_rgb(240, 240, 240);
+    let blue = Color32::from_rgb(46, 84, 165);
+    let dark = Color32::from_rgb(28, 28, 30);
+    let yellow = Color32::from_rgb(240, 200, 60);
+    let green = Color32::from_rgb(52, 140, 90);
+    let cx = egui::Pos2::new(rect.center().x, rect.center().y);
+    match code {
+        "DE" => {
+            hstripe(p, rect, 1.0, 0.0, dark);
+            hstripe(p, rect, 1.0 / 3.0, 1.0 / 3.0, red);
+            hstripe(p, rect, 1.0 / 3.0, 2.0 / 3.0, yellow);
+        }
+        "FR" => {
+            p.rect_filled(*rect, 0.0, blue);
+            vstripe(p, rect, 1.0 / 3.0, 1.0 / 3.0, white);
+            vstripe(p, rect, 1.0 / 3.0, 2.0 / 3.0, red);
+        }
+        "IT" => {
+            p.rect_filled(*rect, 0.0, green);
+            vstripe(p, rect, 1.0 / 3.0, 1.0 / 3.0, white);
+            vstripe(p, rect, 1.0 / 3.0, 2.0 / 3.0, red);
+        }
+        "NL" => {
+            hstripe(p, rect, 1.0, 0.0, red);
+            hstripe(p, rect, 1.0 / 3.0, 1.0 / 3.0, white);
+            hstripe(p, rect, 1.0 / 3.0, 2.0 / 3.0, blue);
+        }
+        "RU" => {
+            p.rect_filled(*rect, 0.0, white);
+            hstripe(p, rect, 1.0 / 3.0, 1.0 / 3.0, blue);
+            hstripe(p, rect, 1.0 / 3.0, 2.0 / 3.0, red);
+        }
+        "IE" | "CI" => {
+            p.rect_filled(*rect, 0.0, green);
+            vstripe(p, rect, 1.0 / 3.0, 1.0 / 3.0, white);
+            vstripe(p, rect, 1.0 / 3.0, 2.0 / 3.0, Color32::from_rgb(240, 140, 40));
+        }
+        "AT" => {
+            p.rect_filled(*rect, 0.0, red);
+            hstripe(p, rect, 1.0 / 3.0, 1.0 / 3.0, white);
+            hstripe(p, rect, 1.0 / 3.0, 2.0 / 3.0, red);
+        }
+        "BG" => {
+            p.rect_filled(*rect, 0.0, white);
+            hstripe(p, rect, 2.0 / 3.0, 1.0 / 3.0, green);
+            hstripe(p, rect, 1.0 / 3.0, 2.0 / 3.0, red);
+        }
+        "HU" => {
+            p.rect_filled(*rect, 0.0, red);
+            hstripe(p, rect, 1.0 / 3.0, 1.0 / 3.0, white);
+            hstripe(p, rect, 1.0 / 3.0, 2.0 / 3.0, green);
+        }
+        "RO" => {
+            p.rect_filled(*rect, 0.0, blue);
+            vstripe(p, rect, 1.0 / 3.0, 1.0 / 3.0, yellow);
+            vstripe(p, rect, 1.0 / 3.0, 2.0 / 3.0, red);
+        }
+        "PL" => {
+            p.rect_filled(*rect, 0.0, white);
+            hstripe(p, rect, 0.5, 0.5, red);
+        }
+        "UA" => {
+            p.rect_filled(*rect, 0.0, blue);
+            hstripe(p, rect, 0.5, 0.5, yellow);
+        }
+        "EE" | "LT" | "LV" | "LU" => {
+            // generic three-stripe stand-ins
+            p.rect_filled(*rect, 0.0, blue);
+            hstripe(p, rect, 1.0 / 3.0, 1.0 / 3.0, dark);
+            hstripe(p, rect, 1.0 / 3.0, 2.0 / 3.0, white);
+        }
+        "US" => {
+            p.rect_filled(*rect, 0.0, white);
+            let sh = rect.height() / 7.0;
+            let mut i = 0;
+            while i < 7 {
+                p.rect_filled(
+                    egui::Rect::from_min_size(
+                        egui::Pos2::new(rect.left(), rect.top() + i as f32 * sh),
+                        egui::vec2(rect.width(), sh.ceil().max(1.0)),
+                    ),
+                    0.0,
+                    red,
+                );
+                i += 2;
+            }
+            let cw = rect.width() * 0.42;
+            let ch = rect.height() * 4.0 / 7.0;
+            p.rect_filled(
+                egui::Rect::from_min_size(rect.left_top(), egui::vec2(cw, ch)),
+                0.0,
+                blue,
+            );
+        }
+        "GB" => {
+            p.rect_filled(*rect, 0.0, blue);
+            p.line_segment(
+                [rect.left_top(), rect.right_bottom()],
+                egui::Stroke::new(rect.height() * 0.18, white),
+            );
+            p.line_segment(
+                [rect.right_top(), rect.left_bottom()],
+                egui::Stroke::new(rect.height() * 0.18, white),
+            );
+            p.line_segment(
+                [egui::Pos2::new(rect.center().x, rect.top()), egui::Pos2::new(rect.center().x, rect.bottom())],
+                egui::Stroke::new(rect.height() * 0.28, white),
+            );
+            p.line_segment(
+                [egui::Pos2::new(rect.left(), rect.center().y), egui::Pos2::new(rect.right(), rect.center().y)],
+                egui::Stroke::new(rect.height() * 0.28, white),
+            );
+            p.line_segment(
+                [egui::Pos2::new(rect.center().x, rect.top()), egui::Pos2::new(rect.center().x, rect.bottom())],
+                egui::Stroke::new(rect.height() * 0.12, red),
+            );
+            p.line_segment(
+                [egui::Pos2::new(rect.left(), rect.center().y), egui::Pos2::new(rect.right(), rect.center().y)],
+                egui::Stroke::new(rect.height() * 0.12, red),
+            );
+        }
+        "CN" => {
+            p.rect_filled(*rect, 0.0, Color32::from_rgb(222, 41, 38));
+            disc(p, egui::Pos2::new(rect.left() + rect.width() * 0.2, rect.top() + rect.height() * 0.3), rect.height() * 0.14, yellow);
+        }
+        "JP" => {
+            p.rect_filled(*rect, 0.0, white);
+            disc(p, cx, rect.height() * 0.3, Color32::from_rgb(188, 62, 74));
+        }
+        "TR" => {
+            p.rect_filled(*rect, 0.0, red);
+            disc(p, egui::Pos2::new(rect.center().x - rect.width() * 0.06, cx.y), rect.height() * 0.26, white);
+            disc(p, egui::Pos2::new(rect.center().x - rect.width() * 0.02, cx.y), rect.height() * 0.2, red);
+            disc(p, egui::Pos2::new(rect.center().x + rect.width() * 0.18, cx.y), rect.height() * 0.08, white);
+        }
+        "IR" => {
+            p.rect_filled(*rect, 0.0, green);
+            hstripe(p, rect, 1.0 / 3.0, 1.0 / 3.0, white);
+            hstripe(p, rect, 1.0 / 3.0, 2.0 / 3.0, red);
+        }
+        "IN" => {
+            p.rect_filled(*rect, 0.0, Color32::from_rgb(240, 140, 40));
+            hstripe(p, rect, 1.0 / 3.0, 1.0 / 3.0, white);
+            hstripe(p, rect, 1.0 / 3.0, 2.0 / 3.0, green);
+            disc(p, cx, rect.height() * 0.14, Color32::from_rgb(30, 60, 140));
+        }
+        "ES" => {
+            p.rect_filled(*rect, 0.0, red);
+            hstripe(p, rect, 0.5, 0.25, yellow);
+        }
+        "PT" => {
+            p.rect_filled(*rect, 0.0, red);
+            vstripe(p, rect, 0.4, 0.0, green);
+            disc(p, egui::Pos2::new(rect.left() + rect.width() * 0.4, cx.y), rect.height() * 0.2, yellow);
+        }
+        "SE" => {
+            p.rect_filled(*rect, 0.0, Color32::from_rgb(40, 90, 160));
+            p.line_segment(
+                [egui::Pos2::new(rect.left() + rect.width() * 0.36, rect.top()), egui::Pos2::new(rect.left() + rect.width() * 0.36, rect.bottom())],
+                egui::Stroke::new(rect.height() * 0.2, yellow),
+            );
+            p.line_segment(
+                [egui::Pos2::new(rect.left(), rect.center().y), egui::Pos2::new(rect.right(), rect.center().y)],
+                egui::Stroke::new(rect.height() * 0.2, yellow),
+            );
+        }
+        "NO" => {
+            p.rect_filled(*rect, 0.0, white);
+            p.line_segment(
+                [egui::Pos2::new(rect.left() + rect.width() * 0.36, rect.top()), egui::Pos2::new(rect.left() + rect.width() * 0.36, rect.bottom())],
+                egui::Stroke::new(rect.height() * 0.26, blue),
+            );
+            p.line_segment(
+                [egui::Pos2::new(rect.left(), rect.center().y), egui::Pos2::new(rect.right(), rect.center().y)],
+                egui::Stroke::new(rect.height() * 0.26, blue),
+            );
+        }
+        "FI" => {
+            p.rect_filled(*rect, 0.0, white);
+            p.line_segment(
+                [egui::Pos2::new(rect.left() + rect.width() * 0.36, rect.top()), egui::Pos2::new(rect.left() + rect.width() * 0.36, rect.bottom())],
+                egui::Stroke::new(rect.height() * 0.28, blue),
+            );
+            p.line_segment(
+                [egui::Pos2::new(rect.left(), rect.center().y), egui::Pos2::new(rect.right(), rect.center().y)],
+                egui::Stroke::new(rect.height() * 0.28, blue),
+            );
+        }
+        "DK" => {
+            p.rect_filled(*rect, 0.0, red);
+            p.line_segment(
+                [egui::Pos2::new(rect.left() + rect.width() * 0.36, rect.top()), egui::Pos2::new(rect.left() + rect.width() * 0.36, rect.bottom())],
+                egui::Stroke::new(rect.height() * 0.24, white),
+            );
+            p.line_segment(
+                [egui::Pos2::new(rect.left(), rect.center().y), egui::Pos2::new(rect.right(), rect.center().y)],
+                egui::Stroke::new(rect.height() * 0.24, white),
+            );
+        }
+        "GR" => {
+            p.rect_filled(*rect, 0.0, white);
+            let sh = rect.height() / 5.0;
+            let mut i = 0;
+            while i < 5 {
+                p.rect_filled(
+                    egui::Rect::from_min_size(
+                        egui::Pos2::new(rect.left(), rect.top() + i as f32 * sh),
+                        egui::vec2(rect.width(), (sh / 2.0).ceil().max(1.0)),
+                    ),
+                    0.0,
+                    blue,
+                );
+                i += 2;
+            }
+            p.rect_filled(
+                egui::Rect::from_min_size(rect.left_top(), egui::vec2(rect.width() * 0.36, rect.height() * 0.6)),
+                0.0,
+                blue,
+            );
+        }
+        "CA" => {
+            p.rect_filled(*rect, 0.0, white);
+            vstripe(p, rect, 0.25, 0.0, red);
+            vstripe(p, rect, 0.25, 0.75, red);
+            let m = egui::Pos2::new(rect.center().x, rect.center().y);
+            p.line_segment(
+                [egui::Pos2::new(m.x, m.y - rect.height() * 0.22), egui::Pos2::new(m.x, m.y + rect.height() * 0.22)],
+                egui::Stroke::new(rect.width() * 0.06, red),
+            );
+        }
+        _ => {}
+    }
+}
+
+/// Allocate a 16x11 flag rect (only when the code is supported) and draw it.
+/// Returns false when nothing was drawn.
+fn flag_ui(ui: &mut egui::Ui, code: &str) -> bool {
+    if !flag_known(code) {
+        return false;
+    }
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 11.0), egui::Sense::hover());
+    draw_flag(ui.painter(), &rect, code);
+    true
+}
+
 fn group_series(g: &GroupData) -> Vec<Series> {
     let first = g.rows.first().map(|r| r.0).unwrap_or(g.from);
     let mut x0 = ((g.from.max(first - 60.0)) / 60.0).ceil() * 60.0;
@@ -1192,6 +1481,34 @@ impl PacketlyApp {
                 self.dark, self.zoom, self.auto_scale as i32, self.scale_cap
             ),
         );
+    }
+
+    /// Universal icon for pseudo-apps (unknown:pidN / name:...) that have no exe.
+    fn is_pseudo_app(name: &str) -> bool {
+        name.starts_with("unknown:") || name.starts_with("name:")
+    }
+
+    fn unknown_texture(&mut self, ctx: &egui::Context) -> egui::TextureHandle {
+        if let Some(tex) = self.icon_tex.get(&i64::MIN) {
+            return tex.clone();
+        }
+        const PNG: &[u8] = include_bytes!("../../assets/unknown.png");
+        let img = image::load_from_memory(PNG).expect("embedded unknown.png").to_rgba8();
+        let size = [img.width() as usize, img.height() as usize];
+        let color_img = egui::ColorImage::from_rgba_unmultiplied(size, &img.into_raw());
+        let tex = ctx.load_texture("unknown-app", color_img, egui::TextureOptions::LINEAR);
+        self.icon_tex.insert(i64::MIN, tex.clone());
+        tex
+    }
+
+    /// Icon for an app row: the real icon when one exists, the universal
+    /// "?" tile for unknown/unnamed processes, None otherwise (dots for
+    /// categories).
+    fn app_icon_opt(&mut self, ctx: &egui::Context, id: i64, name: &str) -> Option<egui::TextureHandle> {
+        if Self::is_pseudo_app(name) {
+            return Some(self.unknown_texture(ctx));
+        }
+        self.icon_texture(ctx, id)
     }
 
     fn icon_texture(&mut self, ctx: &egui::Context, id: i64) -> Option<egui::TextureHandle> {
@@ -1752,7 +2069,18 @@ impl PacketlyApp {
                                     let pressed = ctx.input(|i| i.pointer.primary_pressed());
                                     let down = ctx.input(|i| i.pointer.primary_down());
                                     let released = ctx.input(|i| i.pointer.primary_released());
-                                    if pressed {
+                                    // only interact with the plot when the pointer is over
+                                    // the PLOT's own layer - clicks on the selection popup /
+                                    // details popup / combo menus (which overlap the plot
+                                    // rect) must not start or clear a selection
+                                    let over_plot = pointer
+                                        .map(|pos| {
+                                            ctx.layer_id_at(pos).map_or(false, |l| {
+                                                l == presp.response.layer_id
+                                            })
+                                        })
+                                        .unwrap_or(false);
+                                    if pressed && over_plot {
                                         if let Some(pos) = pointer {
                                             if frame.contains(pos) {
                                                 let ts = presp
@@ -1763,7 +2091,7 @@ impl PacketlyApp {
                                                 self.sel_drag = Some((ts, ts));
                                             }
                                         }
-                                    } else if down {
+                                    } else if down && over_plot {
                                         if let (Some(pos), Some((s0, _))) =
                                             (pointer, self.sel_drag)
                                         {
@@ -1911,8 +2239,8 @@ impl PacketlyApp {
                                                             for a in apps.iter().take(20) {
                                                                 ui.horizontal(|ui| {
                                                                     if let Some(tex) = self
-                                                                        .icon_texture(
-                                                                            ctx, a.app_id,
+                                                                        .app_icon_opt(
+                                                                            ctx, a.app_id, &a.name,
                                                                         )
                                                                     {
                                                                         ui.add(
@@ -1977,14 +2305,11 @@ impl PacketlyApp {
                                                         ui.separator();
                                                         for h in sd.hosts.iter().take(3) {
                                                             ui.horizontal(|ui| {
-                                                                ui.weak(
-                                                                    egui::RichText::new(
-                                                                        h.region
-                                                                            .clone()
-                                                                            .unwrap_or_default(),
-                                                                    )
-                                                                    .size(10.5),
-                                                                );
+                                                                if let Some(rg) =
+                                                                    h.region.as_deref()
+                                                                {
+                                                                    flag_ui(ui, rg);
+                                                                }
                                                                 ui.label(
                                                                     egui::RichText::new(&h.label)
                                                                         .size(11.5),
@@ -2063,8 +2388,8 @@ impl PacketlyApp {
                                     .map(|tr| (tr.from as i64, tr.to as i64));
                                 for (name, sub, color, icon_id, i, o) in rows {
                                     ui.horizontal(|ui| {
-                                        if let Some(tex) =
-                                            icon_id.and_then(|id| app.icon_texture(ui.ctx(), id))
+                                        if let Some(tex) = icon_id
+                                            .and_then(|id| app.app_icon_opt(ui.ctx(), id, &name))
                                         {
                                             ui.add(
                                                 egui::Image::from_texture(&tex)
@@ -2077,6 +2402,9 @@ impl PacketlyApp {
                                         let name_w = (aw - 84.0).max(60.0);
                                         ui.vertical(|ui| {
                                             ui.set_max_width(name_w);
+                                            if name.len() == 2 && flag_known(&name) {
+                                                flag_ui(ui, &name);
+                                            }
                                             let lbl = ui.add(
                                                 egui::Label::new(
                                                     egui::RichText::new(&name).color(t.text),
@@ -2101,6 +2429,7 @@ impl PacketlyApp {
                                                 }
                                             }
                                             if let Some(s) = &sub {
+                                                flag_ui(ui, s);
                                                 ui.weak(egui::RichText::new(s.as_str())
                                                     .size(10.5)
                                                     .color(t.dim));
@@ -2373,7 +2702,9 @@ impl PacketlyApp {
                         for (id, name, bytes) in &snap.usage_per_app {
                             let c = color_for(&id.to_string());
                             ui.horizontal(|ui| {
-                                if let Some(tex) = self.icon_texture(ui.ctx(), *id) {
+                                if let Some(tex) =
+                                    self.app_icon_opt(ui.ctx(), *id, name)
+                                {
                                     ui.add(
                                         egui::Image::from_texture(&tex)
                                             .max_size(egui::vec2(17.0, 17.0)),
@@ -2867,7 +3198,9 @@ impl PacketlyApp {
 
                         // header
                         ui.horizontal(|ui| {
-                            if let Some(tex) = self.icon_texture(ctx, d.app_id) {
+                            if let Some(tex) =
+                                self.app_icon_opt(ctx, d.app_id, &d.name)
+                            {
                                 ui.add(
                                     egui::Image::from_texture(&tex)
                                         .max_size(egui::vec2(24.0, 24.0)),
@@ -3016,15 +3349,9 @@ impl PacketlyApp {
                                         for h in &hosts {
                                             ui.horizontal(|ui| {
                                                 ui.set_min_width(430.0);
-                                                ui.weak(
-                                                    egui::RichText::new(
-                                                        h.region
-                                                            .clone()
-                                                            .unwrap_or_default(),
-                                                    )
-                                                    .size(10.5)
-                                                    .color(t.dim),
-                                                );
+                                                if let Some(rg) = h.region.as_deref() {
+                                                    flag_ui(ui, rg);
+                                                }
                                                 ui.add(
                                                     egui::Label::new(
                                                         egui::RichText::new(&h.label)
