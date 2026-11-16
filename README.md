@@ -1,13 +1,15 @@
 # Packetly
 
-A lightweight, open-source GlassWire-style network monitor for Windows — live per-app
-traffic graphing, attribution, usage quotas and alerts, with a native desktop UI.
-Not affiliated with GlassWire; no firewall, no network scanner, no resource monitor.
+A lightweight, open-source network monitor for Windows. It shows you — live, per
+second — which applications are using your internet connection, how much they
+upload and download, and which servers they talk to. Includes usage quotas with
+alerts, per-app history, and a fast native desktop UI with light and AMOLED-dark
+themes. (It is purely a traffic monitor: no firewall, no network scanner.)
 
 ## Features
 
 - **Live traffic monitor** — real-time per-second traffic graph from Windows ETW
-  kernel-network events, with GlassWire-style smooth rolling hills, auto-scale,
+  kernel-network events, with smooth rolling hills, auto-scale,
   drag-select any region for a per-app/host breakdown
 - **Per-app attribution** — every byte is attributed to the executable that caused it
   (PID resolution + TCP owner-table fallback)

@@ -1,7 +1,7 @@
-# Packetly — a lightweight DIY GlassWire-style network monitor (Windows)
+# Packetly — the collector service (Windows)
 
-Phase 5 complete — the full GlassWire-style monitor, minus firewall,
-network scanning and resource monitor:
+The full monitor: live per-app traffic collection, storage and a local API.
+Deliberately out of scope: firewall, network scanning, resource monitor.
 
 - Collector: real-time ETW kernel-network events, per-app attribution,
   no-admin TCP polling fallback

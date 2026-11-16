@@ -591,7 +591,7 @@ async Task<int> RunServeAsync(string dbPath, string mode, int port, bool elevate
     Log($"API listening on http://127.0.0.1:{port}/");
     CreateDashboardShortcuts(port);
 
-    // open the dashboard window shortly after startup (GlassWire-like behavior)
+    // open the dashboard window shortly after startup
     _ = Task.Run(async () =>
     {
         try

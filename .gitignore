@@ -13,7 +13,7 @@ ui-theme.txt
 
 # workspace-only working docs & artifacts (not part of the published project)
 PROJECT-STATUS.md
-glasswire-architecture-report.md
+architecture-report.md
 tools/
 packtest/
 *.png

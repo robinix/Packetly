@@ -1,4 +1,4 @@
-//! Packetly native UI — GlassWire-style monitor (egui + egui_plot).
+//! Packetly native UI — live network traffic monitor (egui + egui_plot).
 //! v3.1: tabs, smooth filled graph with custom axis overlay, Traffic 4-column view,
 //! Usage tab with quota form, Alerts tab, zoom 100-175 %, light/dark themes,
 //! per-app icons, custom date range, single-instance guard.
@@ -1603,7 +1603,7 @@ impl PacketlyApp {
                                             || rd.cap_bits != cap.to_bits()
                                     });
                                     if stale {
-                                        // two box passes approximate a gaussian -> GlassWire hills
+                                        // two box passes approximate a gaussian -> soft rounded hills
                                         let series_pts: Vec<Vec<[f64; 2]>> = p
                                             .series
                                             .iter()
