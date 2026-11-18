@@ -1656,7 +1656,16 @@ impl PacketlyApp {
                             ui.add_space(14.0);
                         }
                     });
+                    let selection_paused = self.tab == Tab::Graph
+                        && self.snap.lock().unwrap().sel.is_some();
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if selection_paused {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(240, 200, 60),
+                                egui::RichText::new("⏸ paused").size(12.0),
+                            );
+                            ui.add_space(10.0);
+                        }
                         if ui
                             .button(if self.settings_open { "✕ close" } else { "⚙ settings" })
                             .clicked()
@@ -3256,6 +3265,7 @@ fn main() -> eframe::Result {
             let mut period = UsagePeriod::Today;
             let mut sel_data: Option<SelData> = None;
             let mut app_detail_req: Option<(i64, i64, i64)> = None;
+            let mut paused_dirty = false;
             loop {
                 let timeout = sel.refresh();
                 match rx.recv_timeout(timeout) {
@@ -3321,6 +3331,7 @@ fn main() -> eframe::Result {
                                 })
                                 .unwrap_or_default();
                                 sel_data = Some(SelData { t0, t1, hosts, apps });
+                                paused_dirty = true;
                             }
                         },
                     },
@@ -3330,11 +3341,31 @@ fn main() -> eframe::Result {
                 // selection active -> pause live refreshes (the whole view
                 // freezes so the selected range stays in focus; a plain click
                 // on the plot clears the selection and unpauses)
-                let mut fresh = if sel_data.is_some() {
-                    None
-                } else {
-                    Some(fetch_snapshot(&tab, &sel, period))
-                };
+                if sel_data.is_some() {
+                    // paused: republish the frozen snapshot only when the
+                    // selection changed or a detail fetch is pending
+                    if paused_dirty || app_detail_req.is_some() {
+                        let prev = snap.lock().unwrap().clone();
+                        let mut p2 = (*prev).clone();
+                        p2.sel = sel_data.clone();
+                        if let Some((aid, f, t)) = app_detail_req {
+                            p2.app_detail = fetch_json(&format!(
+                                "{}/api/appinfo?app_id={}&from={}&to={}",
+                                API, aid, f, t
+                            ))
+                            .ok()
+                            .map(|d| parse_appinfo(&d, aid, f, t));
+                            app_detail_req = None;
+                        }
+                        *snap.lock().unwrap() = Arc::new(p2);
+                        paused_dirty = false;
+                        if let Some(ctx) = ui_ctx.lock().unwrap().as_ref() {
+                            ctx.request_repaint();
+                        }
+                    }
+                    continue;
+                }
+                let mut fresh = Some(fetch_snapshot(&tab, &sel, period));
                 if let Some((aid, f, t)) = app_detail_req {
                     let detail = fetch_json(&format!(
                         "{}/api/appinfo?app_id={}&from={}&to={}",
@@ -3342,24 +3373,10 @@ fn main() -> eframe::Result {
                     ))
                     .ok()
                     .map(|d| parse_appinfo(&d, aid, f, t));
-                    match (fresh.as_mut(), detail) {
-                        (Some(fr), Some(d)) => fr.app_detail = Some(d),
-                        (None, Some(d)) => {
-                            // paused: patch the frozen snapshot in place
-                            let prev = snap.lock().unwrap().clone();
-                            let mut patched = (*prev).clone();
-                            patched.app_detail = Some(d);
-                            fresh = Some(patched);
-                        }
-                        (None, None) => {
-                            // paused + popup closed: clear it on the frozen snapshot
-                            let prev = snap.lock().unwrap().clone();
-                            let mut patched = (*prev).clone();
-                            patched.app_detail = None;
-                            fresh = Some(patched);
-                        }
-                        (Some(_), None) => {}
+                    if let Some(fr) = fresh.as_mut() {
+                        fr.app_detail = detail;
                     }
+                    app_detail_req = None;
                 }
                 if let Some(fr) = fresh.as_mut() {
                     fr.sel = sel_data.clone();
