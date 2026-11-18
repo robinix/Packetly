@@ -19,6 +19,10 @@ themes. (It is purely a traffic monitor: no firewall, no network scanner.)
   bandwidth, name, path, version, publisher, per-host breakdown and alerts
 - **Country flags** — small painted flags next to host countries (zero extra
   resources), and a universal icon for system/unnamed processes
+- **Settings** — categorized dialog (gear icon, top right): theme, run at
+  Windows startup, start minimized to tray, GeoIP country lookups, about
+- **Selection pause** — selecting a range on the graph pauses live updates
+  so the chosen window stays in focus; a click on the plot resumes
 - **Usage & quotas** — per-app or global usage over 5 minutes/3 hours/24 hours/
   7 days/30 days/all time/custom, daily/weekly/monthly quotas with 75/90/100 % alerts
 - **Alerts** — new-app-on-the-network notifications, quota threshold alerts

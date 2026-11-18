@@ -591,9 +591,16 @@ async Task<int> RunServeAsync(string dbPath, string mode, int port, bool elevate
     Log($"API listening on http://127.0.0.1:{port}/");
     CreateDashboardShortcuts(port);
 
-    // open the dashboard window shortly after startup
-    _ = Task.Run(async () =>
+    // open the dashboard window shortly after startup - unless the user chose
+    // "start minimized to tray" in settings (the tray icon opens it on click)
+    if (StartMinimized())
     {
+        Log("start minimized to tray is enabled - not opening the dashboard");
+    }
+    else
+    {
+        _ = Task.Run(async () =>
+        {
         try
         {
             await Task.Delay(2500, ct);
@@ -602,6 +609,7 @@ async Task<int> RunServeAsync(string dbPath, string mode, int port, bool elevate
         }
         catch (OperationCanceledException) { }
     });
+    }
 
     try
     {
@@ -628,6 +636,25 @@ async Task<int> RunServeAsync(string dbPath, string mode, int port, bool elevate
 }
 
 // ---- logging ----
+
+static bool StartMinimized()
+{
+    try
+    {
+        var path = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "Packetly", "ui-prefs.txt");
+        if (!File.Exists(path)) return false;
+        foreach (var line in File.ReadAllLines(path))
+        {
+            var idx = line.IndexOf('=');
+            if (idx > 0 && line[..idx].Trim() == "startmin" && line[(idx + 1)..].Trim() == "1")
+                return true;
+        }
+    }
+    catch { }
+    return false;
+}
 
 static string LogPath()
 {

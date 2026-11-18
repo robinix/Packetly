@@ -46,6 +46,10 @@ internal sealed class TrayController : IDisposable
         menu.Items.Add("Exit", null, (_, _) => _exit());
         icon.ContextMenuStrip = menu;
         icon.DoubleClick += (_, _) => _openDashboard();
+        icon.MouseClick += (_, e) =>
+        {
+            if (e.Button == MouseButtons.Left) _openDashboard();
+        };
 
         _started.TrySetResult(true);
         Application.Run(); // message loop for the notify icon

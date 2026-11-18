@@ -479,6 +479,13 @@ struct AppDetail {
 }
 
 #[derive(Clone, Default)]
+struct UiFlags {
+    startup_state: Option<bool>,
+    startup_pending: bool,
+    geoip_state: Option<bool>,
+}
+
+#[derive(Clone, Default)]
 struct SelData {
     apps: Vec<SelApp>,
     t0: f64,
@@ -507,6 +514,7 @@ struct Snapshot {
     sel: Option<SelData>,
     app_detail: Option<AppDetail>,
     usage_range: (i64, i64),
+    app_version: String,
 }
 
 struct Rendered {
@@ -841,6 +849,92 @@ fn fetch_traffic(q: &str) -> Result<TrafficData, String> {
     })
 }
 
+fn parse_appinfo(d: &serde_json::Value, app_id: i64, f: i64, t: i64) -> AppDetail {
+    AppDetail {
+        app_id,
+        name: d["name"].as_str().unwrap_or("?").to_string(),
+        path: d["path"].as_str().map(|x| x.to_string()),
+        publisher: d["publisher"].as_str().map(|x| x.to_string()),
+        version: d["version"].as_str().map(|x| x.to_string()),
+        in_bytes: d["inBytes"].as_f64().unwrap_or(0.0),
+        out_bytes: d["outBytes"].as_f64().unwrap_or(0.0),
+        alert_count: d["alertCount"].as_i64().unwrap_or(0),
+        hosts: d["hosts"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .map(|h| AppHostRow {
+                        label: h["hostname"]
+                            .as_str()
+                            .map(|x| x.to_string())
+                            .unwrap_or_else(|| h["ip"].as_str().unwrap_or("?").to_string()),
+                        region: h["region"].as_str().map(|x| x.to_string()),
+                        in_bytes: h["inBytes"].as_f64().unwrap_or(0.0),
+                        out_bytes: h["outBytes"].as_f64().unwrap_or(0.0),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        range: (f, t),
+    }
+}
+
+fn query_startup() -> bool {
+    std::process::Command::new("schtasks")
+        .args(["/query", "/tn", "Packetly"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Enable/disable the logon task. Spawns an elevated process (UAC prompt)
+/// because a highest-privilege task can only be registered elevated.
+fn set_startup(enable: bool) -> bool {
+    let exe = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("packetly.exe")))
+        .filter(|p| p.exists())
+        .unwrap_or_else(|| {
+            std::path::Path::new(
+                &std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".to_string()),
+            )
+            .join("Packetly")
+            .join("packetly.exe")
+        });
+    if !exe.exists() {
+        return false;
+    }
+    let arg = if enable { "--install-autostart" } else { "--uninstall-autostart" };
+    std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            &format!(
+                "Start-Process -FilePath '{}' -ArgumentList '{}' -Verb RunAs -Wait | Out-Null",
+                exe.display(),
+                arg
+            ),
+        ])
+        .status()
+        .map(|st| st.success())
+        .unwrap_or(false)
+}
+
+fn fetch_geoip_state() -> Option<bool> {
+    fetch_json(&format!("{}/api/settings", API))
+        .ok()
+        .map(|d| d["geoip"].as_bool().unwrap_or(false))
+}
+
+fn set_geoip_state(enable: bool) -> Option<bool> {
+    let body = serde_json::json!({ "geoip": enable });
+    ureq::post(&format!("{}/api/settings", API))
+        .timeout(Duration::from_secs(4))
+        .send_json(body)
+        .ok()?;
+    fetch_geoip_state()
+}
+
 fn fetch_snapshot(tab: &Tab, sel: &RangeSel, period: UsagePeriod) -> Snapshot {
     let mut snap = Snapshot::default();
     let q = sel.query();
@@ -900,6 +994,7 @@ fn fetch_snapshot(tab: &Tab, sel: &RangeSel, period: UsagePeriod) -> Snapshot {
             .unwrap_or("")
             .to_string();
         snap.status_ok = true;
+        snap.app_version = d["version"].as_str().unwrap_or("?").to_string();
     }
 
     match tab {
@@ -1423,6 +1518,9 @@ struct PacketlyApp {
     sel_sort: SortKey,
     detail_tab: usize,
     detail_sort: SortKey,
+    settings_open: bool,
+    start_minimized: bool,
+    flags: Arc<Mutex<UiFlags>>,
 }
 
 #[derive(Clone)]
@@ -1477,8 +1575,12 @@ impl PacketlyApp {
         let _ = std::fs::write(
             prefs_file(),
             format!(
-                "dark={}\nzoom={}\nautoscale={}\nscalecap={}",
-                self.dark, self.zoom, self.auto_scale as i32, self.scale_cap
+                "dark={}\nzoom={}\nautoscale={}\nscalecap={}\nstartmin={}",
+                self.dark,
+                self.zoom,
+                self.auto_scale as i32,
+                self.scale_cap,
+                self.start_minimized as i32
             ),
         );
     }
@@ -1555,10 +1657,11 @@ impl PacketlyApp {
                         }
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button(if self.dark { "☼ light" } else { "☾ dark" }).clicked() {
-                            self.dark = !self.dark;
-                            Self::apply_visuals(ctx, &self.theme());
-                            self.save_prefs();
+                        if ui
+                            .button(if self.settings_open { "✕ close" } else { "⚙ settings" })
+                            .clicked()
+                        {
+                            self.settings_open = !self.settings_open;
                         }
                         ui.add_space(8.0);
                         egui::ComboBox::from_id_source("zoom")
@@ -2867,9 +2970,233 @@ impl eframe::App for PacketlyApp {
             Tab::Alerts => self.alerts_tab(ctx),
         }
         self.app_detail_popup(ctx);
+        self.settings_dialog(ctx);
     }
 
 
+}
+
+impl PacketlyApp {
+    fn settings_dialog(&mut self, ctx: &egui::Context) {
+        if !self.settings_open {
+            return;
+        }
+        let t = self.theme();
+        let snap = self.snap.lock().unwrap().clone();
+        let flags = self.flags.lock().unwrap().clone();
+
+        // one-shot background queries when the dialog opens
+        if flags.startup_state.is_none() && !flags.startup_pending {
+            let flags2 = self.flags.clone();
+            let ctx2 = ctx.clone();
+            std::thread::spawn(move || {
+                let ok = query_startup();
+                flags2.lock().unwrap().startup_state = Some(ok);
+                ctx2.request_repaint();
+            });
+        }
+        if flags.geoip_state.is_none() {
+            let flags2 = self.flags.clone();
+            let ctx2 = ctx.clone();
+            std::thread::spawn(move || {
+                let st = fetch_geoip_state();
+                flags2.lock().unwrap().geoip_state = st;
+                ctx2.request_repaint();
+            });
+        }
+
+        egui::Area::new(egui::Id::new("settings-dialog"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style())
+                    .fill(t.card)
+                    .stroke(egui::Stroke::new(1.0, t.border))
+                    .show(ui, |ui| {
+                        ui.set_min_width(460.0);
+                        ui.set_max_width(460.0);
+
+                        ui.horizontal(|ui| {
+                            ui.strong(
+                                egui::RichText::new("Settings").size(15.0).color(t.text),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.small_button("✕").clicked() {
+                                        self.settings_open = false;
+                                    }
+                                },
+                            );
+                        });
+                        ui.separator();
+
+                        // ---- appearance ----
+                        ui.weak(
+                            egui::RichText::new("APPEARANCE")
+                                .size(10.5)
+                                .color(t.dim),
+                        );
+                        if ui
+                            .checkbox(&mut self.dark, "Dark theme")
+                            .changed()
+                        {
+                            Self::apply_visuals(ctx, &self.theme());
+                            self.save_prefs();
+                        }
+                        ui.add_space(4.0);
+
+                        // ---- startup ----
+                        ui.weak(
+                            egui::RichText::new("STARTUP")
+                                .size(10.5)
+                                .color(t.dim),
+                        );
+                        if flags.startup_pending {
+                            ui.weak(
+                                egui::RichText::new(
+                                    "applying… (confirm the UAC prompt if it appears)",
+                                )
+                                .size(11.0)
+                                .color(t.dim),
+                            );
+                        } else {
+                            match flags.startup_state {
+                                None => {
+                                    ui.weak(
+                                        egui::RichText::new("checking…")
+                                            .size(11.0)
+                                            .color(t.dim),
+                                    );
+                                }
+                                Some(on) => {
+                                    let mut v = on;
+                                    let resp = ui.add_enabled(
+                                        true,
+                                        egui::Checkbox::new(&mut v, "Run at Windows startup"),
+                                    );
+                                    if resp.clicked() {
+                                        let flags2 = self.flags.clone();
+                                        let ctx2 = ctx.clone();
+                                        let enable = !on;
+                                        flags2.lock().unwrap().startup_pending = true;
+                                        std::thread::spawn(move || {
+                                            set_startup(enable);
+                                            let ok = query_startup();
+                                            flags2.lock().unwrap().startup_state = Some(ok);
+                                            flags2.lock().unwrap().startup_pending = false;
+                                            ctx2.request_repaint();
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                        let start_min_allowed =
+                            flags.startup_state == Some(true) && !flags.startup_pending;
+                        ui.add_enabled(
+                            start_min_allowed,
+                            egui::Checkbox::new(
+                                &mut self.start_minimized,
+                                "Start minimized to tray (applies at next startup)",
+                            ),
+                        );
+                        if !start_min_allowed && flags.startup_state != Some(true) {
+                            ui.weak(
+                                egui::RichText::new(
+                                    "enable \u{201c}run at windows startup\u{201d} first",
+                                )
+                                .size(10.0)
+                                .color(t.dim),
+                            );
+                        }
+                        if ui
+                            .add(
+                                egui::Label::new(
+                                    egui::RichText::new(
+                                        "the collector keeps running in the tray; click its icon to open the dashboard",
+                                    )
+                                    .size(10.0)
+                                    .color(t.dim),
+                                ),
+                            )
+                            .changed()
+                        {}
+                        ui.add_space(4.0);
+
+                        // ---- privacy ----
+                        ui.weak(
+                            egui::RichText::new("PRIVACY")
+                                .size(10.5)
+                                .color(t.dim),
+                        );
+                        match flags.geoip_state {
+                            None => {
+                                ui.weak(
+                                    egui::RichText::new("checking…")
+                                        .size(11.0)
+                                        .color(t.dim),
+                                );
+                            }
+                            Some(on) => {
+                                let mut v = on;
+                                if ui
+                                    .checkbox(
+                                        &mut v,
+                                        "Resolve host countries (GeoIP, uses ip-api.com)",
+                                    )
+                                    .changed()
+                                {
+                                    let flags2 = self.flags.clone();
+                                    let ctx2 = ctx.clone();
+                                    flags2.lock().unwrap().geoip_state = None;
+                                    std::thread::spawn(move || {
+                                        let st = set_geoip_state(!on);
+                                        flags2.lock().unwrap().geoip_state = st;
+                                        ctx2.request_repaint();
+                                    });
+                                }
+                            }
+                        }
+                        ui.add_space(4.0);
+
+                        // ---- about ----
+                        ui.weak(
+                            egui::RichText::new("ABOUT").size(10.5).color(t.dim),
+                        );
+                        let row = |ui: &mut egui::Ui, k: &str, v: String| {
+                            ui.horizontal(|ui| {
+                                ui.set_min_width(430.0);
+                                ui.weak(egui::RichText::new(k).size(11.0).color(t.dim));
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(v).size(11.0),
+                                            )
+                                            .truncate(),
+                                        );
+                                    },
+                                );
+                            });
+                        };
+                        row(
+                            ui,
+                            "Version:",
+                            snap.app_version.clone(),
+                        );
+                        row(ui, "API:", "127.0.0.1:8912".to_string());
+                        row(
+                            ui,
+                            "Data:",
+                            format!(
+                                "{}\\Packetly",
+                                std::env::var("LOCALAPPDATA").unwrap_or_default()
+                            ),
+                        );
+                    });
+            });
+    }
 }
 
 /// Window/taskbar icon, embedded at compile time so every build (GNU or MSVC)
@@ -2892,6 +3219,7 @@ fn main() -> eframe::Result {
     let _guard = guard.unwrap();
 
     let snap: Arc<Mutex<Arc<Snapshot>>> = Arc::new(Mutex::new(Arc::new(Snapshot::default())));
+    let flags: Arc<Mutex<UiFlags>> = Arc::new(Mutex::new(UiFlags::default()));
     let (tx, rx) = std::sync::mpsc::channel::<UiMsg>();
     let ui_ctx: Arc<Mutex<Option<egui::Context>>> = Arc::new(Mutex::new(None));
 
@@ -2899,6 +3227,7 @@ fn main() -> eframe::Result {
     let mut zoom = 1.0_f32;
     let mut auto_scale = true;
     let mut scale_cap = 1_048_576.0_f64;
+    let mut start_minimized = false;
     if let Ok(s) = std::fs::read_to_string(prefs_file()) {
         for line in s.lines() {
             let mut kv = line.splitn(2, '=');
@@ -2909,6 +3238,7 @@ fn main() -> eframe::Result {
                 "zoom" => zoom = v.trim().parse().unwrap_or(1.0),
                 "autoscale" => auto_scale = v.trim() != "0",
                 "scalecap" => scale_cap = v.trim().parse().unwrap_or(1_048_576.0),
+                "startmin" => start_minimized = v.trim() != "0",
                 _ => {}
             }
         }
@@ -2997,90 +3327,89 @@ fn main() -> eframe::Result {
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                 }
-                let mut fresh = fetch_snapshot(&tab, &sel, period);
-                fresh.sel = sel_data.clone();
+                // selection active -> pause live refreshes (the whole view
+                // freezes so the selected range stays in focus; a plain click
+                // on the plot clears the selection and unpauses)
+                let mut fresh = if sel_data.is_some() {
+                    None
+                } else {
+                    Some(fetch_snapshot(&tab, &sel, period))
+                };
                 if let Some((aid, f, t)) = app_detail_req {
-                    fresh.app_detail = fetch_json(&format!(
+                    let detail = fetch_json(&format!(
                         "{}/api/appinfo?app_id={}&from={}&to={}",
                         API, aid, f, t
                     ))
                     .ok()
-                    .map(|d| AppDetail {
-                        app_id: aid,
-                        name: d["name"].as_str().unwrap_or("?").to_string(),
-                        path: d["path"].as_str().map(|x| x.to_string()),
-                        publisher: d["publisher"].as_str().map(|x| x.to_string()),
-                        version: d["version"].as_str().map(|x| x.to_string()),
-                        in_bytes: d["inBytes"].as_f64().unwrap_or(0.0),
-                        out_bytes: d["outBytes"].as_f64().unwrap_or(0.0),
-                        alert_count: d["alertCount"].as_i64().unwrap_or(0),
-                        hosts: d["hosts"]
-                            .as_array()
-                            .map(|arr| {
-                                arr.iter()
-                                    .map(|h| AppHostRow {
-                                        label: h["hostname"]
-                                            .as_str()
-                                            .map(|x| x.to_string())
-                                            .unwrap_or_else(|| {
-                                                h["ip"].as_str().unwrap_or("?").to_string()
-                                            }),
-                                        region: h["region"].as_str().map(|x| x.to_string()),
-                                        in_bytes: h["inBytes"].as_f64().unwrap_or(0.0),
-                                        out_bytes: h["outBytes"].as_f64().unwrap_or(0.0),
-                                    })
-                                    .collect()
-                            })
-                            .unwrap_or_default(),
-                        range: (f, t),
-                    });
+                    .map(|d| parse_appinfo(&d, aid, f, t));
+                    match (fresh.as_mut(), detail) {
+                        (Some(fr), Some(d)) => fr.app_detail = Some(d),
+                        (None, Some(d)) => {
+                            // paused: patch the frozen snapshot in place
+                            let prev = snap.lock().unwrap().clone();
+                            let mut patched = (*prev).clone();
+                            patched.app_detail = Some(d);
+                            fresh = Some(patched);
+                        }
+                        (None, None) => {
+                            // paused + popup closed: clear it on the frozen snapshot
+                            let prev = snap.lock().unwrap().clone();
+                            let mut patched = (*prev).clone();
+                            patched.app_detail = None;
+                            fresh = Some(patched);
+                        }
+                        (Some(_), None) => {}
+                    }
                 }
-
-                let mut want: Vec<i64> = fresh.apps.iter().map(|a| a.id).collect();
-                want.extend(fresh.usage_per_app.iter().map(|r| r.0));
-                want.sort_unstable();
-                want.dedup();
-                let mut fetched = 0;
-                for id in want {
-                    if fetched >= 2 {
-                        break;
-                    }
-                    if icon_cache.contains_key(&id) || icon_failed.contains(&id) {
-                        continue;
-                    }
-                    match ureq::get(&format!("{}/api/icon?app_id={}", API, id))
-                        .timeout(Duration::from_secs(4))
-                        .call()
-                    {
-                        Ok(resp) => {
-                            if resp.status() == 200 {
-                                let mut bytes = Vec::new();
-                                use std::io::Read;
-                                if resp
-                                    .into_reader()
-                                    .take(200_000)
-                                    .read_to_end(&mut bytes)
-                                    .is_ok()
-                                    && !bytes.is_empty()
-                                {
-                                    icon_cache.insert(id, bytes);
-                                    fetched += 1;
+                if let Some(fr) = fresh.as_mut() {
+                    fr.sel = sel_data.clone();
+                    let mut want: Vec<i64> = fr.apps.iter().map(|a| a.id).collect();
+                    want.extend(fr.usage_per_app.iter().map(|r| r.0));
+                    want.sort_unstable();
+                    want.dedup();
+                    let mut fetched = 0;
+                    for id in want {
+                        if fetched >= 2 {
+                            break;
+                        }
+                        if icon_cache.contains_key(&id) || icon_failed.contains(&id) {
+                            continue;
+                        }
+                        match ureq::get(&format!("{}/api/icon?app_id={}", API, id))
+                            .timeout(Duration::from_secs(4))
+                            .call()
+                        {
+                            Ok(resp) => {
+                                if resp.status() == 200 {
+                                    let mut bytes = Vec::new();
+                                    use std::io::Read;
+                                    if resp
+                                        .into_reader()
+                                        .take(200_000)
+                                        .read_to_end(&mut bytes)
+                                        .is_ok()
+                                        && !bytes.is_empty()
+                                    {
+                                        icon_cache.insert(id, bytes);
+                                        fetched += 1;
+                                    }
+                                } else {
+                                    icon_failed.insert(id);
                                 }
-                            } else {
+                            }
+                            Err(_) => {
                                 icon_failed.insert(id);
                             }
                         }
-                        Err(_) => {
-                            icon_failed.insert(id);
-                        }
                     }
+                    for row in fr.apps.iter_mut() {
+                        row.icon = icon_cache.get(&row.id).cloned();
+                    }
+                    fr.icons = icon_cache.clone();
                 }
-                for row in fresh.apps.iter_mut() {
-                    row.icon = icon_cache.get(&row.id).cloned();
+                if let Some(fr) = fresh {
+                    *snap.lock().unwrap() = Arc::new(fr);
                 }
-                fresh.icons = icon_cache.clone();
-
-                *snap.lock().unwrap() = Arc::new(fresh);
                 if let Some(ctx) = ui_ctx.lock().unwrap().as_ref() {
                     ctx.request_repaint();
                 }
@@ -3098,6 +3427,7 @@ fn main() -> eframe::Result {
     };
 
     let snap_for_app = snap.clone();
+    let flags_for_app = flags.clone();
     let ctx_holder = ui_ctx.clone();
     let zoom0 = zoom;
     eframe::run_native(
@@ -3137,6 +3467,9 @@ fn main() -> eframe::Result {
                 sel_sort: SortKey::Total,
                 detail_tab: 0,
                 detail_sort: SortKey::Down,
+                settings_open: false,
+                start_minimized,
+                flags: flags_for_app,
             }))
         }),
     )
