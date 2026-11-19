@@ -573,6 +573,7 @@ struct ChartCache {
 struct Pivot {
     x0: f64,
     x1: f64,
+    y_max: f64,
     bucket: f64,
     n: usize,
     series: Vec<Series>,
@@ -1181,6 +1182,12 @@ fn pivot(traffic: &TrafficData, in_c: egui::Color32, out_c: egui::Color32) -> Pi
         }
     }
 
+    // raw bucket peak -> basis of the y-scale
+    let mut y_max = 0.0_f64;
+    for v in down.iter().chain(up.iter()) {
+        y_max = y_max.max(*v);
+    }
+    p.y_max = y_max;
     p.series = vec![
         Series {
             name: "Upload".to_string(),
@@ -2089,23 +2096,44 @@ impl PacketlyApp {
                                     });
                                     if stale {
                                         // three box passes approximate a gaussian -> soft rounded hills
-                                        let series_pts: Vec<Vec<[f64; 2]>> = p
+                                        let mut series_pts: Vec<Vec<[f64; 2]>> = p
                                             .series
                                             .iter()
                                             .map(|s| {
-                                                moving_avg(
-                                                &moving_avg(&moving_avg(&s.points, r), r * 2 / 3),
-                                                r / 3,
-                                            )
-                                                    .into_iter()
-                                                    .map(|mut pt| {
-                                                        pt[1] = pt[1].min(cap);
-                                                        pt
-                                                    })
-                                                    .collect::<Vec<_>>()
+                                                smooth(
+                                                    &moving_avg(
+                                                        &moving_avg(
+                                                            &moving_avg(&s.points, r),
+                                                            r * 2 / 3,
+                                                        ),
+                                                        r / 3,
+                                                    ),
+                                                    2400,
+                                                )
                                             })
-                                            .map(|pts| smooth(&pts, 2400))
                                             .collect();
+                                        // smoothing crushes single-bucket peaks, so
+                                        // rescale the curve until its peak equals the
+                                        // true bucket peak: the y-scale (raw-peak based)
+                                        // stays honest and hills still fill the plot.
+                                        // Pure multiplication keeps every hill's
+                                        // proportion identical.
+                                        let mut rendered_max = 0.0_f64;
+                                        for pts in &series_pts {
+                                            for pt in pts {
+                                                rendered_max = rendered_max.max(pt[1]);
+                                            }
+                                        }
+                                        let k = if rendered_max > 0.0 && p.y_max > 0.0 {
+                                            p.y_max / rendered_max
+                                        } else {
+                                            1.0
+                                        };
+                                        for pts in &mut series_pts {
+                                            for pt in pts.iter_mut() {
+                                                pt[1] = (pt[1] * k).min(cap);
+                                            }
+                                        }
                                         cache.rendered = Some(Rendered {
                                             ver: ver.unwrap_or(0),
                                             r,
@@ -2116,15 +2144,11 @@ impl PacketlyApp {
                                     cache.rendered.as_ref().unwrap().series.clone()
                                 };
 
-                                // scale to the RENDERED peak: smoothing lowers raw
-                                // peaks, so scaling by the raw max left the curve
-                                // flat under a huge scale (the 1.5.0 bug)
-                                let rendered_max = rendered
-                                    .iter()
-                                    .flat_map(|pts| pts.iter().map(|pt| pt[1]))
-                                    .fold(0.0_f64, f64::max);
+                                // scale from the RAW bucket peak (p.y_max): the
+                                // rendered curve is peak-normalized to it, so the
+                                // grid honestly reflects what the hills reach
                                 let y_top = if self.auto_scale {
-                                    let target = (rendered_max * 1.25).max(1024.0);
+                                    let target = (p.y_max * 1.25).max(1024.0);
                                     let st = nice_step(target / 8.0);
                                     (target / st).ceil() * st
                                 } else {
@@ -2165,7 +2189,7 @@ impl PacketlyApp {
                                     .height((ui.available_height() * 0.88).max(300.0));
                                 let plot = plot
                                     .include_y(0.0)
-                                    .include_y(y_top);
+                                    .include_y(y_top * 1.04);
                                 let dark_theme = t.text.r() > 128;
                                 let presp = plot.show(ui, |plot_ui| {
                                     // dark muted fills first (occlude like the
@@ -2217,19 +2241,22 @@ impl PacketlyApp {
                                     }
                                     let mut yv = y_step;
                                     while yv <= y_top {
-
                                         let py = presp.transform.position_from_point_y(yv);
                                         painter.line_segment(
                                             [egui::Pos2::new(rect.left(), py), egui::Pos2::new(rect.right(), py)],
                                             egui::Stroke::new(1.0, t.grid),
                                         );
-                                        painter.text(
-                                            egui::Pos2::new(rect.left() + 6.0, py - 4.0),
-                                            egui::Align2::LEFT_BOTTOM,
-                                            fmt_b(yv),
-                                            egui::FontId::proportional(11.0),
-                                            t.axis,
-                                        );
+                                        // labels hugging the top edge collide with the
+                                        // Auto-scale/cap button row above the plot
+                                        if py >= rect.top() + 10.0 {
+                                            painter.text(
+                                                egui::Pos2::new(rect.left() + 6.0, py - 4.0),
+                                                egui::Align2::LEFT_BOTTOM,
+                                                fmt_b(yv),
+                                                egui::FontId::proportional(11.0),
+                                                t.axis,
+                                            );
+                                        }
                                         yv += y_step;
                                     }
                                 }
