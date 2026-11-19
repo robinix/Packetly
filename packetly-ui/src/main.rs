@@ -1673,23 +1673,7 @@ impl PacketlyApp {
                             self.settings_open = !self.settings_open;
                         }
                         ui.add_space(8.0);
-                        egui::ComboBox::from_id_source("zoom")
-                            .selected_text(format!("{:.0}%", self.zoom * 100.0))
-                            .show_ui(ui, |ui| {
-                                for z in [1.0_f32, 1.25, 1.5, 1.75] {
-                                    if ui
-                                        .selectable_label(
-                                            (self.zoom - z).abs() < 0.01,
-                                            format!("{:.0}%", z * 100.0),
-                                        )
-                                        .clicked()
-                                    {
-                                        self.zoom = z;
-                                        ctx.set_pixels_per_point(z);
-                                        self.save_prefs();
-                                    }
-                                }
-                            });
+
                     });
                 });
             });
@@ -3053,6 +3037,27 @@ impl PacketlyApp {
                             Self::apply_visuals(ctx, &self.theme());
                             self.save_prefs();
                         }
+                        ui.horizontal(|ui| {
+                            ui.weak("UI zoom:");
+                            egui::ComboBox::from_id_source("settings_zoom")
+                                .selected_text(format!("{:.0}%", self.zoom * 100.0))
+                                .width(80.0)
+                                .show_ui(ui, |ui| {
+                                    for z in [1.0_f32, 1.25, 1.5, 1.75] {
+                                        if ui
+                                            .selectable_label(
+                                                (self.zoom - z).abs() < 0.01,
+                                                format!("{:.0}%", z * 100.0),
+                                            )
+                                            .clicked()
+                                        {
+                                            self.zoom = z;
+                                            ctx.set_pixels_per_point(z);
+                                            self.save_prefs();
+                                        }
+                                    }
+                                });
+                        });
                         ui.add_space(4.0);
 
                         // ---- startup ----
@@ -3102,13 +3107,16 @@ impl PacketlyApp {
                         }
                         let start_min_allowed =
                             flags.startup_state == Some(true) && !flags.startup_pending;
-                        ui.add_enabled(
+                        let resp = ui.add_enabled(
                             start_min_allowed,
                             egui::Checkbox::new(
                                 &mut self.start_minimized,
                                 "Start minimized to tray (applies at next startup)",
                             ),
                         );
+                        if resp.changed() {
+                            self.save_prefs();
+                        }
                         if !start_min_allowed && flags.startup_state != Some(true) {
                             ui.weak(
                                 egui::RichText::new(
