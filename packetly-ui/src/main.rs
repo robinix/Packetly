@@ -92,14 +92,14 @@ impl Theme {
     }
     fn elite() -> Self {
         Self {
-            nav_bg: egui::Color32::from_rgb(16, 22, 38),
-            bg: egui::Color32::from_rgb(20, 27, 45),
-            plot_bg: egui::Color32::from_rgb(24, 33, 54),
-            card: egui::Color32::from_rgb(30, 40, 64),
-            card2: egui::Color32::from_rgb(36, 47, 74),
-            border: egui::Color32::from_rgb(48, 60, 92),
-            text: egui::Color32::from_rgb(206, 214, 230),
-            dim: egui::Color32::from_rgb(122, 134, 162),
+            nav_bg: egui::Color32::from_rgb(12, 17, 30),
+            bg: egui::Color32::from_rgb(15, 21, 36),
+            plot_bg: egui::Color32::from_rgb(18, 25, 42),
+            card: egui::Color32::from_rgb(25, 33, 52),
+            card2: egui::Color32::from_rgb(30, 40, 62),
+            border: egui::Color32::from_rgb(42, 53, 82),
+            text: egui::Color32::from_rgb(204, 212, 228),
+            dim: egui::Color32::from_rgb(118, 130, 158),
             grid: egui::Color32::from_rgba_unmultiplied(255, 255, 255, 5),
             axis: egui::Color32::from_rgb(124, 137, 173),
             accent: egui::Color32::from_rgb(132, 179, 60),
@@ -1186,7 +1186,7 @@ fn pivot(traffic: &TrafficData, in_c: egui::Color32, out_c: egui::Color32) -> Pi
     for v in down.iter().chain(up.iter()) {
         y_max = y_max.max(*v);
     }
-    p.y_max = y_max * 1.08;
+    p.y_max = y_max * 1.45;
     p.series = vec![
         Series {
             name: "Upload".to_string(),
@@ -1936,10 +1936,7 @@ impl PacketlyApp {
                                     let mr = ((p.n as f64) / 25.0)
                                         .round()
                                         .clamp(2.0, 400.0) as usize;
-                                    let xs = smooth(
-                                        &moving_avg(&moving_avg(&moving_avg(&xs, mr), mr * 2 / 3), mr / 3),
-                                        400,
-                                    );
+                                    let xs = smooth(&moving_avg(&xs, mr), 400);
                                     cache.mini = Some((ver, Arc::new(xs)));
                                 }
                                 cache.mini.as_ref().unwrap().1.clone()
@@ -2028,21 +2025,39 @@ impl PacketlyApp {
                                     );
                                     if !self.auto_scale {
                                         ui.separator();
-                                        for (lbl2, val) in [
-                                            ("100 KB", 102_400.0_f64),
-                                            ("1 MB", 1_048_576.0),
-                                            ("10 MB", 10_485_760.0),
-                                            ("100 MB", 104_857_600.0),
-                                            ("1 GB", 1_073_741_824.0),
-                                        ] {
-                                            if ui
-                                                .selectable_label(self.scale_cap == val, lbl2)
-                                                .clicked()
-                                            {
-                                                self.scale_cap = val;
-                                                self.save_prefs();
-                                            }
-                                        }
+                                        egui::ScrollArea::vertical()
+                                            .max_height(240.0)
+                                            .show(ui, |ui| {
+                                                for (lbl2, val) in [
+                                                    ("50 KB", 51_200.0_f64),
+                                                    ("100 KB", 102_400.0),
+                                                    ("250 KB", 256_000.0),
+                                                    ("500 KB", 512_000.0),
+                                                    ("1 MB", 1_048_576.0),
+                                                    ("2 MB", 2_097_152.0),
+                                                    ("5 MB", 5_242_880.0),
+                                                    ("10 MB", 10_485_760.0),
+                                                    ("25 MB", 26_214_400.0),
+                                                    ("50 MB", 52_428_800.0),
+                                                    ("100 MB", 104_857_600.0),
+                                                    ("250 MB", 262_144_000.0),
+                                                    ("500 MB", 524_288_000.0),
+                                                    ("1 GB", 1_073_741_824.0),
+                                                    ("2 GB", 2_147_483_648.0),
+                                                    ("5 GB", 5_368_709_120.0),
+                                                ] {
+                                                    if ui
+                                                        .selectable_label(
+                                                            (self.scale_cap - val).abs() < 1.0,
+                                                            lbl2,
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        self.scale_cap = val;
+                                                        self.save_prefs();
+                                                    }
+                                                }
+                                            });
                                     }
                                 });
                             });
@@ -2095,11 +2110,14 @@ impl PacketlyApp {
                                     .set_margin_fraction(egui::Vec2::ZERO)
                                     .show_axes([false, true])
                                     .height((ui.available_height() * 0.88).max(300.0));
-                                let plot = if self.auto_scale {
-                                    plot.include_y(0.0)
+                                let y_cap = if self.auto_scale {
+                                    p.y_max
                                 } else {
-                                    plot.include_y(0.0).include_y(self.scale_cap)
+                                    self.scale_cap
                                 };
+                                let plot = plot
+                                    .include_y(0.0)
+                                    .include_y(y_cap);
 
                                 let cap = if self.auto_scale {
                                     f64::INFINITY
@@ -2108,9 +2126,9 @@ impl PacketlyApp {
                                 };
                                 // radius must scale with bucket count: the 3h range returns
                                 // 1s-tier data (n=10800), so a small fixed radius left it pointy
-                                // wide multi-pass gaussian -> deep rounded hills
-                                // like the reference look; ~7% hill width
-                                let r = ((p.n as f64) / 15.0).round().clamp(2.0, 600.0) as usize;
+                                // soft compact bells, distinct (not merged):
+                                // 2-pass gaussian, ~5-6% hill width
+                                let r = ((p.n as f64) / 20.0).round().clamp(2.0, 400.0) as usize;
                                 let rendered = {
                                     let mut cache = self.cache.lock().unwrap();
                                     let stale = cache.rendered.as_ref().map_or(true, |rd| {
