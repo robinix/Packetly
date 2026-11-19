@@ -100,7 +100,7 @@ impl Theme {
             border: egui::Color32::from_rgb(52, 64, 100),
             text: egui::Color32::from_rgb(216, 222, 234),
             dim: egui::Color32::from_rgb(138, 150, 184),
-            grid: egui::Color32::from_rgba_unmultiplied(255, 255, 255, 12),
+            grid: egui::Color32::from_rgba_unmultiplied(255, 255, 255, 7),
             axis: egui::Color32::from_rgb(124, 137, 173),
             accent: egui::Color32::from_rgb(132, 179, 60),
             in_c: egui::Color32::from_rgb(224, 80, 200),
@@ -2090,6 +2090,7 @@ impl PacketlyApp {
                                     .allow_drag(false)
                                     .allow_zoom(false)
                                     .allow_scroll(false)
+                                    .show_grid(egui::Vec2b::FALSE)
                                     .set_margin_fraction(egui::Vec2::ZERO)
                                     .show_axes([false, true])
                                     .height((ui.available_height() * 0.88).max(300.0));
@@ -2107,8 +2108,8 @@ impl PacketlyApp {
                                 // radius must scale with bucket count: the 3h range returns
                                 // 1s-tier data (n=10800), so a small fixed radius left it pointy
                                 // wide multi-pass gaussian -> deep rounded hills
-                                // like the reference look; ~3% of the span radius
-                                let r = ((p.n as f64) / 25.0).round().clamp(2.0, 400.0) as usize;
+                                // like the reference look; ~7% hill width
+                                let r = ((p.n as f64) / 15.0).round().clamp(2.0, 600.0) as usize;
                                 let rendered = {
                                     let mut cache = self.cache.lock().unwrap();
                                     let stale = cache.rendered.as_ref().map_or(true, |rd| {
@@ -2149,7 +2150,7 @@ impl PacketlyApp {
                                         let line = Line::new(PlotPoints::from(pts.clone()))
                                             .name(s.name.clone())
                                             .color(s.color)
-                                            .fill(0.45_f32)
+                                            .fill(0.32_f32)
                                             .width(1.8_f32);
                                         plot_ui.line(line);
                                     }
