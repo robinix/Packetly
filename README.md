@@ -28,7 +28,7 @@ themes. (It is purely a traffic monitor: no firewall, no network scanner.)
 - **Alerts** — new-app-on-the-network notifications, quota threshold alerts
 - **Hostnames & countries** — reverse DNS; optional GeoIP (strictly opt-in, off by
   default; when enabled, host IPs are batched to ip-api.com)
-- **Native Rust UI** — light/AMOLED-dark themes, 100–175 % zoom, tray icon, per-app icons
+- **Native Rust UI** — three themes (Light, Dark AMOLED, Elite navy), 100–175 % zoom, tray icon, per-app icons
 - **Efficient storage** — SQLite WAL with tiered 1 s/60 s/hourly/daily tables,
   watermarked rollups and retention (48 h / 62 d / 400 d / forever)
 

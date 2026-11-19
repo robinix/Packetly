@@ -15,6 +15,26 @@ use std::time::Duration;
 const API: &str = "http://127.0.0.1:8912";
 const TOP_N: usize = 10;
 
+#[derive(Clone, Copy, PartialEq)]
+enum ThemeKind {
+    Dark,
+    Light,
+    Elite,
+}
+
+impl ThemeKind {
+    fn label(self) -> &'static str {
+        match self {
+            ThemeKind::Dark => "Dark (AMOLED)",
+            ThemeKind::Light => "Light",
+            ThemeKind::Elite => "Elite (navy)",
+        }
+    }
+    fn all() -> [ThemeKind; 3] {
+        [ThemeKind::Dark, ThemeKind::Light, ThemeKind::Elite]
+    }
+}
+
 #[derive(Clone)]
 struct Theme {
     nav_bg: egui::Color32,
@@ -68,6 +88,24 @@ impl Theme {
             in_c: egui::Color32::from_rgb(142, 106, 238),
             out_c: egui::Color32::from_rgb(156, 200, 247),
             danger: egui::Color32::from_rgb(230, 100, 90),
+        }
+    }
+    fn elite() -> Self {
+        Self {
+            nav_bg: egui::Color32::from_rgb(18, 25, 44),
+            bg: egui::Color32::from_rgb(23, 32, 55),
+            plot_bg: egui::Color32::from_rgb(27, 38, 66),
+            card: egui::Color32::from_rgb(33, 44, 74),
+            card2: egui::Color32::from_rgb(39, 51, 84),
+            border: egui::Color32::from_rgb(52, 64, 100),
+            text: egui::Color32::from_rgb(216, 222, 234),
+            dim: egui::Color32::from_rgb(138, 150, 184),
+            grid: egui::Color32::from_rgba_unmultiplied(255, 255, 255, 12),
+            axis: egui::Color32::from_rgb(124, 137, 173),
+            accent: egui::Color32::from_rgb(132, 179, 60),
+            in_c: egui::Color32::from_rgb(224, 80, 200),
+            out_c: egui::Color32::from_rgb(110, 147, 232),
+            danger: egui::Color32::from_rgb(235, 90, 90),
         }
     }
     fn alpha(c: egui::Color32, a: u8) -> egui::Color32 {
@@ -1501,7 +1539,7 @@ struct PacketlyApp {
     show_custom: bool,
     period: UsagePeriod,
     zoom: f32,
-    dark: bool,
+    theme_kind: ThemeKind,
     snap: Arc<Mutex<Arc<Snapshot>>>,
     tx: std::sync::mpsc::Sender<UiMsg>,
     cache: Mutex<ChartCache>,
@@ -1532,10 +1570,10 @@ enum UiMsg {
 
 impl PacketlyApp {
     fn theme(&self) -> Theme {
-        if self.dark {
-            Theme::dark()
-        } else {
-            Theme::light()
+        match self.theme_kind {
+            ThemeKind::Dark => Theme::dark(),
+            ThemeKind::Light => Theme::light(),
+            ThemeKind::Elite => Theme::elite(),
         }
     }
 
@@ -1575,12 +1613,17 @@ impl PacketlyApp {
         let _ = std::fs::write(
             prefs_file(),
             format!(
-                "dark={}\nzoom={}\nautoscale={}\nscalecap={}\nstartmin={}",
-                self.dark,
+                "dark={}\nzoom={}\nautoscale={}\nscalecap={}\nstartmin={}\ntheme={}",
+                self.theme_kind == ThemeKind::Dark,
                 self.zoom,
                 self.auto_scale as i32,
                 self.scale_cap,
-                self.start_minimized as i32
+                self.start_minimized as i32,
+                match self.theme_kind {
+                    ThemeKind::Dark => "dark",
+                    ThemeKind::Light => "light",
+                    ThemeKind::Elite => "elite",
+                }
             ),
         );
     }
@@ -1890,10 +1933,13 @@ impl PacketlyApp {
                                         }
                                         xs.push([ts, total]);
                                     }
-                                    let mr = ((p.n as f64) / 50.0)
+                                    let mr = ((p.n as f64) / 25.0)
                                         .round()
-                                        .clamp(2.0, 90.0) as usize;
-                                    let xs = smooth(&moving_avg(&xs, mr), 400);
+                                        .clamp(2.0, 400.0) as usize;
+                                    let xs = smooth(
+                                        &moving_avg(&moving_avg(&moving_avg(&xs, mr), mr * 2 / 3), mr / 3),
+                                        400,
+                                    );
                                     cache.mini = Some((ver, Arc::new(xs)));
                                 }
                                 cache.mini.as_ref().unwrap().1.clone()
@@ -2060,7 +2106,9 @@ impl PacketlyApp {
                                 };
                                 // radius must scale with bucket count: the 3h range returns
                                 // 1s-tier data (n=10800), so a small fixed radius left it pointy
-                                let r = ((p.n as f64) / 50.0).round().clamp(2.0, 90.0) as usize;
+                                // wide multi-pass gaussian -> deep rounded hills
+                                // like the reference look; ~3% of the span radius
+                                let r = ((p.n as f64) / 25.0).round().clamp(2.0, 400.0) as usize;
                                 let rendered = {
                                     let mut cache = self.cache.lock().unwrap();
                                     let stale = cache.rendered.as_ref().map_or(true, |rd| {
@@ -2074,7 +2122,10 @@ impl PacketlyApp {
                                             .series
                                             .iter()
                                             .map(|s| {
-                                                moving_avg(&moving_avg(&s.points, r), r / 2)
+                                                moving_avg(
+                                                &moving_avg(&moving_avg(&s.points, r), r * 2 / 3),
+                                                r / 3,
+                                            )
                                                     .into_iter()
                                                     .map(|mut pt| {
                                                         pt[1] = pt[1].min(cap);
@@ -3030,13 +3081,27 @@ impl PacketlyApp {
                                 .size(10.5)
                                 .color(t.dim),
                         );
-                        if ui
-                            .checkbox(&mut self.dark, "Dark theme")
-                            .changed()
-                        {
-                            Self::apply_visuals(ctx, &self.theme());
-                            self.save_prefs();
-                        }
+                        ui.horizontal(|ui| {
+                            ui.weak("Theme:");
+                            egui::ComboBox::from_id_source("theme_kind")
+                                .selected_text(self.theme_kind.label())
+                                .width(130.0)
+                                .show_ui(ui, |ui| {
+                                    for k in ThemeKind::all() {
+                                        if ui
+                                            .selectable_label(
+                                                self.theme_kind == k,
+                                                k.label(),
+                                            )
+                                            .clicked()
+                                        {
+                                            self.theme_kind = k;
+                                            Self::apply_visuals(ctx, &self.theme());
+                                            self.save_prefs();
+                                        }
+                                    }
+                                });
+                        });
                         ui.horizontal(|ui| {
                             ui.weak("UI zoom:");
                             egui::ComboBox::from_id_source("settings_zoom")
@@ -3240,7 +3305,7 @@ fn main() -> eframe::Result {
     let (tx, rx) = std::sync::mpsc::channel::<UiMsg>();
     let ui_ctx: Arc<Mutex<Option<egui::Context>>> = Arc::new(Mutex::new(None));
 
-    let mut dark = true;
+    let mut theme_kind = ThemeKind::Dark;
     let mut zoom = 1.0_f32;
     let mut auto_scale = true;
     let mut scale_cap = 1_048_576.0_f64;
@@ -3251,11 +3316,35 @@ fn main() -> eframe::Result {
             let k = kv.next().unwrap_or("");
             let v = kv.next().unwrap_or("");
             match k {
-                "dark" => dark = v.trim() != "false",
+                "dark" => {
+                    if theme_kind == ThemeKind::Dark {
+                        theme_kind = if v.trim() != "false" {
+                            ThemeKind::Dark
+                        } else {
+                            ThemeKind::Light
+                        };
+                    }
+                }
                 "zoom" => zoom = v.trim().parse().unwrap_or(1.0),
                 "autoscale" => auto_scale = v.trim() != "0",
                 "scalecap" => scale_cap = v.trim().parse().unwrap_or(1_048_576.0),
                 "startmin" => start_minimized = v.trim() != "0",
+                "theme" => {
+                    theme_kind = match v.trim() {
+                        "light" => ThemeKind::Light,
+                        "elite" => ThemeKind::Elite,
+                        _ => ThemeKind::Dark,
+                    }
+                }
+                "dark" => {
+                    if theme_kind == ThemeKind::Dark {
+                        theme_kind = if v.trim() != "false" {
+                            ThemeKind::Dark
+                        } else {
+                            ThemeKind::Light
+                        };
+                    }
+                }
                 _ => {}
             }
         }
@@ -3470,7 +3559,7 @@ fn main() -> eframe::Result {
                 show_custom: false,
                 period: UsagePeriod::Today,
                 zoom: zoom0,
-                dark,
+                theme_kind,
                 snap: snap_for_app,
                 tx,
                 cache: Mutex::new(ChartCache {
