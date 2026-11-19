@@ -27,3 +27,4 @@ packtest/
 !assets/packetly.png
 !assets/unknown.png
 .zcode/
+packetly/src/Packetly/publish/

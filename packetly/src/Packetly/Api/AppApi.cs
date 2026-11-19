@@ -54,7 +54,7 @@ internal static class AppApi
             return new
             {
                 app = "packetly",
-                version = "1.5.0",
+                version = "1.5.1",
                 now,
                 startedAt = svc.StartedAt,
                 uptimeSeconds = now - svc.StartedAt,
@@ -424,7 +424,10 @@ internal static class AppApi
                 // too — this keeps breakdown=apps uniform across all ranges.
                 return (now - 300, now, "traffic_1s", 1, false);
             case "3h":
-                return (now - 3L * 3600, t, "traffic_1s", 1, false);
+                // 1s data (n=10800) got crushed by smoothing and scaled by its
+                // own raw burst peak -> flat line. 60s buckets (n=181) keep
+                // distinct hills like the reference; 1s stays for 5m.
+                return (now - 3L * 3600, t, "traffic_60s", 60, false);
             case "24h":
                 return (now - 86400, t, "traffic_60s", 60, false);
             case "7d":

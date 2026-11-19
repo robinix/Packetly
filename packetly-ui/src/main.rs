@@ -573,7 +573,6 @@ struct ChartCache {
 struct Pivot {
     x0: f64,
     x1: f64,
-    y_max: f64,
     bucket: f64,
     n: usize,
     series: Vec<Series>,
@@ -1182,11 +1181,6 @@ fn pivot(traffic: &TrafficData, in_c: egui::Color32, out_c: egui::Color32) -> Pi
         }
     }
 
-    let mut y_max = 0.0_f64;
-    for v in down.iter().chain(up.iter()) {
-        y_max = y_max.max(*v);
-    }
-    p.y_max = y_max * 1.45;
     p.series = vec![
         Series {
             name: "Upload".to_string(),
@@ -1936,7 +1930,13 @@ impl PacketlyApp {
                                     let mr = ((p.n as f64) / 25.0)
                                         .round()
                                         .clamp(2.0, 400.0) as usize;
-                                    let xs = smooth(&moving_avg(&xs, mr), 400);
+                                    let xs = smooth(
+                                        &moving_avg(
+                                            &moving_avg(&moving_avg(&xs, mr), mr * 2 / 3),
+                                            mr / 3,
+                                        ),
+                                        400,
+                                    );
                                     cache.mini = Some((ver, Arc::new(xs)));
                                 }
                                 cache.mini.as_ref().unwrap().1.clone()
@@ -2072,8 +2072,61 @@ impl PacketlyApp {
                             (Some(_), Some(p)) if !p.series.is_empty() => {
                                 let axis_mode = axis_mode_for(&self.sel, p.x1 - p.x0);
                                 let x_step = self.sel.x_step(p.x1 - p.x0);
+                                let cap = if self.auto_scale {
+                                    f64::INFINITY
+                                } else {
+                                    self.scale_cap
+                                };
+                                // radius scales with bucket count so bells stay
+                                // proportional across ranges
+                                let r = ((p.n as f64) / 20.0).round().clamp(2.0, 400.0) as usize;
+                                let rendered = {
+                                    let mut cache = self.cache.lock().unwrap();
+                                    let stale = cache.rendered.as_ref().map_or(true, |rd| {
+                                        rd.ver != ver.unwrap_or(0)
+                                            || rd.r != r
+                                            || rd.cap_bits != cap.to_bits()
+                                    });
+                                    if stale {
+                                        // three box passes approximate a gaussian -> soft rounded hills
+                                        let series_pts: Vec<Vec<[f64; 2]>> = p
+                                            .series
+                                            .iter()
+                                            .map(|s| {
+                                                moving_avg(
+                                                &moving_avg(&moving_avg(&s.points, r), r * 2 / 3),
+                                                r / 3,
+                                            )
+                                                    .into_iter()
+                                                    .map(|mut pt| {
+                                                        pt[1] = pt[1].min(cap);
+                                                        pt
+                                                    })
+                                                    .collect::<Vec<_>>()
+                                            })
+                                            .map(|pts| smooth(&pts, 2400))
+                                            .collect();
+                                        cache.rendered = Some(Rendered {
+                                            ver: ver.unwrap_or(0),
+                                            r,
+                                            cap_bits: cap.to_bits(),
+                                            series: Arc::new(series_pts),
+                                        });
+                                    }
+                                    cache.rendered.as_ref().unwrap().series.clone()
+                                };
+
+                                // scale to the RENDERED peak: smoothing lowers raw
+                                // peaks, so scaling by the raw max left the curve
+                                // flat under a huge scale (the 1.5.0 bug)
+                                let rendered_max = rendered
+                                    .iter()
+                                    .flat_map(|pts| pts.iter().map(|pt| pt[1]))
+                                    .fold(0.0_f64, f64::max);
                                 let y_top = if self.auto_scale {
-                                    p.y_max
+                                    let target = (rendered_max * 1.25).max(1024.0);
+                                    let st = nice_step(target / 8.0);
+                                    (target / st).ceil() * st
                                 } else {
                                     self.scale_cap
                                 };
@@ -2110,60 +2163,9 @@ impl PacketlyApp {
                                     .set_margin_fraction(egui::Vec2::ZERO)
                                     .show_axes([false, true])
                                     .height((ui.available_height() * 0.88).max(300.0));
-                                let y_cap = if self.auto_scale {
-                                    p.y_max
-                                } else {
-                                    self.scale_cap
-                                };
                                 let plot = plot
                                     .include_y(0.0)
-                                    .include_y(y_cap);
-
-                                let cap = if self.auto_scale {
-                                    f64::INFINITY
-                                } else {
-                                    self.scale_cap
-                                };
-                                // radius must scale with bucket count: the 3h range returns
-                                // 1s-tier data (n=10800), so a small fixed radius left it pointy
-                                // soft compact bells, distinct (not merged):
-                                // 2-pass gaussian, ~5-6% hill width
-                                let r = ((p.n as f64) / 20.0).round().clamp(2.0, 400.0) as usize;
-                                let rendered = {
-                                    let mut cache = self.cache.lock().unwrap();
-                                    let stale = cache.rendered.as_ref().map_or(true, |rd| {
-                                        rd.ver != ver.unwrap_or(0)
-                                            || rd.r != r
-                                            || rd.cap_bits != cap.to_bits()
-                                    });
-                                    if stale {
-                                        // two box passes approximate a gaussian -> soft rounded hills
-                                        let series_pts: Vec<Vec<[f64; 2]>> = p
-                                            .series
-                                            .iter()
-                                            .map(|s| {
-                                                moving_avg(
-                                                &moving_avg(&moving_avg(&s.points, r), r * 2 / 3),
-                                                r / 3,
-                                            )
-                                                    .into_iter()
-                                                    .map(|mut pt| {
-                                                        pt[1] = pt[1].min(cap);
-                                                        pt
-                                                    })
-                                                    .collect::<Vec<_>>()
-                                            })
-                                            .map(|pts| smooth(&pts, 2400))
-                                            .collect();
-                                        cache.rendered = Some(Rendered {
-                                            ver: ver.unwrap_or(0),
-                                            r,
-                                            cap_bits: cap.to_bits(),
-                                            series: Arc::new(series_pts),
-                                        });
-                                    }
-                                    cache.rendered.as_ref().unwrap().series.clone()
-                                };
+                                    .include_y(y_top);
                                 let dark_theme = t.text.r() > 128;
                                 let presp = plot.show(ui, |plot_ui| {
                                     // dark muted fills first (occlude like the
