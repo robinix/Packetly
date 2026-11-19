@@ -85,22 +85,22 @@ impl Theme {
             grid: egui::Color32::from_rgba_unmultiplied(255, 255, 255, 16),
             axis: egui::Color32::from_rgb(120, 138, 130),
             accent: egui::Color32::from_rgb(96, 165, 250),
-            in_c: egui::Color32::from_rgb(142, 106, 238),
-            out_c: egui::Color32::from_rgb(156, 200, 247),
+            in_c: egui::Color32::from_rgb(122, 84, 235),
+            out_c: egui::Color32::from_rgb(132, 178, 242),
             danger: egui::Color32::from_rgb(230, 100, 90),
         }
     }
     fn elite() -> Self {
         Self {
-            nav_bg: egui::Color32::from_rgb(18, 25, 44),
-            bg: egui::Color32::from_rgb(23, 32, 55),
-            plot_bg: egui::Color32::from_rgb(27, 38, 66),
-            card: egui::Color32::from_rgb(33, 44, 74),
-            card2: egui::Color32::from_rgb(39, 51, 84),
-            border: egui::Color32::from_rgb(52, 64, 100),
-            text: egui::Color32::from_rgb(216, 222, 234),
-            dim: egui::Color32::from_rgb(138, 150, 184),
-            grid: egui::Color32::from_rgba_unmultiplied(255, 255, 255, 7),
+            nav_bg: egui::Color32::from_rgb(16, 22, 38),
+            bg: egui::Color32::from_rgb(20, 27, 45),
+            plot_bg: egui::Color32::from_rgb(24, 33, 54),
+            card: egui::Color32::from_rgb(30, 40, 64),
+            card2: egui::Color32::from_rgb(36, 47, 74),
+            border: egui::Color32::from_rgb(48, 60, 92),
+            text: egui::Color32::from_rgb(206, 214, 230),
+            dim: egui::Color32::from_rgb(122, 134, 162),
+            grid: egui::Color32::from_rgba_unmultiplied(255, 255, 255, 5),
             axis: egui::Color32::from_rgb(124, 137, 173),
             accent: egui::Color32::from_rgb(132, 179, 60),
             in_c: egui::Color32::from_rgb(224, 80, 200),
@@ -1948,6 +1948,7 @@ impl PacketlyApp {
                                 .height(42.0)
                                 .width(ui.available_width())
                                 .show_axes([false, false])
+                                .show_grid(egui::Vec2b::FALSE)
                                 .allow_drag(false)
                                 .allow_zoom(false)
                                 .allow_scroll(false)
@@ -2061,7 +2062,7 @@ impl PacketlyApp {
                                 } else {
                                     self.scale_cap
                                 };
-                                let y_step = nice_step(y_top / 4.0);
+                                let y_step = nice_step(y_top / 8.0);
 
                                 let plot = Plot::new("traffic")
                                     .x_grid_spacer(move |input| {
@@ -2145,14 +2146,35 @@ impl PacketlyApp {
                                     }
                                     cache.rendered.as_ref().unwrap().series.clone()
                                 };
+                                let dark_theme = t.text.r() > 128;
                                 let presp = plot.show(ui, |plot_ui| {
+                                    // dark muted fills first (occlude like the
+                                    // reference), then bright strokes on top
                                     for (s, pts) in p.series.iter().zip(rendered.iter()) {
-                                        let line = Line::new(PlotPoints::from(pts.clone()))
-                                            .name(s.name.clone())
-                                            .color(s.color)
-                                            .fill(0.32_f32)
-                                            .width(1.8_f32);
-                                        plot_ui.line(line);
+                                        let fill_color = if dark_theme {
+                                            egui::Color32::from_rgb(
+                                                (s.color.r() as f32 * 0.42) as u8,
+                                                (s.color.g() as f32 * 0.42) as u8,
+                                                (s.color.b() as f32 * 0.42) as u8,
+                                            )
+                                        } else {
+                                            Theme::alpha(s.color, 80)
+                                        };
+                                        let fill_alpha = if dark_theme { 1.0 } else { 0.45 };
+                                        plot_ui.line(
+                                            Line::new(PlotPoints::from(pts.clone()))
+                                                .color(fill_color)
+                                                .fill(fill_alpha)
+                                                .width(0.0_f32),
+                                        );
+                                    }
+                                    for (s, pts) in p.series.iter().zip(rendered.iter()) {
+                                        plot_ui.line(
+                                            Line::new(PlotPoints::from(pts.clone()))
+                                                .name(s.name.clone())
+                                                .color(s.color)
+                                                .width(1.8_f32),
+                                        );
                                     }
                                 });
 
