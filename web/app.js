@@ -1,9 +1,7 @@
-/* Packetly Web dashboard.
- * Mirrors the desktop app's chart pipeline (3-pass box smoothing,
- * Catmull-Rom rounding, peak normalization, honest raw-peak scale) so the
- * hills look identical. Runs on demo data everywhere; switches to live
- * mode automatically when served from the collector (same origin, :8912).
- * Zero dependencies. */
+/* Packetly Web — pixel replica of the desktop Traffic Monitor screen.
+ * Chart pipeline mirrors packetly-ui/src/main.rs exactly: 3-pass box
+ * smoothing -> Catmull-Rom -> peak normalization -> honest raw-peak scale.
+ * Demo mode in hosted previews; live mode when served by the collector. */
 (() => {
   'use strict';
 
@@ -11,10 +9,15 @@
   const UP = [110, 147, 232];
   const GRID = 'rgba(255,255,255,0.035)';
   const AXIS = 'rgba(160,172,200,0.8)';
-  const RANGES = ['5m', '3h', '24h', '7d', '30d', 'unlimited'];
-  const RANGE_LABEL = { '5m': '5 minutes', '3h': '3 hours', '24h': '24 hours', '7d': '7 days', '30d': '30 days', unlimited: 'all time' };
+  const RANGE_LABEL = { '5m': '5 Minutes', '3h': '3 Hours', '24h': '24 Hours', '7d': '7 Days', '30d': '30 Days', unlimited: 'All Time' };
+  const LADDER = [
+    ['50 KB', 51200], ['100 KB', 102400], ['250 KB', 256000], ['500 KB', 512000],
+    ['1 MB', 1048576], ['2 MB', 2097152], ['5 MB', 5242880], ['10 MB', 10485760],
+    ['25 MB', 26214400], ['50 MB', 52428800], ['100 MB', 104857600], ['250 MB', 262144000],
+    ['500 MB', 524288000], ['1 GB', 1073741824], ['2 GB', 2147483648], ['5 GB', 5368709120],
+  ];
 
-  const state = { range: '3h', live: false, timer: null, demo: null };
+  const state = { range: '3h', live: false, timer: null, demo: null, autoScale: true, scaleCap: 104857600 };
 
   const $ = (id) => document.getElementById(id);
 
@@ -69,7 +72,6 @@
     out.push([pts[n - 1][0], pts[n - 1][1]]);
     return out;
   }
-  // values[] -> smoothed, peak-normalized pts [[ts, v], ...]; returns {pts, rawMax}
   function pipeline(ts, values, target) {
     const n = values.length;
     let rawMax = 0;
@@ -123,15 +125,13 @@
     const p = prep(canvas);
     if (!p) return;
     const { ctx, w, h } = p;
-    const labels = opts.labels !== false;
-    const top = labels ? 16 : 2, bottom = labels ? 22 : 2, left = 2, right = 2;
+    const top = 14, bottom = 24, left = 2, right = 2;
     const pw = w - left - right, ph = h - top - bottom;
     const x0 = opts.x0, x1 = opts.x1, yTop = opts.yTop || 1;
 
-    // horizontal grid lines (labels draw after the series so fills
-    // never cover them, like the desktop overlay)
+    // grid lines first (labels draw after the series, like the desktop overlay)
     const yLabelPos = [];
-    if (labels && opts.gridStep) {
+    if (opts.gridStep) {
       for (let yv = opts.gridStep; yv <= yTop + 1e-9; yv += opts.gridStep) {
         const py = top + ph - (yv / yTop) * ph;
         ctx.strokeStyle = GRID;
@@ -154,7 +154,6 @@
       if (!pts || pts.length < 2) continue;
       const px = (ts) => left + ((ts - x0) / (x1 - x0)) * pw;
       const py = (v) => base - (Math.min(v, yTop) / yTop) * ph;
-      // fill
       ctx.beginPath();
       ctx.moveTo(px(pts[0][0]), base);
       for (const [ts, v] of pts) ctx.lineTo(px(ts), py(v));
@@ -162,34 +161,64 @@
       ctx.closePath();
       ctx.fillStyle = dim(s.color);
       ctx.fill();
-      // stroke
       ctx.beginPath();
       for (let i = 0; i < pts.length; i++) {
         const x = px(pts[i][0]), y = py(pts[i][1]);
         if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
       }
       ctx.strokeStyle = css(s.color);
-      ctx.lineWidth = opts.lineWidth || 1.8;
+      ctx.lineWidth = 1.8;
       ctx.lineJoin = 'round';
       ctx.stroke();
     }
     ctx.restore();
 
-    // labels on top of everything
-    if (labels && opts.gridStep) {
+    // labels on top (suppressed for the bare mini strip, like the desktop)
+    if (opts.labels !== false) {
       ctx.font = '11px "Segoe UI", system-ui, sans-serif';
-      ctx.textAlign = 'left';
       ctx.textBaseline = 'alphabetic';
+      ctx.textAlign = 'left';
       ctx.fillStyle = AXIS;
       for (const [yv, py] of yLabelPos) ctx.fillText(fmtB(yv), left + 6, py - 4);
       const step = timeStep(x1 - x0);
       ctx.textAlign = 'center';
       for (let ts = Math.ceil(x0 / step) * step; ts <= x1; ts += step) {
         const px = left + ((ts - x0) / (x1 - x0)) * pw;
-        ctx.fillStyle = AXIS;
-        ctx.fillText(fmtTime(ts, step), px, h - 6);
+        ctx.fillText(fmtTime(ts, step), px, h - 7);
       }
     }
+  }
+
+  // ring gauge like the desktop's donut (down share pink, up share blue)
+  function drawRing(down, up) {
+    const canvas = $('ring');
+    const dpr = window.devicePixelRatio || 1;
+    if (canvas.width !== Math.round(84 * dpr)) {
+      canvas.width = Math.round(84 * dpr);
+      canvas.height = Math.round(84 * dpr);
+    }
+    const ctx = canvas.getContext('2d');
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, 84, 84);
+    const cx = 42, cy = 42, r = 32, lw = 9;
+    ctx.lineWidth = lw;
+    ctx.lineCap = 'round';
+    ctx.strokeStyle = 'rgba(255,255,255,0.07)';
+    ctx.beginPath();
+    ctx.arc(cx, cy, r, 0, Math.PI * 2);
+    ctx.stroke();
+    const tot = down + up || 1;
+    const sweep = Math.PI * 2 * 0.82; // gap at the bottom like the reference
+    const start = Math.PI * 0.5 + (Math.PI * 2 - sweep) / 2;
+    const downShare = Math.max(0.06, Math.min(0.94, down / tot));
+    ctx.strokeStyle = css(DOWN);
+    ctx.beginPath();
+    ctx.arc(cx, cy, r, start, start + sweep * downShare);
+    ctx.stroke();
+    ctx.strokeStyle = css(UP);
+    ctx.beginPath();
+    ctx.arc(cx, cy, r, start + sweep * downShare + 0.03, start + sweep);
+    ctx.stroke();
   }
 
   // ---------- demo data ----------
@@ -263,21 +292,18 @@
     const totalDown = down.reduce((a, b) => a + b, 0);
     const totalUp = up.reduce((a, b) => a + b, 0);
 
-    // apps split of the totals
     let wsum = 0;
     for (const a of APP_POOL) wsum += a[1];
-    const apps = APP_POOL.map(([name, w, color], i) => {
+    const apps = APP_POOL.map(([name, w, color]) => {
       const share = (w / wsum) * (0.75 + rnd() * 0.5);
       return {
-        name,
-        color,
+        name, color,
         count: 2 + Math.floor(rnd() * 140),
         inBytes: totalDown * share * (0.75 + rnd() * 0.4),
         outBytes: totalUp * share * (0.6 + rnd() * 0.8),
       };
     }).sort((a, b) => b.inBytes + b.outBytes - (a.inBytes + a.outBytes));
 
-    // hosts split
     const hosts = HOST_POOL.slice(0, 6).map(([h, flag, region], i) => ({
       host: h, flag, region,
       inBytes: totalDown * (0.22 - i * 0.03) * (0.8 + rnd() * 0.5),
@@ -291,23 +317,25 @@
 
   // ---------- rendering ----------
   function render(d) {
-    const target = 2400;
-    const pd = pipeline(d.ts, Array.from(d.down), target);
-    const pu = pipeline(d.ts, Array.from(d.up), target);
+    const pd = pipeline(d.ts, Array.from(d.down), 2400);
+    const pu = pipeline(d.ts, Array.from(d.up), 2400);
 
     let rawMax = 0;
     for (const v of d.down) if (v > rawMax) rawMax = v;
     for (const v of d.up) if (v > rawMax) rawMax = v;
-    const targetCap = Math.max(rawMax * 1.25, 1024);
-    const st = niceStep(targetCap / 8);
-    const yTop = Math.ceil(targetCap / st) * st;
+    const yTop = state.autoScale
+      ? (() => {
+          const target = Math.max(rawMax * 1.25, 1024);
+          const st = niceStep(target / 8);
+          return Math.ceil(target / st) * st;
+        })()
+      : state.scaleCap;
 
     drawChart($('main-chart'), [
       { color: DOWN, pts: pd.pts },
       { color: UP, pts: pu.pts },
     ], { x0: d.ts[0], x1: d.ts[d.ts.length - 1], yTop, gridStep: niceStep(yTop / 8) });
 
-    // mini timeline: total activity
     const n = d.ts.length;
     const total = new Array(n);
     for (let i = 0; i < n; i++) total[i] = d.down[i] + d.up[i];
@@ -317,28 +345,29 @@
     mpts = movingAvg(mpts, Math.max(1, Math.round((mr * 2) / 3)));
     mpts = movingAvg(mpts, Math.max(1, Math.round(mr / 3)));
     mpts = catmull(mpts, 400);
+    let mMax = 0;
+    for (const p of mpts) if (p[1] > mMax) mMax = p[1];
     drawChart($('mini-chart'), [{ color: DOWN, pts: mpts }], {
       x0: d.ts[0], x1: d.ts[d.ts.length - 1],
-      yTop: Math.max(...mpts.map((p) => p[1])) * 1.1,
-      labels: false, lineWidth: 1.0,
+      yTop: mMax * 1.12, labels: false,
     });
 
-    // stats
+    drawRing(d.totalDown, d.totalUp);
     $('stat-down').textContent = fmtB(d.totalDown);
     $('stat-up').textContent = fmtB(d.totalUp);
     $('stat-down-rate').textContent = fmtB(d.down[n - 1] / d.bucket) + '/s';
     $('stat-up-rate').textContent = fmtB(d.up[n - 1] / d.bucket) + '/s';
     $('stat-wan').textContent = fmtB(d.wan);
     $('stat-lan').textContent = fmtB(d.lan);
-    const tot = d.totalDown + d.totalUp || 1;
-    $('bar-down').style.width = ((d.totalDown / tot) * 100).toFixed(1) + '%';
-    $('bar-up').style.width = ((d.totalUp / tot) * 100).toFixed(1) + '%';
-    $('bar-wan').style.width = ((d.wan / (d.wan + d.lan || 1)) * 100).toFixed(1) + '%';
-    $('bar-lan').style.width = ((d.lan / (d.wan + d.lan || 1)) * 100).toFixed(1) + '%';
+    const wl = d.wan + d.lan || 1;
+    $('bar-wan').style.width = ((d.wan / wl) * 100).toFixed(1) + '%';
+    $('bar-lan').style.width = Math.max(1.5, (d.lan / wl) * 100).toFixed(1) + '%';
 
-    // apps
+    renderLists(d);
+  }
+
+  function renderLists(d) {
     const top = d.apps[0] ? d.apps[0].inBytes + d.apps[0].outBytes : 1;
-    $('apps-sub').textContent = RANGE_LABEL[state.range];
     $('app-rows').innerHTML = d.apps.slice(0, 8).map((a) => {
       const tt = a.inBytes + a.outBytes;
       return `<div class="row">
@@ -354,7 +383,6 @@
       </div>`;
     }).join('');
 
-    // hosts
     const hTop = Math.max(...d.hosts.map((h) => h.inBytes + h.outBytes), 1);
     $('host-rows').innerHTML = d.hosts.map((h) => {
       const tt = h.inBytes + h.outBytes;
@@ -397,10 +425,12 @@
       const idx = Math.round((t - x0) / bucket);
       if (idx >= 0 && idx < n) { down[idx] += i; up[idx] += o; }
     }
-    const totalDown = down.reduce((a, b) => a + b, 0);
-    const totalUp = up.reduce((a, b) => a + b, 0);
-    let wan = totalDown + totalUp, lan = 0;
-    return { ts, down, up, bucket, totalDown, totalUp, wan, lan, apps: [], hosts: [] };
+    return {
+      ts, down, up, bucket,
+      totalDown: down.reduce((a, b) => a + b, 0),
+      totalUp: up.reduce((a, b) => a + b, 0),
+      wan: 0, lan: 0, apps: [], hosts: [],
+    };
   }
 
   async function loadLive() {
@@ -411,13 +441,12 @@
       fetchJson(`/api/hosts?range=${range}&limit=8`).catch(() => null),
     ]);
     const d = fromTraffic(traffic);
+    const palette = APP_POOL.map((p) => p[2]);
     if (apps && apps.apps) {
-      d.apps = apps.apps.map((a) => ({
-        name: a.name || 'unknown', color: null, count: 0,
+      d.apps = apps.apps.map((a, i) => ({
+        name: a.name || 'unknown', color: palette[i % palette.length], count: 0,
         inBytes: a.inBytes || 0, outBytes: a.outBytes || 0,
       })).sort((a, b) => b.inBytes + b.outBytes - (a.inBytes + a.outBytes));
-      const palette = APP_POOL.map((p) => p[2]);
-      d.apps.forEach((a, i) => { a.color = palette[i % palette.length]; a.count = 0; });
     }
     if (hosts && hosts.hosts) {
       const flags = { DE: '🇩🇪', IR: '🇮🇷', NL: '🇳🇱', US: '🇺🇸', FR: '🇫🇷', GB: '🇬🇧', TR: '🇹🇷', SE: '🇸🇪' };
@@ -430,7 +459,6 @@
     }
     if (d.apps.length === 0) d.apps = genDemo(state.range).apps;
     if (d.hosts.length === 0) d.hosts = genDemo(state.range).hosts;
-    // live totals: prefer the API's own view of WAN/LAN if hosts reveal private peers
     let priv = 0;
     for (const h of d.hosts) {
       if (/^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(h.host)) priv += h.inBytes + h.outBytes;
@@ -447,7 +475,6 @@
         await loadLive();
         return;
       } catch (e) {
-        // collector went away mid-session -> fall back to demo
         setLive(false);
       }
     }
@@ -461,28 +488,75 @@
     const banner = $('banner');
     if (live) {
       badge.className = 'badge live';
-      badge.innerHTML = `<span class="dot"></span>live · collector v${version || '?'}`;
+      badge.innerHTML = `<span class="dot"></span>live v${version || '?'}`;
       banner.hidden = true;
       if (!state.timer) state.timer = setInterval(refresh, 3000);
     } else {
       badge.className = 'badge demo';
       badge.innerHTML = '<span class="dot"></span>demo data';
       banner.hidden = false;
-      banner.textContent = 'Demo data — this hosted preview cannot reach your PC. Run the dashboard on your machine (http://127.0.0.1:8912) for live numbers.';
+      banner.textContent = 'Demo data — hosted previews cannot reach your PC. Open http://127.0.0.1:8912 for live numbers.';
       if (state.timer) { clearInterval(state.timer); state.timer = null; }
     }
   }
 
-  // ---------- wiring ----------
-  $('periods').addEventListener('click', (e) => {
+  // ---------- menus (combo replicas) ----------
+  function closeMenus() {
+    $('period-menu').hidden = true;
+    $('scale-menu').hidden = true;
+  }
+  $('period-btn').addEventListener('click', (e) => {
+    e.stopPropagation();
+    const m = $('period-menu');
+    m.hidden = !m.hidden;
+    $('scale-menu').hidden = true;
+  });
+  $('period-menu').addEventListener('click', (e) => {
     const btn = e.target.closest('button[data-range]');
     if (!btn) return;
     state.range = btn.dataset.range;
-    for (const b of $('periods').querySelectorAll('button')) {
-      b.classList.toggle('active', b === btn);
+    for (const b of $('period-menu').querySelectorAll('button')) {
+      b.classList.toggle('sel', b === btn);
     }
+    $('period-btn').firstChild.textContent = RANGE_LABEL[state.range] + ' ';
+    closeMenus();
     refresh();
   });
+  $('scale-btn').addEventListener('click', (e) => {
+    e.stopPropagation();
+    const m = $('scale-menu');
+    m.hidden = !m.hidden;
+    $('period-menu').hidden = true;
+  });
+  $('scale-menu').addEventListener('click', (e) => e.stopPropagation());
+  $('autoscale-chk').addEventListener('change', (e) => {
+    state.autoScale = e.target.checked;
+    $('scale-ladder').hidden = state.autoScale;
+    updateScaleBtn();
+    if (state.demo) render(state.demo);
+  });
+  function buildLadder() {
+    $('scale-ladder').innerHTML = LADDER.map(([lbl, val]) =>
+      `<button data-cap="${val}" class="${Math.abs(state.scaleCap - val) < 1 ? 'sel' : ''}">${lbl}</button>`
+    ).join('');
+  }
+  $('scale-ladder').addEventListener('click', (e) => {
+    const btn = e.target.closest('button[data-cap]');
+    if (!btn) return;
+    state.scaleCap = Number(btn.dataset.cap);
+    buildLadder();
+    updateScaleBtn();
+    if (state.demo) render(state.demo);
+  });
+  function updateScaleBtn() {
+    $('scale-btn').innerHTML = (state.autoScale
+      ? 'Auto-scale'
+      : `cap ${fmtB(state.scaleCap)}`) + ' <span class="caret">▾</span>';
+  }
+  document.addEventListener('click', closeMenus);
+
+  buildLadder();
+  updateScaleBtn();
 
   const ro = new ResizeObserver(() => {
     if (state.demo || state.live) refresh();

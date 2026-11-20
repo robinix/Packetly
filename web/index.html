@@ -3,89 +3,102 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Packetly — Web Dashboard</title>
+  <title>Packetly — Traffic Monitor (web replica)</title>
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
-  <div class="wrap">
+  <!-- Pixel replica of the desktop app's Traffic Monitor screen.
+         Reference: assets/reference-traffic-monitor.png -->
+  <div class="app">
 
-    <header class="topbar">
-      <div class="brand">
-        <span class="logo">P</span>
-        <span class="name">Packetly</span>
-        <span class="badge" id="mode-badge"><span class="dot"></span>connecting…</span>
-      </div>
-      <nav class="periods" id="periods">
-        <button data-range="5m">5 min</button>
-        <button data-range="3h" class="active">3 hours</button>
-        <button data-range="24h">24 hours</button>
-        <button data-range="7d">7 days</button>
-        <button data-range="30d">30 days</button>
-        <button data-range="unlimited">All time</button>
-      </nav>
-    </header>
+    <div class="titlebar"></div>
+
+    <nav class="nav">
+      <span class="brand">Packetly</span>
+      <button class="tab active">Traffic Monitor</button>
+      <button class="tab">Traffic</button>
+      <button class="tab">Usage</button>
+      <button class="tab">Alerts</button>
+      <span class="badge" id="mode-badge"><span class="dot"></span>connecting…</span>
+      <button class="settings">⚙ settings</button>
+    </nav>
 
     <div class="banner" id="banner" hidden></div>
 
-    <section class="stats">
-      <div class="card stat">
-        <div class="stat-label">Download</div>
-        <div class="stat-value down" id="stat-down">—</div>
-        <div class="stat-rate" id="stat-down-rate">—</div>
-        <div class="bar"><div class="bar-fill down-fill" id="bar-down"></div></div>
-      </div>
-      <div class="card stat">
-        <div class="stat-label">Upload</div>
-        <div class="stat-value up" id="stat-up">—</div>
-        <div class="stat-rate" id="stat-up-rate">—</div>
-        <div class="bar"><div class="bar-fill up-fill" id="bar-up"></div></div>
-      </div>
-      <div class="card stat">
-        <div class="stat-label">WAN</div>
-        <div class="stat-value" id="stat-wan">—</div>
-        <div class="stat-rate" id="stat-wan-sub">total in window</div>
-        <div class="bar"><div class="bar-fill wan-fill" id="bar-wan"></div></div>
-      </div>
-      <div class="card stat">
-        <div class="stat-label">LAN</div>
-        <div class="stat-value" id="stat-lan">—</div>
-        <div class="stat-rate" id="stat-lan-sub">local traffic</div>
-        <div class="bar"><div class="bar-fill lan-fill" id="bar-lan"></div></div>
-      </div>
-    </section>
-
-    <section class="card chart-card">
-      <div class="chart-head">
-        <span class="chart-title">Traffic monitor</span>
-        <span class="chart-legend">
-          <span class="swatch down-swatch"></span>download
-          <span class="swatch up-swatch"></span>upload
-        </span>
-      </div>
-      <div class="chart-holder"><canvas id="main-chart"></canvas></div>
-      <div class="mini-holder"><canvas id="mini-chart"></canvas></div>
-    </section>
-
-    <section class="two-col">
-      <div class="card list-card">
-        <div class="list-head">
-          <span class="chart-title">Apps</span>
-          <span class="dim" id="apps-sub"></span>
+    <div class="filterbar">
+      <span class="filter-label">Filter</span>
+      <div class="filter-right">
+        <div class="combo-wrap">
+          <button class="combo" id="period-btn">3 Hours <span class="caret">▾</span></button>
+          <div class="menu" id="period-menu" hidden>
+            <button data-range="5m">5 Minutes</button>
+            <button data-range="3h" class="sel">3 Hours</button>
+            <button data-range="24h">24 Hours</button>
+            <button data-range="7d">7 Days</button>
+            <button data-range="30d">30 Days</button>
+            <button data-range="unlimited">All Time</button>
+          </div>
         </div>
+        <button class="custom">Custom...</button>
+      </div>
+    </div>
+
+    <div class="plot-zone">
+      <div class="scale-row">
+        <div class="combo-wrap">
+          <button class="combo small" id="scale-btn">Auto-scale <span class="caret">▾</span></button>
+          <div class="menu" id="scale-menu" hidden>
+            <label class="chk"><input type="checkbox" id="autoscale-chk" checked> Auto-Scale</label>
+            <div class="hint">Uncheck Auto-Scale to set the desired graph scale manually.</div>
+            <div class="ladder" id="scale-ladder" hidden></div>
+          </div>
+        </div>
+      </div>
+      <div class="plot-card">
+        <canvas id="main-chart"></canvas>
+      </div>
+    </div>
+
+    <div class="bottom">
+      <canvas id="ring" width="84" height="84"></canvas>
+      <div class="rates">
+        <div class="rate">
+          <span class="rate-label down-c">down <b id="stat-down">—</b></span>
+          <span class="rate-sub" id="stat-down-rate">—</span>
+        </div>
+        <div class="rate">
+          <span class="rate-label up-c">up <b id="stat-up">—</b></span>
+          <span class="rate-sub" id="stat-up-rate">—</span>
+        </div>
+      </div>
+      <div class="wanlan">
+        <div class="wl">
+          <span class="wl-label">WAN</span><b id="stat-wan">—</b>
+          <div class="wl-bar"><div class="wl-fill wan" id="bar-wan"></div></div>
+        </div>
+        <div class="wl">
+          <span class="wl-label">LAN</span><b id="stat-lan">—</b>
+          <div class="wl-bar"><div class="wl-fill lan" id="bar-lan"></div></div>
+        </div>
+        <div class="mini-holder"><canvas id="mini-chart"></canvas></div>
+      </div>
+    </div>
+
+    <div class="section-title">Traffic tab preview <span class="dim">— apps &amp; hosts for the selected window</span></div>
+    <div class="two-col">
+      <div class="card list-card">
+        <div class="list-head"><span>App</span><span class="dim">Total</span></div>
         <div id="app-rows"></div>
       </div>
       <div class="card list-card">
-        <div class="list-head">
-          <span class="chart-title">Hosts</span>
-          <span class="dim">top remote peers</span>
-        </div>
+        <div class="list-head"><span>Hosts</span><span class="dim">top remote peers</span></div>
         <div id="host-rows"></div>
       </div>
-    </section>
+    </div>
 
     <footer class="foot">
-      Packetly Web · runs on demo data in hosted previews · point it at your PC's
-      collector (127.0.0.1:8912) for live data
+      Packetly Web · demo data in hosted previews · live at your PC's collector (127.0.0.1:8912) ·
+      desktop reference: assets/reference-traffic-monitor.png
     </footer>
   </div>
 

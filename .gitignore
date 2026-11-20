@@ -33,5 +33,8 @@ package-lock.json
 # the UI embeds the icon PNG at compile time - keep it tracked
 !assets/packetly.png
 !assets/unknown.png
+# desktop screenshots the web replica is matched against
+!assets/reference-traffic-monitor.png
+!assets/reference-30d.png
 .zcode/
 packetly/src/Packetly/publish/
