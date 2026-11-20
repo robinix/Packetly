@@ -29,14 +29,14 @@
     cached: null, // { ver, upPts, downPts, targetK, rawMax, x0, x1, bucket, miniUp, miniDown, miniMax }
     autoScale: true,
     scaleCap: 104857600,
-    // 60fps smooth viewport glide & scale easing (mirrors packetly-ui/src/main.rs)
+    // VSync continuous viewport glide & scale easing (mirrors packetly-ui/src/main.rs)
     animX1: 0,
     animYTop: 0,
     animK: 1,
     animLast: 0,
     animRange: '',
-    snapX1Seen: 0,
-    snapX1At: 0,
+    clockUnix0: Date.now() / 1000,
+    clockMs0: performance.now(),
     demoRnd: null,
     demoBurstDown: 0,
     demoBurstUp: 0,
@@ -168,7 +168,7 @@
 
   function timeStep(span) {
     // GlassWire-matching label intervals for the preset spans
-    const exact = { 300: 20, 297: 20, 10800: 600, 86400: 3600, 604800: 43200, 2592000: 172800 };
+    const exact = { 300: 20, 285: 20, 10800: 600, 86400: 3600, 604800: 43200, 2592000: 172800 };
     if (exact[Math.round(span)]) return exact[Math.round(span)];
     if (span <= 320) return 20;
     const steps = [10, 20, 30, 60, 120, 300, 600, 1200, 1800, 3600, 7200, 14400, 21600, 43200, 86400, 172800, 691200, 1382400, 2764800];
@@ -356,7 +356,7 @@
   ];
 
   const DEMO_CFG = {
-    '5m': { n: 300, bucket: 1, ambient: 45e3, bursts: 8, bMin: 1.4e6, bMax: 8.5e6, upMax: 3.5e6, seed: 11 },
+    '5m': { n: 301, bucket: 1, ambient: 45e3, bursts: 8, bMin: 1.4e6, bMax: 8.5e6, upMax: 3.5e6, seed: 11 },
     '3h': { n: 181, bucket: 60, ambient: 3.5e6, bursts: 9, bMin: 40e6, bMax: 650e6, upMax: 240e6, seed: 22 },
     '24h': { n: 1440, bucket: 60, ambient: 2e6, bursts: 14, bMin: 120e6, bMax: 1.4e9, upMax: 900e6, seed: 33 },
     '7d': { n: 10080, bucket: 60, ambient: 1.5e6, bursts: 26, bMin: 250e6, bMax: 4.2e9, upMax: 1.5e9, seed: 44 },
@@ -433,61 +433,70 @@
     return { ts, down, up, bucket, totalDown, totalUp, wan, lan, apps, hosts };
   }
 
-  // Append 1 live second in demo 5m mode so the 60fps right-to-left glide is visible in AI Studio
+  // Keep demo 5m synced to wall clock (appending every elapsed 1s bucket up to floor(now))
   function tickDemo5m() {
     if (state.live || state.range !== '5m' || !state.data) return;
     const d = state.data;
     const cfg = DEMO_CFG['5m'];
     const rnd = state.demoRnd || Math.random;
     const n = d.ts.length;
-    const nextTs = d.ts[n - 1] + 1;
+    const targetNow = Math.floor(Date.now() / 1000);
+    let added = 0;
 
-    if (state.demoBurstDown <= 0 && rnd() < 0.09) {
-      state.demoBurstDown = 2 + Math.floor(rnd() * 6);
-      state.demoBurstDownMag = cfg.bMin * 0.7 + rnd() * (cfg.bMax - cfg.bMin) * 0.75;
-    }
-    if (state.demoBurstUp <= 0 && rnd() < 0.07) {
-      state.demoBurstUp = 2 + Math.floor(rnd() * 5);
-      state.demoBurstUpMag = cfg.bMin * 0.3 + rnd() * cfg.upMax * 0.7;
-    }
-    let nd = cfg.ambient * (0.25 + rnd() * 0.9);
-    let nu = cfg.ambient * (0.12 + rnd() * 0.45);
-    if (state.demoBurstDown > 0) {
-      nd += state.demoBurstDownMag * (0.55 + rnd() * 0.55);
-      state.demoBurstDown--;
-    }
-    if (state.demoBurstUp > 0) {
-      nu += state.demoBurstUpMag * (0.5 + rnd() * 0.6);
-      state.demoBurstUp--;
-    }
+    while (d.ts[n - 1] < targetNow && added < 15) {
+      const nextTs = d.ts[n - 1] + 1;
+      if (state.demoBurstDown <= 0 && rnd() < 0.09) {
+        state.demoBurstDown = 2 + Math.floor(rnd() * 6);
+        state.demoBurstDownMag = cfg.bMin * 0.7 + rnd() * (cfg.bMax - cfg.bMin) * 0.75;
+      }
+      if (state.demoBurstUp <= 0 && rnd() < 0.07) {
+        state.demoBurstUp = 2 + Math.floor(rnd() * 5);
+        state.demoBurstUpMag = cfg.bMin * 0.3 + rnd() * cfg.upMax * 0.7;
+      }
+      let nd = cfg.ambient * (0.25 + rnd() * 0.9);
+      let nu = cfg.ambient * (0.12 + rnd() * 0.45);
+      if (state.demoBurstDown > 0) {
+        nd += state.demoBurstDownMag * (0.55 + rnd() * 0.55);
+        state.demoBurstDown--;
+      }
+      if (state.demoBurstUp > 0) {
+        nu += state.demoBurstUpMag * (0.5 + rnd() * 0.6);
+        state.demoBurstUp--;
+      }
 
-    const dropDown = d.down[0], dropUp = d.up[0];
-    d.ts.shift(); d.ts.push(nextTs);
-    d.down.copyWithin(0, 1); d.down[n - 1] = nd;
-    d.up.copyWithin(0, 1); d.up[n - 1] = nu;
-    d.totalDown = Math.max(0, d.totalDown - dropDown + nd);
-    d.totalUp = Math.max(0, d.totalUp - dropUp + nu);
+      const dropDown = d.down[0], dropUp = d.up[0];
+      d.ts.shift(); d.ts.push(nextTs);
+      d.down.copyWithin(0, 1); d.down[n - 1] = nd;
+      d.up.copyWithin(0, 1); d.up[n - 1] = nu;
+      d.totalDown = Math.max(0, d.totalDown - dropDown + nd);
+      d.totalUp = Math.max(0, d.totalUp - dropUp + nu);
+      added++;
+    }
+    if (added === 0) return;
+
     d.wan = (d.totalDown + d.totalUp) * 0.975;
     d.lan = (d.totalDown + d.totalUp) * 0.025;
-
     ingestData(d, false);
   }
 
-  // ---------- cache + 60fps animation loop ----------
+  // ---------- cache + VSync animation loop ----------
   function ingestData(d, updateLists) {
     state.data = d;
     const n = d.ts.length;
+    const x0 = d.ts[0], x1 = d.ts[n - 1];
+    const peakEnd = d.bucket === 1 && n > 6 ? n - 2 : n;
     let rawMax = 0;
-    for (let i = 0; i < n; i++) {
+    for (let i = 0; i < peakEnd; i++) {
       if (d.down[i] > rawMax) rawMax = d.down[i];
       if (d.up[i] > rawMax) rawMax = d.up[i];
     }
 
     const upPts = smoothSeries(d.ts, d.up, 130, 1400);
     const downPts = smoothSeries(d.ts, d.down, 130, 1400);
+    const tailCut = d.bucket === 1 && n > 6 ? x1 - 2 : Infinity;
     let renderedMax = 0;
-    for (const pt of upPts) if (pt[1] > renderedMax) renderedMax = pt[1];
-    for (const pt of downPts) if (pt[1] > renderedMax) renderedMax = pt[1];
+    for (const pt of upPts) if (pt[0] <= tailCut && pt[1] > renderedMax) renderedMax = pt[1];
+    for (const pt of downPts) if (pt[0] <= tailCut && pt[1] > renderedMax) renderedMax = pt[1];
     const targetK = renderedMax > 0 && rawMax > 0 ? rawMax / renderedMax : 1;
 
     const miniUp = smoothSeries(d.ts, d.up, 110, 420);
@@ -495,12 +504,6 @@
     let miniMax = 0;
     for (const pt of miniUp) if (pt[1] > miniMax) miniMax = pt[1];
     for (const pt of miniDown) if (pt[1] > miniMax) miniMax = pt[1];
-
-    const x0 = d.ts[0], x1 = d.ts[n - 1];
-    if (Math.abs(x1 - state.snapX1Seen) > 0.01) {
-      state.snapX1Seen = x1;
-      state.snapX1At = performance.now();
-    }
 
     state.cached = {
       upPts, downPts, targetK, rawMax, x0, x1, bucket: d.bucket,
@@ -553,9 +556,18 @@
 
     const isLive5m = state.range === '5m';
     const spanFull = Math.max(c.bucket, c.x1 - c.x0);
-    const liveLag = isLive5m && spanFull > 6 ? 2.25 : 0;
-    const liveCeil = isLive5m && spanFull > 6 ? c.x1 - 1.0 : c.x1;
-    const visSpan = isLive5m && spanFull > 6 ? Math.max(1, spanFull - 3.0) : spanFull;
+    let wallNow = state.clockUnix0 + (nowMs - state.clockMs0) / 1000;
+    if (isLive5m && Math.abs(wallNow - c.x1) > 8) {
+      state.clockUnix0 = Date.now() / 1000;
+      state.clockMs0 = nowMs;
+      wallNow = state.clockUnix0;
+    }
+
+    const liveDelay = isLive5m && spanFull > 20 ? 7.0 : 0;
+    const liveCeil = isLive5m && spanFull > 20 ? Math.max(c.x0 + c.bucket, c.x1 - 2.0) : c.x1;
+    const visSpan = isLive5m && spanFull > 20 ? Math.max(1, Math.min(285, spanFull - 15.0)) : spanFull;
+    const minX1 = Math.min(c.x0 + c.bucket, liveCeil);
+    const idealLiveX1 = Math.max(minX1, Math.min(liveCeil, wallNow - liveDelay));
 
     const rangeChanged =
       state.animRange !== state.range ||
@@ -565,30 +577,25 @@
     let needMore = false;
     if (rangeChanged) {
       state.animRange = state.range;
-      state.animX1 = Math.max(c.x0 + c.bucket, Math.min(liveCeil, c.x1 - liveLag));
+      state.animX1 = isLive5m && spanFull > 20 ? idealLiveX1 : c.x1;
       state.animYTop = targetYTop;
       state.animK = c.targetK;
-      state.snapX1Seen = c.x1;
-      state.snapX1At = nowMs;
     } else {
-      if (isLive5m && spanFull > 6) {
-        const elapsed = state.snapX1At ? Math.min(2.5, (nowMs - state.snapX1At) / 1000) : 0;
-        const clockX1 = Math.min(liveCeil, c.x1 - liveLag + elapsed);
-        const err = clockX1 - state.animX1;
-        const speed = Math.max(0, Math.min(2.2, 1.0 + err * 1.4));
-        state.animX1 = Math.min(liveCeil, state.animX1 + speed * dt);
-        if (state.animX1 < liveCeil - 0.01) needMore = true;
+      if (isLive5m && spanFull > 20) {
+        // Pure monotonic 1.000x clock — zero servo, zero rubberbanding
+        state.animX1 = idealLiveX1;
+        needMore = true;
       } else {
         const diffX = c.x1 - state.animX1;
         if (Math.abs(diffX) > 0.05) {
-          state.animX1 += diffX * (1 - Math.exp(-dt * 7));
+          state.animX1 += diffX * (1 - Math.exp(-dt * 5));
           needMore = true;
         } else {
           state.animX1 = c.x1;
         }
       }
 
-      const easeY = 1 - Math.exp(-dt * 8);
+      const easeY = 1 - Math.exp(-dt * 4.5);
       if (Math.abs(targetYTop - state.animYTop) > targetYTop * 0.002) {
         state.animYTop += (targetYTop - state.animYTop) * easeY;
         needMore = true;
@@ -603,7 +610,7 @@
       }
     }
 
-    const vx1 = Math.max(c.x0 + c.bucket, Math.min(liveCeil, state.animX1));
+    const vx1 = Math.max(minX1, Math.min(liveCeil, state.animX1));
     const vx0 = Math.max(c.x0, vx1 - visSpan);
     const yTop = Math.max(1024, state.animYTop);
     const cap = state.autoScale ? Infinity : state.scaleCap;
@@ -727,7 +734,7 @@
   }
 
   function pollMs() {
-    if (state.range === '5m') return 1000;
+    if (state.range === '5m') return 750;
     if (state.range === '3h') return 5000;
     return 60000;
   }
@@ -738,7 +745,7 @@
     if (state.live) {
       state.pollTimer = setInterval(refresh, pollMs());
     } else if (state.range === '5m') {
-      state.demoTickTimer = setInterval(tickDemo5m, 1000);
+      state.demoTickTimer = setInterval(tickDemo5m, 500);
     }
   }
 

@@ -7,7 +7,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use eframe::egui;
-use egui_plot::{Line, Plot, PlotPoints};
+use egui_plot::Plot;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -64,7 +64,7 @@ impl Theme {
             border: egui::Color32::from_rgb(226, 232, 230),
             text: egui::Color32::from_rgb(31, 41, 55),
             dim: egui::Color32::from_rgb(120, 130, 140),
-            grid: egui::Color32::from_rgba_unmultiplied(255, 255, 255, 110),
+            grid: srgb_alpha(egui::Color32::WHITE, 0.45),
             axis: egui::Color32::from_rgb(110, 122, 132),
             accent: egui::Color32::from_rgb(59, 130, 246),
             in_c: egui::Color32::from_rgb(134, 90, 222),
@@ -82,7 +82,7 @@ impl Theme {
             border: egui::Color32::from_rgb(30, 38, 34),
             text: egui::Color32::from_rgb(220, 232, 226),
             dim: egui::Color32::from_rgb(125, 143, 134),
-            grid: egui::Color32::from_rgba_unmultiplied(255, 255, 255, 16),
+            grid: srgb_alpha(egui::Color32::WHITE, 0.05),
             axis: egui::Color32::from_rgb(120, 138, 130),
             accent: egui::Color32::from_rgb(96, 165, 250),
             in_c: egui::Color32::from_rgb(122, 84, 235),
@@ -94,23 +94,71 @@ impl Theme {
         Self {
             nav_bg: egui::Color32::from_rgb(12, 17, 30),
             bg: egui::Color32::from_rgb(15, 21, 36),
-            plot_bg: egui::Color32::from_rgb(18, 25, 42),
+            plot_bg: egui::Color32::from_rgb(18, 26, 42),
             card: egui::Color32::from_rgb(25, 33, 52),
             card2: egui::Color32::from_rgb(30, 40, 62),
             border: egui::Color32::from_rgb(42, 53, 82),
             text: egui::Color32::from_rgb(204, 212, 228),
             dim: egui::Color32::from_rgb(118, 130, 158),
-            grid: egui::Color32::from_rgba_unmultiplied(255, 255, 255, 5),
-            axis: egui::Color32::from_rgb(124, 137, 173),
+            grid: srgb_alpha(egui::Color32::WHITE, 0.035),
+            axis: egui::Color32::from_rgb(132, 143, 168),
             accent: egui::Color32::from_rgb(132, 179, 60),
             in_c: egui::Color32::from_rgb(224, 80, 200),
             out_c: egui::Color32::from_rgb(110, 147, 232),
-            danger: egui::Color32::from_rgb(235, 90, 90),
+            danger: egui::Color32::from_rgb(230, 100, 90),
         }
     }
     fn alpha(c: egui::Color32, a: u8) -> egui::Color32 {
         egui::Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a)
     }
+}
+
+/// Exact sRGB-space premultiplied alpha matching HTML5 Canvas `rgba(r,g,b,a)`.
+/// Avoids egui's linear-to-sRGB gamma boost that washes out low-alpha fills & gridlines.
+fn srgb_alpha(c: egui::Color32, a: f32) -> egui::Color32 {
+    let a = a.clamp(0.0, 1.0);
+    egui::Color32::from_rgba_premultiplied(
+        (c.r() as f32 * a).round() as u8,
+        (c.g() as f32 * a).round() as u8,
+        (c.b() as f32 * a).round() as u8,
+        (255.0 * a).round() as u8,
+    )
+}
+
+/// Render a vertical linear-gradient area fill (matching web `createLinearGradient`)
+/// using an egui triangle-strip mesh: `a_top` at `top_y` fading smoothly to `a_bot` at `base_y`.
+fn paint_gradient_fill(
+    painter: &egui::Painter,
+    screen_pts: &[egui::Pos2],
+    color: egui::Color32,
+    top_y: f32,
+    base_y: f32,
+    a_top: f32,
+    a_bot: f32,
+) {
+    if screen_pts.len() < 2 {
+        return;
+    }
+    let span_y = (base_y - top_y).max(1.0);
+    let bot_c = srgb_alpha(color, a_bot);
+    let mut mesh = egui::Mesh::default();
+    mesh.vertices.reserve(screen_pts.len() * 2);
+    mesh.indices.reserve((screen_pts.len() - 1) * 6);
+    for (i, pt) in screen_pts.iter().enumerate() {
+        let y = pt.y.min(base_y);
+        let frac = ((y - top_y) / span_y).clamp(0.0, 1.0);
+        let a = a_top + (a_bot - a_top) * frac;
+        let top_c = srgb_alpha(color, a);
+        let vi = (i * 2) as u32;
+        mesh.colored_vertex(egui::Pos2::new(pt.x, y), top_c);
+        mesh.colored_vertex(egui::Pos2::new(pt.x, base_y), bot_c);
+        if i > 0 {
+            let prev = vi - 2;
+            mesh.add_triangle(prev, prev + 1, vi);
+            mesh.add_triangle(prev + 1, vi + 1, vi);
+        }
+    }
+    painter.add(egui::Shape::mesh(mesh));
 }
 
 const PALETTE: [egui::Color32; 10] = [
@@ -173,7 +221,7 @@ impl Range {
     }
     fn refresh(self) -> Duration {
         match self {
-            Range::M5 => Duration::from_millis(1000),
+            Range::M5 => Duration::from_millis(750),
             Range::H3 => Duration::from_millis(5000),
             _ => Duration::from_millis(60000),
         }
@@ -1058,6 +1106,7 @@ fn clip_and_scale(pts: &[[f64; 2]], vx0: f64, vx1: f64, k: f64, cap: f64) -> Vec
 }
 
 fn traffic_ver(tr: &TrafficData) -> u64 {
+    let last_ts = tr.rows.last().map(|r| r.0 as u64).unwrap_or(0);
     let last_sum = tr
         .rows
         .last()
@@ -1068,6 +1117,8 @@ fn traffic_ver(tr: &TrafficData) -> u64 {
         .wrapping_add(tr.to as u64)
         .wrapping_mul(31)
         .wrapping_add(tr.from as u64)
+        .wrapping_mul(31)
+        .wrapping_add(last_ts)
         .wrapping_mul(31)
         .wrapping_add(last_sum)
 }
@@ -1450,8 +1501,15 @@ fn pivot(traffic: &TrafficData, in_c: egui::Color32, out_c: egui::Color32) -> Pi
     let mut p = Pivot::default();
     let bucket = tier_bucket(&traffic.tier);
     p.bucket = bucket;
-    let first = traffic.rows.first().map(|r| r.0).unwrap_or(traffic.from);
-    let mut x0 = ((traffic.from.max(first - bucket)) / bucket).ceil() * bucket;
+    // Only trim leading empty space on unbounded ("All Time") queries where from == 0;
+    // bounded ranges (5m, 3h, 24h, 7d, 30d, Custom) keep a rock-steady x0..x1 grid so
+    // idle periods at the left edge never shift the viewport span or stretch the curve.
+    let mut x0 = if traffic.from <= 0.0 {
+        let first = traffic.rows.first().map(|r| r.0).unwrap_or(traffic.from);
+        ((first - bucket).max(0.0) / bucket).ceil() * bucket
+    } else {
+        (traffic.from / bucket).ceil() * bucket
+    };
     if traffic.to <= x0 {
         x0 = (traffic.from / bucket).ceil() * bucket;
     }
@@ -1466,6 +1524,9 @@ fn pivot(traffic: &TrafficData, in_c: egui::Color32, out_c: egui::Color32) -> Pi
     let mut down = vec![0.0_f64; n];
     let mut up = vec![0.0_f64; n];
     for (ts, _app, i, o) in &traffic.rows {
+        if *ts < x0 - bucket * 0.5 {
+            continue;
+        }
         let idx = ((ts - x0) / bucket).round() as usize;
         if idx < n {
             down[idx] += i;
@@ -1473,10 +1534,12 @@ fn pivot(traffic: &TrafficData, in_c: egui::Color32, out_c: egui::Color32) -> Pi
         }
     }
 
-    // raw bucket peak -> basis of the y-scale
+    // raw bucket peak -> basis of the y-scale (on live 1s tier exclude the
+    // unflushed tail [n-2..n] so in-progress writes never jitter the Y scale)
+    let peak_end = if bucket == 1.0 && n > 6 { n - 2 } else { n };
     let mut y_max = 0.0_f64;
-    for v in down.iter().chain(up.iter()) {
-        y_max = y_max.max(*v);
+    for i in 0..peak_end {
+        y_max = y_max.max(down[i]).max(up[i]);
     }
     p.y_max = y_max;
     p.series = vec![
@@ -1851,14 +1914,14 @@ struct PacketlyApp {
     settings_open: bool,
     start_minimized: bool,
     flags: Arc<Mutex<UiFlags>>,
-    // Smooth 60fps viewport scroll & scale animation state
+    // Smooth VSync viewport scroll & scale animation state
     anim_x1: f64,
     anim_y_top: f64,
     anim_k: f64,
     anim_last: Option<std::time::Instant>,
     anim_sel_key: String,
-    snap_x1_seen: f64,
-    snap_x1_at: Option<std::time::Instant>,
+    clock_unix0: f64,
+    clock_inst0: std::time::Instant,
 }
 
 #[derive(Clone)]
@@ -2256,29 +2319,64 @@ impl PacketlyApp {
                                 cache.mini.as_ref().unwrap().1.clone()
                             };
                             let mini_colors = [t.out_c, t.in_c];
-                            Plot::new("mini_timeline")
-                                .height(42.0)
-                                .width(ui.available_width())
-                                .show_axes([false, false])
-                                .show_grid(egui::Vec2b::FALSE)
-                                .set_margin_fraction(egui::Vec2::ZERO)
-                                .allow_drag(false)
-                                .allow_zoom(false)
-                                .allow_scroll(false)
-                                .allow_boxed_zoom(false)
-                                .show(ui, |plot_ui| {
-                                    for (idx, pts) in mini_series.iter().enumerate() {
-                                        if !pts.is_empty() {
-                                            let c = mini_colors[idx % mini_colors.len()];
-                                            plot_ui.line(
-                                                Line::new(PlotPoints::from(pts.clone()))
-                                                    .color(c)
-                                                    .fill(0.0_f32)
-                                                    .width(1.1_f32),
-                                            );
-                                        }
+                            let (mrect, _) = ui.allocate_exact_size(
+                                egui::vec2(ui.available_width().max(1.0), 44.0),
+                                egui::Sense::hover(),
+                            );
+                            let mpainter = ui.painter_at(mrect);
+                            mpainter.rect_filled(mrect, 4.0, t.plot_bg);
+                            let mut mx0 = f64::INFINITY;
+                            let mut mx1 = f64::NEG_INFINITY;
+                            let mut my_max = 1.0_f64;
+                            for pts in mini_series.iter() {
+                                if let (Some(a), Some(b)) = (pts.first(), pts.last()) {
+                                    mx0 = mx0.min(a[0]);
+                                    mx1 = mx1.max(b[0]);
+                                }
+                                for pt in pts {
+                                    my_max = my_max.max(pt[1]);
+                                }
+                            }
+                            if mx1 > mx0 {
+                                let mspan_x = (mx1 - mx0).max(1e-6);
+                                let mtop = mrect.top() + 3.0;
+                                let mbase = mrect.bottom() - 2.0;
+                                let mh = (mbase - mtop).max(1.0);
+                                let my_top = my_max * 1.12;
+                                let mw = mrect.width().max(1.0);
+                                let dark_theme = t.text.r() > 128;
+                                let (ma_top, ma_bot) =
+                                    if dark_theme { (0.32, 0.08) } else { (0.38, 0.12) };
+                                let mini_screen: Vec<Vec<egui::Pos2>> = mini_series
+                                    .iter()
+                                    .map(|pts| {
+                                        pts.iter()
+                                            .map(|pt| {
+                                                let x = mrect.left()
+                                                    + (((pt[0] - mx0) / mspan_x) as f32) * mw;
+                                                let y = mbase
+                                                    - (((pt[1].min(my_top)) / my_top) as f32) * mh;
+                                                egui::Pos2::new(x, y)
+                                            })
+                                            .collect()
+                                    })
+                                    .collect();
+                                for (idx, spts) in mini_screen.iter().enumerate() {
+                                    let c = mini_colors[idx % mini_colors.len()];
+                                    paint_gradient_fill(
+                                        &mpainter, spts, c, mtop, mbase, ma_top, ma_bot,
+                                    );
+                                }
+                                for (idx, spts) in mini_screen.iter().enumerate() {
+                                    if spts.len() >= 2 {
+                                        let c = mini_colors[idx % mini_colors.len()];
+                                        mpainter.add(egui::Shape::line(
+                                            spts.clone(),
+                                            egui::Stroke::new(1.1, c),
+                                        ));
                                     }
-                                });
+                                }
+                            }
                         }
                     });
                 });
@@ -2301,7 +2399,6 @@ impl PacketlyApp {
                             cache.version = ver.unwrap_or(0);
                             cache.pivot = if p.series.is_empty() { None } else { Some(Arc::new(p)) };
                             cache.rendered = None;
-                            cache.mini = None;
                         }
                     }
                 }
@@ -2382,7 +2479,13 @@ impl PacketlyApp {
 
                 egui::Frame::none()
                     .fill(t.plot_bg)
-                    .rounding(6.0)
+                    .rounding(8.0)
+                    .inner_margin(egui::Margin {
+                        left: 2.0,
+                        right: 2.0,
+                        top: 10.0,
+                        bottom: 24.0,
+                    })
                     .show(ui, |ui| {
                         match (&snap.traffic, &p) {
                             (Some(_), Some(p)) if !p.series.is_empty() => {
@@ -2421,10 +2524,17 @@ impl PacketlyApp {
                                                 )
                                             })
                                             .collect();
+                                        let tail_cut = if p.bucket == 1.0 && p.n > 6 {
+                                            p.x1 - 2.0
+                                        } else {
+                                            f64::INFINITY
+                                        };
                                         let mut rendered_max = 0.0_f64;
                                         for pts in &series_pts {
                                             for pt in pts {
-                                                rendered_max = rendered_max.max(pt[1]);
+                                                if pt[0] <= tail_cut {
+                                                    rendered_max = rendered_max.max(pt[1]);
+                                                }
                                             }
                                         }
                                         let tk = if rendered_max > 0.0 && p.y_max > 0.0 {
@@ -2453,7 +2563,7 @@ impl PacketlyApp {
                                     self.scale_cap
                                 };
 
-                                // ---- 60fps continuous viewport glide & smooth Y-scale easing ----
+                                // ---- VSync continuous viewport glide & gentle Y-scale easing ----
                                 let now_inst = std::time::Instant::now();
                                 let dt = self
                                     .anim_last
@@ -2463,36 +2573,47 @@ impl PacketlyApp {
                                     .unwrap_or(0.0);
                                 self.anim_last = Some(now_inst);
 
-                                if (p.x1 - self.snap_x1_seen).abs() > 0.01 {
-                                    self.snap_x1_seen = p.x1;
-                                    self.snap_x1_at = Some(now_inst);
-                                }
-
                                 let sel_key = self.sel.query();
                                 let is_live_5m = matches!(self.sel, RangeSel::Preset(Range::M5));
                                 let is_custom = matches!(self.sel, RangeSel::Custom(_, _));
                                 let is_paused = snap.sel.is_some() || self.sel_drag.is_some();
                                 let span_full = (p.x1 - p.x0).max(p.bucket);
-                                // On 5m, TrafficWriter flushes closed seconds up to now-1, so
-                                // keeping the right edge ~2.25s behind p.x1 (capped <= p.x1-1.0)
-                                // ensures real closed smoothed data glides seamlessly in from
-                                // the right edge at constant 1.0x speed with zero drop-to-zero.
-                                let live_lag = if is_live_5m && span_full > 6.0 {
-                                    2.25
+
+                                let mut wall_now =
+                                    self.clock_unix0 + self.clock_inst0.elapsed().as_secs_f64();
+                                // Re-anchor monotonic clock only after sleep/hibernate or OS clock jump
+                                if is_live_5m && (wall_now - p.x1).abs() > 8.0 {
+                                    self.clock_unix0 = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .map(|d| d.as_secs_f64())
+                                        .unwrap_or(p.x1);
+                                    self.clock_inst0 = now_inst;
+                                    wall_now = self.clock_unix0;
+                                }
+
+                                // On 5m, TrafficWriter flushes closed seconds up to now-2 reliably,
+                                // and the 3-pass box filter (r=2,1,1 => 4s) + Catmull-Rom (+1s)
+                                // reaches 5s right of view_x1. Trailing continuous wall_now by 7.0s
+                                // keeps every visible pixel 100% inside already-closed flushed data:
+                                // exact 1.000x real-time scroll, zero speed surges, zero right-edge jumps.
+                                let live_delay = if is_live_5m && span_full > 20.0 {
+                                    7.0
                                 } else {
                                     0.0
                                 };
-                                let live_ceil = if is_live_5m && span_full > 6.0 {
-                                    p.x1 - 1.0
+                                let live_ceil = if is_live_5m && span_full > 20.0 {
+                                    (p.x1 - 2.0).max(p.x0 + p.bucket)
                                 } else {
                                     p.x1
                                 };
-                                let vis_span = if is_live_5m && span_full > 6.0 {
-                                    (span_full - 3.0).max(1.0)
+                                let vis_span = if is_live_5m && span_full > 20.0 {
+                                    (span_full - 15.0).clamp(1.0, 285.0)
                                 } else {
                                     span_full
                                 };
                                 let min_x1 = (p.x0 + p.bucket).min(live_ceil);
+                                let ideal_live_x1 =
+                                    (wall_now - live_delay).clamp(min_x1, live_ceil);
                                 let range_changed = sel_key != self.anim_sel_key
                                     || self.anim_x1 < p.x0
                                     || self.anim_x1 > p.x1 + p.bucket * 4.0;
@@ -2500,30 +2621,22 @@ impl PacketlyApp {
                                 let mut need_repaint = false;
                                 if range_changed {
                                     self.anim_sel_key = sel_key;
-                                    self.anim_x1 = (p.x1 - live_lag).clamp(min_x1, live_ceil);
+                                    self.anim_x1 = if is_live_5m && span_full > 20.0 {
+                                        ideal_live_x1
+                                    } else {
+                                        p.x1
+                                    };
                                     self.anim_y_top = target_y_top;
                                     self.anim_k = target_k;
-                                    self.snap_x1_seen = p.x1;
-                                    self.snap_x1_at = Some(now_inst);
                                 } else if !is_paused {
-                                    if is_live_5m && span_full > 6.0 {
-                                        let elapsed = self
-                                            .snap_x1_at
-                                            .map(|t0| {
-                                                now_inst.duration_since(t0).as_secs_f64().min(2.5)
-                                            })
-                                            .unwrap_or(0.0);
-                                        let clock_x1 = (p.x1 - live_lag + elapsed).min(live_ceil);
-                                        let err = clock_x1 - self.anim_x1;
-                                        let speed = (1.0 + err * 1.4).clamp(0.0, 2.2);
-                                        self.anim_x1 = (self.anim_x1 + speed * dt).min(live_ceil);
-                                        if self.anim_x1 < live_ceil - 0.01 {
-                                            need_repaint = true;
-                                        }
+                                    if is_live_5m && span_full > 20.0 {
+                                        // Pure monotonic 1.000x clock — zero servo, zero rubberbanding
+                                        self.anim_x1 = ideal_live_x1;
+                                        need_repaint = true;
                                     } else if !is_custom {
                                         let diff_x = p.x1 - self.anim_x1;
                                         if diff_x.abs() > 0.05 {
-                                            let ease = 1.0 - (-dt * 7.0).exp();
+                                            let ease = 1.0 - (-dt * 5.0).exp();
                                             self.anim_x1 += diff_x * ease;
                                             need_repaint = true;
                                         } else {
@@ -2533,7 +2646,7 @@ impl PacketlyApp {
                                         self.anim_x1 = p.x1;
                                     }
 
-                                    let ease_y = 1.0 - (-dt * 8.0).exp();
+                                    let ease_y = 1.0 - (-dt * 4.5).exp();
                                     if (target_y_top - self.anim_y_top).abs()
                                         > target_y_top * 0.002
                                     {
@@ -2559,7 +2672,7 @@ impl PacketlyApp {
                                 let y_step = nice_step(target_y_top / 8.0);
                                 let cur_k = self.anim_k;
                                 if need_repaint {
-                                    ctx.request_repaint_after(Duration::from_millis(16));
+                                    ctx.request_repaint();
                                 }
 
                                 let visible_series: Vec<Vec<[f64; 2]>> = rendered
@@ -2568,25 +2681,6 @@ impl PacketlyApp {
                                     .collect();
 
                                 let plot = Plot::new("traffic")
-                                    .x_grid_spacer(move |input| {
-                                        time_ticks(input.bounds.0, input.bounds.1, x_step)
-                                            .into_iter()
-                                            .map(|ts| egui_plot::GridMark {
-                                                value: ts,
-                                                step_size: x_step,
-                                            })
-                                            .collect()
-                                    })
-                                    .y_grid_spacer(move |input| {
-                                        let a = (input.bounds.0 / y_step).ceil() as i64;
-                                        let b = (input.bounds.1 / y_step).ceil() as i64;
-                                        (a..=b)
-                                            .map(|i| egui_plot::GridMark {
-                                                value: i as f64 * y_step,
-                                                step_size: y_step,
-                                            })
-                                            .collect()
-                                    })
                                     .x_axis_formatter(|_, _| String::new())
                                     .y_axis_formatter(|_, _| String::new())
                                     .label_formatter(|_, _| String::new())
@@ -2594,68 +2688,48 @@ impl PacketlyApp {
                                     .allow_zoom(false)
                                     .allow_scroll(false)
                                     .show_grid(egui::Vec2b::FALSE)
+                                    .show_background(false)
                                     .set_margin_fraction(egui::Vec2::ZERO)
-                                    .show_axes([false, true])
-                                    .height((ui.available_height() * 0.88).max(300.0));
-                                let plot = plot
+                                    .show_axes([false, false])
+                                    .height((ui.available_height() * 0.88).max(280.0))
                                     .include_x(view_x0)
                                     .include_x(view_x1)
                                     .include_y(0.0)
                                     .include_y(y_top * 1.04);
                                 let dark_theme = t.text.r() > 128;
-                                let presp = plot.show(ui, |plot_ui| {
-                                    // luminous fills first (baseline y=0.0), crisp strokes on top
-                                    for (s, pts) in p.series.iter().zip(visible_series.iter()) {
-                                        let fill_color = if dark_theme {
-                                            egui::Color32::from_rgb(
-                                                (s.color.r() as f32 * 0.56) as u8,
-                                                (s.color.g() as f32 * 0.56) as u8,
-                                                (s.color.b() as f32 * 0.56) as u8,
-                                            )
-                                        } else {
-                                            Theme::alpha(s.color, 95)
-                                        };
-                                        plot_ui.line(
-                                            Line::new(PlotPoints::from(pts.clone()))
-                                                .color(fill_color)
-                                                .fill(0.0_f32)
-                                                .width(0.0_f32),
-                                        );
-                                    }
-                                    for (s, pts) in p.series.iter().zip(visible_series.iter()) {
-                                        plot_ui.line(
-                                            Line::new(PlotPoints::from(pts.clone()))
-                                                .name(s.name.clone())
-                                                .color(s.color)
-                                                .width(1.6_f32),
-                                        );
-                                    }
-                                });
+                                let presp = plot.show(ui, |_plot_ui| {});
 
                                 {
-                                    let rect = presp.transform.frame();
-                                    let painter = ui.painter_at(*rect);
-                                    let vgrid = Theme::alpha(
-                                        t.grid,
-                                        ((t.grid.a() as f32) * 0.65).round().max(3.0) as u8,
+                                    let rect = *presp.transform.frame();
+                                    let clip_plot = egui::Rect::from_min_max(
+                                        egui::Pos2::new(rect.left(), rect.top() - 4.0),
+                                        egui::Pos2::new(rect.right(), rect.bottom() + 2.0),
                                     );
-                                    for ts in time_ticks(view_x0, view_x1, x_step) {
+                                    let label_rect = egui::Rect::from_min_max(
+                                        egui::Pos2::new(rect.left(), rect.top() - 4.0),
+                                        egui::Pos2::new(rect.right(), rect.bottom() + 24.0),
+                                    );
+                                    let painter = ui.painter_at(clip_plot);
+                                    let label_painter = ui.painter_at(label_rect);
+
+                                    // Layer 1: Subtle vertical + horizontal gridlines BEHIND curves
+                                    let vgrid = match self.theme_kind {
+                                        ThemeKind::Elite => srgb_alpha(egui::Color32::WHITE, 0.022),
+                                        ThemeKind::Dark => srgb_alpha(egui::Color32::WHITE, 0.032),
+                                        ThemeKind::Light => srgb_alpha(egui::Color32::WHITE, 0.30),
+                                    };
+                                    let x_ticks = time_ticks(view_x0, view_x1, x_step);
+                                    for &ts in &x_ticks {
                                         let px = presp.transform.position_from_point_x(ts);
                                         painter.line_segment(
                                             [
                                                 egui::Pos2::new(px, rect.top()),
-                                                egui::Pos2::new(px, rect.bottom() - 20.0),
+                                                egui::Pos2::new(px, rect.bottom()),
                                             ],
                                             egui::Stroke::new(1.0, vgrid),
                                         );
-                                        painter.text(
-                                            egui::Pos2::new(px, rect.bottom() - 8.0),
-                                            egui::Align2::CENTER_BOTTOM,
-                                            fmt_time_axis(ts, axis_mode),
-                                            egui::FontId::proportional(11.0),
-                                            t.axis,
-                                        );
                                     }
+                                    let mut y_labels: Vec<(f64, f32)> = Vec::new();
                                     let mut yv = y_step;
                                     while yv <= y_top * 1.02 {
                                         let py = presp.transform.position_from_point_y(yv);
@@ -2667,19 +2741,80 @@ impl PacketlyApp {
                                                 ],
                                                 egui::Stroke::new(1.0, t.grid),
                                             );
-                                            // labels hugging the top edge collide with the
-                                            // Auto-scale/cap button row above the plot
                                             if py >= rect.top() + 10.0 {
-                                                painter.text(
-                                                    egui::Pos2::new(rect.left() + 6.0, py - 4.0),
-                                                    egui::Align2::LEFT_BOTTOM,
-                                                    fmt_b(yv),
-                                                    egui::FontId::proportional(11.0),
-                                                    t.axis,
-                                                );
+                                                y_labels.push((yv, py));
                                             }
                                         }
                                         yv += y_step;
+                                    }
+
+                                    // Layer 2: Rich vertical linear-gradient area fills (0.34 -> 0.07)
+                                    let base_y = presp
+                                        .transform
+                                        .position_from_point_y(0.0)
+                                        .min(rect.bottom());
+                                    let (a_top, a_bot) =
+                                        if dark_theme { (0.34, 0.07) } else { (0.42, 0.14) };
+                                    let screen_series: Vec<Vec<egui::Pos2>> = visible_series
+                                        .iter()
+                                        .map(|pts| {
+                                            pts.iter()
+                                                .map(|pt| {
+                                                    egui::Pos2::new(
+                                                        presp
+                                                            .transform
+                                                            .position_from_point_x(pt[0]),
+                                                        presp
+                                                            .transform
+                                                            .position_from_point_y(pt[1]),
+                                                    )
+                                                })
+                                                .collect()
+                                        })
+                                        .collect();
+                                    for (s, spts) in p.series.iter().zip(screen_series.iter()) {
+                                        paint_gradient_fill(
+                                            &painter,
+                                            spts,
+                                            s.color,
+                                            rect.top(),
+                                            base_y,
+                                            a_top,
+                                            a_bot,
+                                        );
+                                    }
+
+                                    // Layer 3: Crisp strokes cleanly on top of fills
+                                    for (s, spts) in p.series.iter().zip(screen_series.iter()) {
+                                        if spts.len() >= 2 {
+                                            painter.add(egui::Shape::line(
+                                                spts.clone(),
+                                                egui::Stroke::new(1.7, s.color),
+                                            ));
+                                        }
+                                    }
+
+                                    // Layer 4: Axis labels (Y on top-left, X cleanly in bottom strip)
+                                    for (yv, py) in y_labels {
+                                        label_painter.text(
+                                            egui::Pos2::new(rect.left() + 6.0, py - 4.0),
+                                            egui::Align2::LEFT_BOTTOM,
+                                            fmt_b(yv),
+                                            egui::FontId::proportional(11.0),
+                                            t.axis,
+                                        );
+                                    }
+                                    for &ts in &x_ticks {
+                                        let px = presp.transform.position_from_point_x(ts);
+                                        if px > rect.left() + 18.0 && px < rect.right() - 18.0 {
+                                            label_painter.text(
+                                                egui::Pos2::new(px, rect.bottom() + 17.0),
+                                                egui::Align2::CENTER_BOTTOM,
+                                                fmt_time_axis(ts, axis_mode),
+                                                egui::FontId::proportional(11.0),
+                                                t.axis,
+                                            );
+                                        }
                                     }
                                 }
 
@@ -4102,8 +4237,11 @@ fn main() -> eframe::Result {
                 anim_k: 1.0,
                 anim_last: None,
                 anim_sel_key: String::new(),
-                snap_x1_seen: 0.0,
-                snap_x1_at: None,
+                clock_unix0: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs_f64())
+                    .unwrap_or(0.0),
+                clock_inst0: std::time::Instant::now(),
             }))
         }),
     )

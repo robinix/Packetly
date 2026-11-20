@@ -2288,7 +2288,7 @@ dependencies = [
 
 [[package]]
 name = "packetly-ui"
-version = "1.7.0"
+version = "1.7.2"
 dependencies = [
  "chrono",
  "eframe",
