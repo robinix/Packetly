@@ -35,6 +35,14 @@ The server honors the `PORT` env var for hosted environments.
   (`http://127.0.0.1:8912`, same origin as `/api/*`) it polls
   `/api/traffic`, `/api/apps`, `/api/hosts` every 3 s and renders real data.
 
+## For AI agents
+
+**Work on the actual desktop app, not this demo.** The product is
+`packetly/` (.NET collector) + `packetly-ui/` (Rust egui). This folder is a
+preview/prototyping surface only — see the repo-root `AGENTS.md` for the full
+policy. In short: prototype here, then state clearly that the change must be
+ported to `packetly-ui/src/main.rs`; a web/-only edit never ships to users.
+
 ## Relationship to the desktop app
 
 This folder is fully additive. The desktop app is:
