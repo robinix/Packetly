@@ -1,12 +1,17 @@
 name: Release
 
 # Builds Windows binaries and attaches an install-ready zip to the GitHub
-# Release whenever a v* tag is pushed. Publish an update: bump the version,
-# commit, tag (e.g. v1.0.1), push the tag - this workflow does the rest.
+# Release whenever a v* tag is pushed OR when AppApi.cs bumps to a new
+# untagged version on main (e.g. pushed from Google AI Studio).
 
 on:
   push:
     tags: ["v*"]
+    branches: ["main"]
+    paths:
+      - "packetly/src/Packetly/Api/AppApi.cs"
+      - "CHANGELOG.md"
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -17,22 +22,65 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Resolve release version
+        id: ver
+        shell: pwsh
+        run: |
+          if ("${{ github.ref_type }}" -eq "tag") {
+            $tag = "${{ github.ref_name }}"
+            $shouldRelease = "true"
+          } else {
+            $api = Get-Content -Raw "packetly/src/Packetly/Api/AppApi.cs"
+            if ($api -notmatch 'version\s*=\s*"([^"]+)"') {
+              Write-Error "Could not parse version from AppApi.cs"
+              exit 1
+            }
+            $tag = "v$($Matches[1])"
+            $existing = git ls-remote --tags origin "refs/tags/$tag"
+            if ($existing) {
+              Write-Host "Tag $tag already exists on origin — skipping release."
+              $shouldRelease = "false"
+            } else {
+              Write-Host "New untagged version detected: $tag — will build and publish release."
+              $shouldRelease = "true"
+            }
+          }
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "should_release=$shouldRelease" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+          # Extract matching section from CHANGELOG.md if present
+          $notes = "Packetly $tag"
+          if (Test-Path "CHANGELOG.md") {
+            $cl = Get-Content -Raw "CHANGELOG.md"
+            $escaped = [regex]::Escape($tag)
+            $m = [regex]::Match($cl, "(?ms)^##\s+$escaped\b.*?(?=^##\s+|\z)")
+            if ($m.Success) {
+              $notes = $m.Value.Trim()
+            }
+          }
+          Set-Content -Path "release-notes.md" -Value $notes -Encoding utf8
+
       - uses: actions/setup-dotnet@v4
+        if: steps.ver.outputs.should_release == 'true'
         with:
           dotnet-version: 8.0.x
 
       - uses: dtolnay/rust-toolchain@stable
+        if: steps.ver.outputs.should_release == 'true'
 
       - name: Build collector
+        if: steps.ver.outputs.should_release == 'true'
         run: dotnet publish packetly/src/Packetly -c Release -r win-x64 --self-contained false
 
       - name: Build UI
+        if: steps.ver.outputs.should_release == 'true'
         run: cargo build --release --manifest-path packetly-ui/Cargo.toml
 
       - name: Package
+        if: steps.ver.outputs.should_release == 'true'
         shell: pwsh
         run: |
-          $tag = "${{ github.ref_name }}"
+          $tag = "${{ steps.ver.outputs.tag }}"
           $stage = "Packetly"
           New-Item -ItemType Directory -Path "$stage/scripts" -Force | Out-Null
           $pub = 'packetly/src/Packetly/bin/Release/net8.0-windows/win-x64/publish'
@@ -45,7 +93,12 @@ jobs:
           Get-Item "Packetly-$tag-win-x64.zip" | Select-Object Name, Length
 
       - name: Publish release
+        if: steps.ver.outputs.should_release == 'true'
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: Packetly ${{ steps.ver.outputs.tag }}
+          target_commitish: ${{ github.sha }}
           files: Packetly-*-win-x64.zip
+          body_path: release-notes.md
           generate_release_notes: true
