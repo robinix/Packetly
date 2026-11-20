@@ -306,24 +306,22 @@ impl RangeSel {
     fn x_step(&self, span: f64) -> f64 {
         match self {
             RangeSel::Preset(r) => match r {
-                Range::M5 => 30.0,
-                Range::H3 => 900.0,
-                Range::H24 => 7200.0,
-                Range::D7 => 86400.0,
-                Range::D30 => 259200.0,
-                Range::Unlimited => 31536000.0,
+                // GlassWire-matching label intervals:
+                // 5m->20s, 3h->10m, 24h->1h, 7d->12h, 30d->2d, all->8d
+                Range::M5 => 20.0,
+                Range::H3 => 600.0,
+                Range::H24 => 3600.0,
+                Range::D7 => 43200.0,
+                Range::D30 => 172800.0,
+                Range::Unlimited => 691200.0,
             },
             RangeSel::Custom(_, _) => {
-                let raw = span / 8.0;
+                // ~15 labels like the reference
+                let raw = span / 15.0;
                 for s in [
-                    3600.0,
-                    7200.0,
-                    10800.0,
-                    21600.0,
-                    43200.0,
-                    86400.0,
-                    172800.0,
-                    604800.0,
+                    10.0, 20.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1200.0, 1800.0,
+                    3600.0, 7200.0, 14400.0, 21600.0, 43200.0, 86400.0, 172800.0,
+                    691200.0,
                 ] {
                     if raw <= s {
                         return s;
@@ -338,6 +336,7 @@ impl RangeSel {
 #[derive(Clone, Copy, PartialEq)]
 enum AxisMode {
     Time,
+    Hm,
     DayTime,
     Date,
 }
@@ -345,14 +344,18 @@ enum AxisMode {
 fn axis_mode_for(sel: &RangeSel, span: f64) -> AxisMode {
     match sel {
         RangeSel::Preset(r) => match r {
-            Range::M5 | Range::H3 => AxisMode::Time,
-            Range::H24 | Range::D7 | Range::D30 => AxisMode::DayTime,
-            Range::Unlimited => AxisMode::Date,
+            Range::M5 => AxisMode::Time,
+            Range::H3 | Range::H24 => AxisMode::Hm,
+            Range::D7 => AxisMode::DayTime,
+            Range::D30 | Range::Unlimited => AxisMode::Date,
         },
         RangeSel::Custom(_, _) => {
-            if span <= 6.0 * 3600.0 {
+            let step = sel.x_step(span);
+            if step < 60.0 {
                 AxisMode::Time
-            } else if span <= 3.0 * 86400.0 {
+            } else if step < 3600.0 {
+                AxisMode::Hm
+            } else if step < 86400.0 {
                 AxisMode::DayTime
             } else {
                 AxisMode::Date
@@ -675,29 +678,45 @@ fn civil(secs: i64) -> (i64, u32, u32, u32, u32, u32) {
     )
 }
 
-fn parse_local_dt(s: &str) -> Option<i64> {
+fn ymd_secs(y: i32, m: u32, d: u32, hh: u32, mi: u32, ss: u32) -> Option<i64> {
     use chrono::TimeZone;
-    let s = s.trim();
-    let (date, time) = match s.split_once(' ') {
-        Some((d, t)) => (d, t),
-        None => (s, "00:00"),
-    };
-    let mut dp = date.split('-');
-    let y: i32 = dp.next()?.trim().parse().ok()?;
-    let mo: u32 = dp.next()?.trim().parse().ok()?;
-    let d: u32 = dp.next()?.trim().parse().ok()?;
-    let mut tp = time.split(':');
-    let hh: u32 = tp.next().unwrap_or("0").trim().parse().ok()?;
-    let mi: u32 = tp.next().unwrap_or("0").trim().parse().ok()?;
-    let ss: u32 = tp.next().unwrap_or("0").trim().parse().ok()?;
-    let dt = chrono::Local.with_ymd_and_hms(y, mo, d, hh, mi, ss).single()?;
-    Some(dt.timestamp())
+    chrono::Local
+        .with_ymd_and_hms(y, m, d, hh, mi, ss)
+        .single()
+        .map(|dt| dt.timestamp())
+}
+
+/// unix seconds of local midnight on the given day
+fn local_midnight(secs: f64) -> f64 {
+    let (y, m, d, _, _, _) = civil(secs as i64);
+    ymd_secs(y as i32, m, d, 0, 0, 0).unwrap_or(secs as i64) as f64
+}
+
+/// x ticks anchored to the LOCAL wall clock so sub-day steps land on
+/// :00/:20/:40, hours on the hour and day steps on local midnight
+/// (epoch-multiple ticks were offset by the +03:30 timezone)
+fn time_ticks(x0: f64, x1: f64, step: f64) -> Vec<f64> {
+    if !(step > 0.0) || !(x1 > x0) {
+        return Vec::new();
+    }
+    let anchor = local_midnight(x0);
+    let first = anchor + ((x0 - anchor) / step).ceil() * step;
+    let mut out = Vec::new();
+    let mut ts = first;
+    let mut guard = 0;
+    while ts <= x1 && guard < 100_000 {
+        out.push(ts);
+        ts += step;
+        guard += 1;
+    }
+    out
 }
 
 fn fmt_time_axis(secs: f64, mode: AxisMode) -> String {
     let (y, m, d, hh, mm, ss) = civil(secs as i64);
     match mode {
         AxisMode::Time => format!("{:02}:{:02}:{:02}", hh, mm, ss),
+        AxisMode::Hm => format!("{:02}:{:02}", hh, mm),
         AxisMode::DayTime => format!("{:02}-{:02} {:02}:{:02}", m, d, hh, mm),
         AxisMode::Date => format!("{:04}-{:02}-{:02}", y, m, d),
     }
@@ -706,6 +725,166 @@ fn fmt_time_axis(secs: f64, mode: AxisMode) -> String {
 fn fmt_time_tooltip(secs: f64) -> String {
     let (y, m, d, hh, mm, ss) = civil(secs as i64);
     format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", y, m, d, hh, mm, ss)
+}
+
+const MONTH_NAMES: [&str; 12] = [
+    "JANUARY",
+    "FEBRUARY",
+    "MARCH",
+    "APRIL",
+    "MAY",
+    "JUNE",
+    "JULY",
+    "AUGUST",
+    "SEPTEMBER",
+    "OCTOBER",
+    "NOVEMBER",
+    "DECEMBER",
+];
+
+fn days_in_month(y: i32, m: u32) -> u32 {
+    use chrono::Datelike;
+    let (ny, nm) = if m == 12 { (y + 1, 1) } else { (y, m + 1) };
+    let first_next = chrono::NaiveDate::from_ymd_opt(ny, nm, 1).unwrap_or_default();
+    let first_this = chrono::NaiveDate::from_ymd_opt(y, m, 1).unwrap_or_default();
+    (first_next - first_this).num_days() as u32
+}
+
+/// GlassWire-style month calendar: click a day to view it, click a second
+/// day to view the range between the two
+fn calendar_body(ui: &mut egui::Ui, app: &mut PacketlyApp) {
+    use chrono::Datelike;
+    let t = app.theme();
+    let now = chrono::Local::now();
+    let today = (now.year(), now.month(), now.day());
+
+    ui.horizontal(|ui| {
+        if ui
+            .add(
+                egui::Button::new(egui::RichText::new("‹").size(14.0))
+                    .fill(egui::Color32::TRANSPARENT),
+            )
+            .on_hover_text("Previous month")
+            .clicked()
+        {
+            let (y, m) = app.cal_view;
+            app.cal_view = if m == 1 { (y - 1, 12) } else { (y, m - 1) };
+        }
+        if ui
+            .add(
+                egui::Button::new(egui::RichText::new("›").size(14.0))
+                    .fill(egui::Color32::TRANSPARENT),
+            )
+            .on_hover_text("Next month")
+            .clicked()
+        {
+            let (y, m) = app.cal_view;
+            app.cal_view = if m == 12 { (y + 1, 1) } else { (y, m + 1) };
+        }
+        ui.add_space(6.0);
+        ui.strong(
+            egui::RichText::new(format!(
+                "{} {}",
+                MONTH_NAMES[(app.cal_view.1 - 1) as usize],
+                app.cal_view.0
+            ))
+            .size(12.5),
+        );
+    });
+    ui.add_space(2.0);
+
+    // range to highlight: mid-selection shows the anchor, otherwise the
+    // currently applied custom range
+    let range = match (app.cal_anchor, &app.sel) {
+        (Some(a), _) => Some((a, a)),
+        (None, RangeSel::Custom(f, t2)) => Some((*f, *t2)),
+        _ => None,
+    };
+
+    let (vy, vm) = app.cal_view;
+    let first_wd = chrono::NaiveDate::from_ymd_opt(vy, vm, 1)
+        .map(|d| d.weekday().num_days_from_sunday())
+        .unwrap_or(0);
+    let dim = days_in_month(vy, vm);
+
+    egui::Grid::new("cal-grid")
+        .spacing([2.0, 2.0])
+        .min_col_width(34.0)
+        .show(ui, |ui| {
+            for wd in ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"] {
+                ui.add_sized(
+                    [34.0, 16.0],
+                    egui::Label::new(egui::RichText::new(wd).size(10.5).color(t.dim)),
+                );
+            }
+            ui.end_row();
+            for _ in 0..first_wd {
+                ui.add_sized([34.0, 22.0], egui::Label::new(egui::RichText::new("")));
+            }
+            let mut cell = first_wd;
+            for d in 1..=dim {
+                let day0 = ymd_secs(vy, vm, d, 0, 0, 0).unwrap_or(0);
+                let day1 = day0 + 86399;
+                let (endpoint, in_range) = match range {
+                    Some((f, t2)) => {
+                        let e0 = t2 - 86399;
+                        (day0 == f || day0 == e0, day0 > f && day0 < e0)
+                    }
+                    None => (false, false),
+                };
+                let is_today = (vy, vm, d) == today;
+                let fill = if endpoint {
+                    Some(t.accent)
+                } else if in_range {
+                    Some(t.card2)
+                } else {
+                    None
+                };
+                let txt = if endpoint {
+                    egui::Color32::from_rgb(15, 21, 36)
+                } else if is_today {
+                    t.in_c
+                } else {
+                    t.text
+                };
+                let mut btn =
+                    egui::Button::new(egui::RichText::new(d.to_string()).size(11.5).color(txt));
+                if let Some(f) = fill {
+                    btn = btn.fill(f);
+                }
+                if ui.add_sized([34.0, 22.0], btn).clicked() {
+                    match app.cal_anchor {
+                        None => {
+                            app.cal_anchor = Some(day0);
+                            app.sel = RangeSel::Custom(day0, day1);
+                        }
+                        Some(a) if day0 > a => {
+                            app.sel = RangeSel::Custom(a, day1);
+                            app.cal_anchor = None;
+                        }
+                        Some(_) => {
+                            app.cal_anchor = Some(day0);
+                            app.sel = RangeSel::Custom(day0, day1);
+                        }
+                    }
+                    let _ = app.tx.send(UiMsg::Refresh(
+                        app.tab,
+                        app.sel.clone(),
+                        app.period,
+                    ));
+                }
+                cell += 1;
+                if cell % 7 == 0 {
+                    ui.end_row();
+                }
+            }
+        });
+    ui.add_space(2.0);
+    ui.weak(
+        egui::RichText::new("Pick a day, then a second day for a range")
+            .size(10.0)
+            .color(t.dim),
+    );
 }
 
 fn rel_time(ts: f64) -> String {
@@ -1535,8 +1714,8 @@ fn group_series(g: &GroupData) -> Vec<Series> {
 struct PacketlyApp {
     tab: Tab,
     sel: RangeSel,
-    custom_edit_from: String,
-    custom_edit_to: String,
+    cal_view: (i32, u32),
+    cal_anchor: Option<i64>,
     show_custom: bool,
     period: UsagePeriod,
     zoom: f32,
@@ -1737,16 +1916,45 @@ impl PacketlyApp {
                 ui.horizontal(|ui| {
                     ui.weak("Filter");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.selectable_label(custom_active, "Custom…").clicked() {
+                        let custom_resp = ui.selectable_label(custom_active, "Custom…");
+                        if custom_resp.clicked() {
                             if on_usage {
                                 self.period = UsagePeriod::Custom;
                             }
                             self.show_custom = !self.show_custom;
+                            if self.show_custom {
+                                self.cal_anchor = None;
+                                let base = match &self.sel {
+                                    RangeSel::Custom(_, t) => *t,
+                                    _ => chrono::Local::now().timestamp(),
+                                };
+                                use chrono::{Datelike, TimeZone};
+                                let dt = chrono::Local
+                                    .timestamp_opt(base, 0)
+                                    .single()
+                                    .unwrap_or_default();
+                                self.cal_view = (dt.year(), dt.month());
+                            }
                             let _ = self.tx.send(UiMsg::Refresh(
                                 self.tab,
                                 self.sel.clone(),
                                 self.period,
                             ));
+                        }
+                        if self.show_custom {
+                            let rect = custom_resp.rect;
+                            egui::Area::new(egui::Id::new("custom-calendar"))
+                                .order(egui::Order::Foreground)
+                                .fixed_pos(egui::Pos2::new(
+                                    (rect.right() - 276.0).max(8.0),
+                                    rect.bottom() + 6.0,
+                                ))
+                                .show(ctx, |ui| {
+                                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                                        ui.set_min_width(264.0);
+                                        calendar_body(ui, self);
+                                    });
+                                });
                         }
                         ui.add_space(6.0);
                         if on_usage {
@@ -1785,39 +1993,7 @@ impl PacketlyApp {
                         }
                     });
                 });
-                if self.show_custom {
-                    ui.add_space(4.0);
-                    ui.horizontal(|ui| {
-                        ui.weak("From");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.custom_edit_from)
-                                .desired_width(150.0)
-                                .hint_text("YYYY-MM-DD HH:MM"),
-                        );
-                        ui.weak("To");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.custom_edit_to)
-                                .desired_width(150.0)
-                                .hint_text("YYYY-MM-DD HH:MM"),
-                        );
-                        if ui.button("Apply").clicked() {
-                            match (
-                                parse_local_dt(&self.custom_edit_from),
-                                parse_local_dt(&self.custom_edit_to),
-                            ) {
-                                (Some(f), Some(t)) if t > f => {
-                                    self.sel = RangeSel::Custom(f, t);
-                                    let _ = self.tx.send(UiMsg::Refresh(
-                                        self.tab,
-                                        self.sel.clone(),
-                                        self.period,
-                                    ));
-                                }
-                                _ => {}
-                            }
-                        }
-                    });
-                }
+
             });
     }
 
@@ -2158,11 +2334,10 @@ impl PacketlyApp {
 
                                 let plot = Plot::new("traffic")
                                     .x_grid_spacer(move |input| {
-                                        let a = (input.bounds.0 / x_step).ceil() as i64;
-                                        let b = (input.bounds.1 / x_step).ceil() as i64;
-                                        (a..=b)
-                                            .map(|i| egui_plot::GridMark {
-                                                value: i as f64 * x_step,
+                                        time_ticks(input.bounds.0, input.bounds.1, x_step)
+                                            .into_iter()
+                                            .map(|ts| egui_plot::GridMark {
+                                                value: ts,
                                                 step_size: x_step,
                                             })
                                             .collect()
@@ -2225,19 +2400,15 @@ impl PacketlyApp {
                                 {
                                     let rect = presp.transform.frame();
                                     let painter = ui.painter();
-                                    let mut ts = (p.x0 / x_step).ceil() * x_step;
-                                    while ts <= p.x1 {
-                                        if ts >= p.x0 {
-                                            let px = presp.transform.position_from_point_x(ts);
-                                            painter.text(
-                                                egui::Pos2::new(px, rect.bottom() - 8.0),
-                                                egui::Align2::CENTER_BOTTOM,
-                                                fmt_time_axis(ts, axis_mode),
-                                                egui::FontId::proportional(11.0),
-                                                t.axis,
-                                            );
-                                        }
-                                        ts += x_step;
+                                    for ts in time_ticks(p.x0, p.x1, x_step) {
+                                        let px = presp.transform.position_from_point_x(ts);
+                                        painter.text(
+                                            egui::Pos2::new(px, rect.bottom() - 8.0),
+                                            egui::Align2::CENTER_BOTTOM,
+                                            fmt_time_axis(ts, axis_mode),
+                                            egui::FontId::proportional(11.0),
+                                            t.axis,
+                                        );
                                     }
                                     let mut yv = y_step;
                                     while yv <= y_top {
@@ -3624,8 +3795,8 @@ fn main() -> eframe::Result {
             Ok(Box::new(PacketlyApp {
                 tab: Tab::Graph,
                 sel: RangeSel::Preset(Range::M5),
-                custom_edit_from: String::new(),
-                custom_edit_to: String::new(),
+                cal_view: (2026, 1),
+                cal_anchor: None,
                 show_custom: false,
                 period: UsagePeriod::Today,
                 zoom: zoom0,

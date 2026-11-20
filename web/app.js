@@ -107,12 +107,21 @@
   }
 
   function timeStep(span) {
-    const steps = [15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400, 172800, 604800, 2592000];
-    for (const s of steps) if (span / s <= 9) return s;
-    return 31536000;
+    // GlassWire-matching label intervals for the preset spans
+    const exact = { 300: 20, 10800: 600, 86400: 3600, 604800: 43200, 2592000: 172800 };
+    if (exact[span]) return exact[span];
+    const steps = [10, 20, 30, 60, 120, 300, 600, 1200, 1800, 3600, 7200, 14400, 21600, 43200, 86400, 172800, 691200, 1382400, 2764800];
+    for (const s of steps) if (span / s <= 15) return s;
+    return Math.ceil(span / 15 / 86400) * 86400;
   }
   function fmtTime(ts, step) {
     const d = new Date(ts * 1000);
+    if (step < 60) {
+      const hh = String(d.getHours()).padStart(2, '0');
+      const mm = String(d.getMinutes()).padStart(2, '0');
+      const ss = String(d.getSeconds()).padStart(2, '0');
+      return `${hh}:${mm}:${ss}`;
+    }
     if (step < 86400) {
       const hh = String(d.getHours()).padStart(2, '0');
       const mm = String(d.getMinutes()).padStart(2, '0');
@@ -173,7 +182,8 @@
     }
     ctx.restore();
 
-    // labels on top (suppressed for the bare mini strip, like the desktop)
+    // x labels on top, anchored to LOCAL midnight like the desktop
+    // (epoch multiples were offset by the timezone)
     if (opts.labels !== false) {
       ctx.font = '11px "Segoe UI", system-ui, sans-serif';
       ctx.textBaseline = 'alphabetic';
@@ -181,10 +191,15 @@
       ctx.fillStyle = AXIS;
       for (const [yv, py] of yLabelPos) ctx.fillText(fmtB(yv), left + 6, py - 4);
       const step = timeStep(x1 - x0);
+      const d0 = new Date(x0 * 1000);
+      d0.setHours(0, 0, 0, 0);
+      const anchor = d0.getTime() / 1000;
+      let ts = anchor + Math.ceil((x0 - anchor) / step) * step;
       ctx.textAlign = 'center';
-      for (let ts = Math.ceil(x0 / step) * step; ts <= x1; ts += step) {
+      while (ts <= x1) {
         const px = left + ((ts - x0) / (x1 - x0)) * pw;
         ctx.fillText(fmtTime(ts, step), px, h - 7);
+        ts += step;
       }
     }
   }
