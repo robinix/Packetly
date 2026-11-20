@@ -173,7 +173,7 @@ impl Range {
     }
     fn refresh(self) -> Duration {
         match self {
-            Range::M5 => Duration::from_millis(2000),
+            Range::M5 => Duration::from_millis(1000),
             Range::H3 => Duration::from_millis(5000),
             _ => Duration::from_millis(60000),
         }
@@ -561,7 +561,7 @@ struct Snapshot {
 struct Rendered {
     ver: u64,
     r: usize,
-    cap_bits: u64,
+    target_k: f64,
     series: Arc<Vec<Vec<[f64; 2]>>>,
 }
 
@@ -569,7 +569,7 @@ struct ChartCache {
     version: u64,
     pivot: Option<Arc<Pivot>>,
     rendered: Option<Rendered>,
-    mini: Option<(u64, Arc<Vec<[f64; 2]>>)>,
+    mini: Option<(u64, Arc<Vec<Vec<[f64; 2]>>>)>,
 }
 
 #[derive(Clone, Default)]
@@ -967,13 +967,29 @@ fn smooth(pts: &[[f64; 2]], max_out: usize) -> Vec<[f64; 2]> {
     if pts.len() < 3 {
         return pts.to_vec();
     }
-    let bins = ((max_out as f64) / (pts.len() as f64)).ceil().clamp(1.0, 12.0) as usize;
-    let mut out = Vec::with_capacity(pts.len() * bins + 1);
-    for i in 0..pts.len() - 1 {
-        let p0 = pts[i.saturating_sub(1)];
-        let p1 = pts[i];
-        let p2 = pts[i + 1];
-        let p3 = pts[(i + 2).min(pts.len() - 1)];
+    // Bound control points on high-count spans (24h/7d) — already Gaussian-smoothed
+    // well above Nyquist — so Catmull-Rom stays crisp and fast on every range.
+    let sampled_buf: Vec<[f64; 2]>;
+    let ctrl: &[[f64; 2]] = if pts.len() > 600 {
+        let target_ctrl = 480usize;
+        let last = pts.len() - 1;
+        sampled_buf = (0..target_ctrl)
+            .map(|i| {
+                let idx = (i * last + (target_ctrl - 1) / 2) / (target_ctrl - 1);
+                pts[idx]
+            })
+            .collect();
+        &sampled_buf
+    } else {
+        pts
+    };
+    let bins = ((max_out as f64) / (ctrl.len() as f64)).ceil().clamp(1.0, 12.0) as usize;
+    let mut out = Vec::with_capacity(ctrl.len() * bins + 1);
+    for i in 0..ctrl.len() - 1 {
+        let p0 = ctrl[i.saturating_sub(1)];
+        let p1 = ctrl[i];
+        let p2 = ctrl[i + 1];
+        let p3 = ctrl[(i + 2).min(ctrl.len() - 1)];
         for s in 0..bins {
             let t = s as f64 / bins as f64;
             let t2 = t * t;
@@ -992,8 +1008,68 @@ fn smooth(pts: &[[f64; 2]], max_out: usize) -> Vec<[f64; 2]> {
             out.push([x, y]);
         }
     }
-    out.push(*pts.last().unwrap());
+    out.push(*ctrl.last().unwrap());
     out
+}
+
+/// Clip a sorted curve to [vx0, vx1] with exact linear interpolation at the
+/// viewport edges, applying peak-normalization scale `k` and manual `cap`.
+fn clip_and_scale(pts: &[[f64; 2]], vx0: f64, vx1: f64, k: f64, cap: f64) -> Vec<[f64; 2]> {
+    if pts.is_empty() || vx1 <= vx0 {
+        return Vec::new();
+    }
+    let n = pts.len();
+    let mut out = Vec::with_capacity(n.min(1600));
+    let start = pts.partition_point(|p| p[0] < vx0);
+    if start > 0 && start < n {
+        let a = pts[start - 1];
+        let b = pts[start];
+        let dx = b[0] - a[0];
+        let t = if dx > 0.0 {
+            ((vx0 - a[0]) / dx).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let y = a[1] + (b[1] - a[1]) * t;
+        out.push([vx0, (y * k).min(cap).max(0.0)]);
+    } else if start == 0 && pts[0][0] > vx0 {
+        out.push([vx0, (pts[0][1] * k).min(cap).max(0.0)]);
+    }
+    let mut end = start;
+    while end < n && pts[end][0] <= vx1 {
+        out.push([pts[end][0], (pts[end][1] * k).min(cap).max(0.0)]);
+        end += 1;
+    }
+    if end > 0 && end < n {
+        let a = pts[end - 1];
+        let b = pts[end];
+        let dx = b[0] - a[0];
+        let t = if dx > 0.0 {
+            ((vx1 - a[0]) / dx).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let y = a[1] + (b[1] - a[1]) * t;
+        out.push([vx1, (y * k).min(cap).max(0.0)]);
+    } else if end == n && pts[n - 1][0] < vx1 {
+        out.push([vx1, (pts[n - 1][1] * k).min(cap).max(0.0)]);
+    }
+    out
+}
+
+fn traffic_ver(tr: &TrafficData) -> u64 {
+    let last_sum = tr
+        .rows
+        .last()
+        .map(|r| (r.2 + r.3).to_bits())
+        .unwrap_or(0);
+    (tr.rows.len() as u64)
+        .wrapping_mul(31)
+        .wrapping_add(tr.to as u64)
+        .wrapping_mul(31)
+        .wrapping_add(tr.from as u64)
+        .wrapping_mul(31)
+        .wrapping_add(last_sum)
 }
 
 fn fetch_json(url: &str) -> Result<serde_json::Value, String> {
@@ -1035,17 +1111,23 @@ fn parse_group(d: &serde_json::Value) -> GroupData {
 }
 
 fn fetch_traffic(q: &str) -> Result<TrafficData, String> {
-    let t = fetch_json(&format!("{}/api/traffic?{}&breakdown=apps", API, q))?;
-    let mut names = HashMap::new();
-    if let Some(m) = t["data"]["appNames"].as_object() {
-        for (k, v) in m {
-            if let Ok(id) = k.parse::<i64>() {
-                names.insert(id, v.as_str().unwrap_or("app").to_string());
+    // Request aggregate per-bucket totals (10x-30x smaller & faster than breakdown=apps)
+    let t = fetch_json(&format!("{}/api/traffic?{}", API, q))?;
+    let mut rows = Vec::new();
+    if let Some(arr) = t["data"]["totals"].as_array() {
+        rows.reserve(arr.len());
+        for r in arr {
+            if r.as_array().map_or(false, |a| a.len() >= 3) {
+                rows.push((
+                    r[0].as_f64().unwrap_or(0.0),
+                    0_i64,
+                    r[1].as_f64().unwrap_or(0.0),
+                    r[2].as_f64().unwrap_or(0.0),
+                ));
             }
         }
-    }
-    let mut rows = Vec::new();
-    if let Some(arr) = t["data"]["rows"].as_array() {
+    } else if let Some(arr) = t["data"]["rows"].as_array() {
+        rows.reserve(arr.len());
         for r in arr {
             if r.as_array().map_or(false, |a| a.len() == 4) {
                 rows.push((
@@ -1062,7 +1144,7 @@ fn fetch_traffic(q: &str) -> Result<TrafficData, String> {
         to: t["to"].as_f64().unwrap_or(0.0),
         tier: t["tier"].as_str().unwrap_or("").to_string(),
         rows,
-        names,
+        names: HashMap::new(),
     })
 }
 
@@ -1152,9 +1234,16 @@ fn set_geoip_state(enable: bool) -> Option<bool> {
     fetch_geoip_state()
 }
 
-fn fetch_snapshot(tab: &Tab, sel: &RangeSel, period: UsagePeriod) -> Snapshot {
+fn fetch_snapshot(
+    tab: &Tab,
+    sel: &RangeSel,
+    period: UsagePeriod,
+    prev: Option<&Snapshot>,
+    tick: u64,
+) -> Snapshot {
     let mut snap = Snapshot::default();
     let q = sel.query();
+    let full_meta = !matches!(tab, Tab::Graph) || tick == 0 || tick % 5 == 0 || prev.is_none();
 
     match fetch_traffic(&q) {
         Ok(t) => snap.traffic = Some(t),
@@ -1164,36 +1253,44 @@ fn fetch_snapshot(tab: &Tab, sel: &RangeSel, period: UsagePeriod) -> Snapshot {
         }
     }
 
-    if let Ok(d) = fetch_json(&format!("{}/api/apps?{}&limit=10", API, q)) {
-        if let Some(arr) = d["apps"].as_array() {
-            snap.apps = arr
-                .iter()
-                .map(|a| AppRow {
-                    id: a["id"].as_i64().unwrap_or(0),
-                    name: a["name"].as_str().unwrap_or("?").to_string(),
-                    icon: None,
-                    in_bytes: a["inBytes"].as_f64().unwrap_or(0.0),
-                    out_bytes: a["outBytes"].as_f64().unwrap_or(0.0),
-                })
-                .collect();
+    // Apps & hosts lists are only displayed on the Traffic tab — skip them on
+    // Traffic Monitor so live 1-second polling stays sub-5ms.
+    if matches!(tab, Tab::Traffic) {
+        if let Ok(d) = fetch_json(&format!("{}/api/apps?{}&limit=10", API, q)) {
+            if let Some(arr) = d["apps"].as_array() {
+                snap.apps = arr
+                    .iter()
+                    .map(|a| AppRow {
+                        id: a["id"].as_i64().unwrap_or(0),
+                        name: a["name"].as_str().unwrap_or("?").to_string(),
+                        icon: None,
+                        in_bytes: a["inBytes"].as_f64().unwrap_or(0.0),
+                        out_bytes: a["outBytes"].as_f64().unwrap_or(0.0),
+                    })
+                    .collect();
+            }
         }
-    }
-    if let Ok(d) = fetch_json(&format!("{}/api/hosts?{}&limit=12", API, q)) {
-        if let Some(arr) = d["hosts"].as_array() {
-            snap.hosts = arr
-                .iter()
-                .map(|h| HostRow {
-                    label: h["hostname"]
-                        .as_str()
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| h["ip"].as_str().unwrap_or("?").to_string()),
-                    region: h["region"].as_str().map(|s| s.to_string()),
-                    in_bytes: h["inBytes"].as_f64().unwrap_or(0.0),
-                    out_bytes: h["outBytes"].as_f64().unwrap_or(0.0),
-                })
-                .collect();
+        if let Ok(d) = fetch_json(&format!("{}/api/hosts?{}&limit=12", API, q)) {
+            if let Some(arr) = d["hosts"].as_array() {
+                snap.hosts = arr
+                    .iter()
+                    .map(|h| HostRow {
+                        label: h["hostname"]
+                            .as_str()
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| h["ip"].as_str().unwrap_or("?").to_string()),
+                        region: h["region"].as_str().map(|s| s.to_string()),
+                        in_bytes: h["inBytes"].as_f64().unwrap_or(0.0),
+                        out_bytes: h["outBytes"].as_f64().unwrap_or(0.0),
+                    })
+                    .collect();
+            }
         }
+    } else if let Some(p) = prev {
+        snap.apps = p.apps.clone();
+        snap.hosts = p.hosts.clone();
     }
+
     if let Ok(d) = fetch_json(&format!("{}/api/traffic?{}&group=lan", API, q)) {
         snap.lanwan = LanWan {
             lan_in: d["lanIn"].as_f64().unwrap_or(0.0),
@@ -1201,34 +1298,49 @@ fn fetch_snapshot(tab: &Tab, sel: &RangeSel, period: UsagePeriod) -> Snapshot {
             wan_in: d["wanIn"].as_f64().unwrap_or(0.0),
             wan_out: d["wanOut"].as_f64().unwrap_or(0.0),
         };
+    } else if let Some(p) = prev {
+        snap.lanwan = p.lanwan;
     }
-    if let Ok(d) = fetch_json(&format!("{}/api/status", API)) {
-        snap.collector = d["collector"]
-            .as_str()
-            .unwrap_or("")
-            .split(" (")
-            .next()
-            .unwrap_or("")
-            .to_string();
-        snap.status_ok = true;
-        snap.app_version = d["version"].as_str().unwrap_or("?").to_string();
+
+    if full_meta {
+        if let Ok(d) = fetch_json(&format!("{}/api/status", API)) {
+            snap.collector = d["collector"]
+                .as_str()
+                .unwrap_or("")
+                .split(" (")
+                .next()
+                .unwrap_or("")
+                .to_string();
+            snap.status_ok = true;
+            snap.app_version = d["version"].as_str().unwrap_or("?").to_string();
+        }
+    } else if let Some(p) = prev {
+        snap.collector = p.collector.clone();
+        snap.status_ok = p.status_ok;
+        snap.app_version = p.app_version.clone();
     }
 
     match tab {
         Tab::Graph => {
-            if let Ok(d) = fetch_json(&format!("{}/api/events?limit=50", API)) {
-                if let Some(arr) = d["events"].as_array() {
-                    snap.events = arr
-                        .iter()
-                        .map(|e| EventRow {
-                            id: e["id"].as_i64().unwrap_or(0),
-                            ts: e["ts"].as_f64().unwrap_or(0.0),
-                            kind: e["type"].as_i64().unwrap_or(0),
-                            app_name: e["appName"].as_str().map(|s| s.to_string()),
-                            data: e["data"].as_str().unwrap_or("").to_string(),
-                        })
-                        .collect();
+            if full_meta {
+                if let Ok(d) = fetch_json(&format!("{}/api/events?limit=50", API)) {
+                    snap.unseen = d["unseen"].as_i64().unwrap_or(0);
+                    if let Some(arr) = d["events"].as_array() {
+                        snap.events = arr
+                            .iter()
+                            .map(|e| EventRow {
+                                id: e["id"].as_i64().unwrap_or(0),
+                                ts: e["ts"].as_f64().unwrap_or(0.0),
+                                kind: e["type"].as_i64().unwrap_or(0),
+                                app_name: e["appName"].as_str().map(|s| s.to_string()),
+                                data: e["data"].as_str().unwrap_or("").to_string(),
+                            })
+                            .collect();
+                    }
                 }
+            } else if let Some(p) = prev {
+                snap.events = p.events.clone();
+                snap.unseen = p.unseen;
             }
         }
         Tab::Traffic => {
@@ -1739,6 +1851,14 @@ struct PacketlyApp {
     settings_open: bool,
     start_minimized: bool,
     flags: Arc<Mutex<UiFlags>>,
+    // Smooth 60fps viewport scroll & scale animation state
+    anim_x1: f64,
+    anim_y_top: f64,
+    anim_k: f64,
+    anim_last: Option<std::time::Instant>,
+    anim_sel_key: String,
+    snap_x1_seen: f64,
+    snap_x1_at: Option<std::time::Instant>,
 }
 
 #[derive(Clone)]
@@ -2090,57 +2210,73 @@ impl PacketlyApp {
                         }
 
                         if let Some(traffic) = &snap.traffic {
-                            // mini timeline is cached per data version; smoothing runs once
-                            let ver = (traffic.rows.len() as u64)
-                                .wrapping_mul(31)
-                                .wrapping_add(traffic.to as u64);
-                            let xs = {
+                            // mini timeline is cached per data version; sharper smoothing
+                            // + dual upload/download silhouettes match the main chart
+                            let ver = traffic_ver(traffic);
+                            let mini_series = {
                                 let mut cache = self.cache.lock().unwrap();
                                 let stale =
                                     cache.mini.as_ref().map_or(true, |(v, _)| *v != ver);
                                 if stale {
                                     let p = pivot(traffic, t.in_c, t.out_c);
-                                    let mut xs: Vec<[f64; 2]> = Vec::new();
-                                    for i in 0..p.n {
-                                        let ts = p.x0 + i as f64 * p.bucket;
-                                        let mut total = 0.0;
-                                        for s in &p.series {
-                                            total +=
-                                                s.points.get(i).map(|pt| pt[1]).unwrap_or(0.0);
-                                        }
-                                        xs.push([ts, total]);
-                                    }
-                                    let mr = ((p.n as f64) / 25.0)
+                                    let mr = ((p.n as f64) / 110.0)
                                         .round()
-                                        .clamp(2.0, 400.0) as usize;
-                                    let xs = smooth(
-                                        &moving_avg(
-                                            &moving_avg(&moving_avg(&xs, mr), mr * 2 / 3),
-                                            mr / 3,
-                                        ),
-                                        400,
-                                    );
-                                    cache.mini = Some((ver, Arc::new(xs)));
+                                        .clamp(1.0, 120.0) as usize;
+                                    let r2 = (mr * 2 / 3).max(1);
+                                    let r3 = (mr / 3).max(1);
+                                    let mut curves: Vec<Vec<[f64; 2]>> = p
+                                        .series
+                                        .iter()
+                                        .map(|s| {
+                                            smooth(
+                                                &moving_avg(
+                                                    &moving_avg(&moving_avg(&s.points, mr), r2),
+                                                    r3,
+                                                ),
+                                                420,
+                                            )
+                                        })
+                                        .collect();
+                                    let mut m_max = 0.0_f64;
+                                    for pts in &curves {
+                                        for pt in pts {
+                                            m_max = m_max.max(pt[1]);
+                                        }
+                                    }
+                                    if m_max > 0.0 && p.y_max > 0.0 {
+                                        let mk = p.y_max / m_max;
+                                        for pts in &mut curves {
+                                            for pt in pts.iter_mut() {
+                                                pt[1] *= mk;
+                                            }
+                                        }
+                                    }
+                                    cache.mini = Some((ver, Arc::new(curves)));
                                 }
                                 cache.mini.as_ref().unwrap().1.clone()
                             };
+                            let mini_colors = [t.out_c, t.in_c];
                             Plot::new("mini_timeline")
                                 .height(42.0)
                                 .width(ui.available_width())
                                 .show_axes([false, false])
                                 .show_grid(egui::Vec2b::FALSE)
+                                .set_margin_fraction(egui::Vec2::ZERO)
                                 .allow_drag(false)
                                 .allow_zoom(false)
                                 .allow_scroll(false)
                                 .allow_boxed_zoom(false)
                                 .show(ui, |plot_ui| {
-                                    if !xs.is_empty() {
-                                        plot_ui.line(
-                                            Line::new(PlotPoints::from(xs.as_ref().clone()))
-                                                .color(t.in_c)
-                                                .fill(0.35_f32)
-                                                .width(1.0_f32),
-                                        );
+                                    for (idx, pts) in mini_series.iter().enumerate() {
+                                        if !pts.is_empty() {
+                                            let c = mini_colors[idx % mini_colors.len()];
+                                            plot_ui.line(
+                                                Line::new(PlotPoints::from(pts.clone()))
+                                                    .color(c)
+                                                    .fill(0.0_f32)
+                                                    .width(1.1_f32),
+                                            );
+                                        }
                                     }
                                 });
                         }
@@ -2156,10 +2292,7 @@ impl PacketlyApp {
             .show(ctx, |ui| {
                 let snap = self.snap.lock().unwrap().clone();
 
-                let ver = snap
-                    .traffic
-                    .as_ref()
-                    .map(|tr| (tr.rows.len() as u64).wrapping_mul(31).wrapping_add(tr.to as u64));
+                let ver = snap.traffic.as_ref().map(traffic_ver);
                 {
                     let mut cache = self.cache.lock().unwrap();
                     if ver != Some(cache.version) {
@@ -2260,19 +2393,19 @@ impl PacketlyApp {
                                 } else {
                                     self.scale_cap
                                 };
-                                // radius scales with bucket count so bells stay
-                                // proportional across ranges
-                                let r = ((p.n as f64) / 20.0).round().clamp(2.0, 400.0) as usize;
-                                let rendered = {
+                                // Sharper proportional 3-pass smoothing (~1.3%-1.8% FWHM across
+                                // every range) preserves distinct bursts & valleys like GlassWire
+                                // instead of merging nearby hills into a single vague blob.
+                                let r = ((p.n as f64) / 130.0).round().clamp(1.0, 120.0) as usize;
+                                let (rendered, target_k) = {
                                     let mut cache = self.cache.lock().unwrap();
                                     let stale = cache.rendered.as_ref().map_or(true, |rd| {
-                                        rd.ver != ver.unwrap_or(0)
-                                            || rd.r != r
-                                            || rd.cap_bits != cap.to_bits()
+                                        rd.ver != ver.unwrap_or(0) || rd.r != r
                                     });
                                     if stale {
-                                        // three box passes approximate a gaussian -> soft rounded hills
-                                        let mut series_pts: Vec<Vec<[f64; 2]>> = p
+                                        let r2 = (r * 2 / 3).max(1);
+                                        let r3 = (r / 3).max(1);
+                                        let series_pts: Vec<Vec<[f64; 2]>> = p
                                             .series
                                             .iter()
                                             .map(|s| {
@@ -2280,57 +2413,159 @@ impl PacketlyApp {
                                                     &moving_avg(
                                                         &moving_avg(
                                                             &moving_avg(&s.points, r),
-                                                            r * 2 / 3,
+                                                            r2,
                                                         ),
-                                                        r / 3,
+                                                        r3,
                                                     ),
-                                                    2400,
+                                                    1400,
                                                 )
                                             })
                                             .collect();
-                                        // smoothing crushes single-bucket peaks, so
-                                        // rescale the curve until its peak equals the
-                                        // true bucket peak: the y-scale (raw-peak based)
-                                        // stays honest and hills still fill the plot.
-                                        // Pure multiplication keeps every hill's
-                                        // proportion identical.
                                         let mut rendered_max = 0.0_f64;
                                         for pts in &series_pts {
                                             for pt in pts {
                                                 rendered_max = rendered_max.max(pt[1]);
                                             }
                                         }
-                                        let k = if rendered_max > 0.0 && p.y_max > 0.0 {
+                                        let tk = if rendered_max > 0.0 && p.y_max > 0.0 {
                                             p.y_max / rendered_max
                                         } else {
                                             1.0
                                         };
-                                        for pts in &mut series_pts {
-                                            for pt in pts.iter_mut() {
-                                                pt[1] = (pt[1] * k).min(cap);
-                                            }
-                                        }
                                         cache.rendered = Some(Rendered {
                                             ver: ver.unwrap_or(0),
                                             r,
-                                            cap_bits: cap.to_bits(),
+                                            target_k: tk,
                                             series: Arc::new(series_pts),
                                         });
                                     }
-                                    cache.rendered.as_ref().unwrap().series.clone()
+                                    let rd = cache.rendered.as_ref().unwrap();
+                                    (rd.series.clone(), rd.target_k)
                                 };
 
-                                // scale from the RAW bucket peak (p.y_max): the
-                                // rendered curve is peak-normalized to it, so the
-                                // grid honestly reflects what the hills reach
-                                let y_top = if self.auto_scale {
+                                // Scale from the RAW bucket peak (p.y_max): the rendered curve
+                                // is peak-normalized to it so the y-axis stays honest.
+                                let target_y_top = if self.auto_scale {
                                     let target = (p.y_max * 1.25).max(1024.0);
                                     let st = nice_step(target / 8.0);
                                     (target / st).ceil() * st
                                 } else {
                                     self.scale_cap
                                 };
-                                let y_step = nice_step(y_top / 8.0);
+
+                                // ---- 60fps continuous viewport glide & smooth Y-scale easing ----
+                                let now_inst = std::time::Instant::now();
+                                let dt = self
+                                    .anim_last
+                                    .map(|prev| {
+                                        now_inst.duration_since(prev).as_secs_f64().clamp(0.0, 0.05)
+                                    })
+                                    .unwrap_or(0.0);
+                                self.anim_last = Some(now_inst);
+
+                                if (p.x1 - self.snap_x1_seen).abs() > 0.01 {
+                                    self.snap_x1_seen = p.x1;
+                                    self.snap_x1_at = Some(now_inst);
+                                }
+
+                                let sel_key = self.sel.query();
+                                let is_live_5m = matches!(self.sel, RangeSel::Preset(Range::M5));
+                                let is_custom = matches!(self.sel, RangeSel::Custom(_, _));
+                                let is_paused = snap.sel.is_some() || self.sel_drag.is_some();
+                                let span_full = (p.x1 - p.x0).max(p.bucket);
+                                // On 5m, TrafficWriter flushes closed seconds up to now-1, so
+                                // keeping the right edge ~2.25s behind p.x1 (capped <= p.x1-1.0)
+                                // ensures real closed smoothed data glides seamlessly in from
+                                // the right edge at constant 1.0x speed with zero drop-to-zero.
+                                let live_lag = if is_live_5m && span_full > 6.0 {
+                                    2.25
+                                } else {
+                                    0.0
+                                };
+                                let live_ceil = if is_live_5m && span_full > 6.0 {
+                                    p.x1 - 1.0
+                                } else {
+                                    p.x1
+                                };
+                                let vis_span = if is_live_5m && span_full > 6.0 {
+                                    (span_full - 3.0).max(1.0)
+                                } else {
+                                    span_full
+                                };
+                                let min_x1 = (p.x0 + p.bucket).min(live_ceil);
+                                let range_changed = sel_key != self.anim_sel_key
+                                    || self.anim_x1 < p.x0
+                                    || self.anim_x1 > p.x1 + p.bucket * 4.0;
+
+                                let mut need_repaint = false;
+                                if range_changed {
+                                    self.anim_sel_key = sel_key;
+                                    self.anim_x1 = (p.x1 - live_lag).clamp(min_x1, live_ceil);
+                                    self.anim_y_top = target_y_top;
+                                    self.anim_k = target_k;
+                                    self.snap_x1_seen = p.x1;
+                                    self.snap_x1_at = Some(now_inst);
+                                } else if !is_paused {
+                                    if is_live_5m && span_full > 6.0 {
+                                        let elapsed = self
+                                            .snap_x1_at
+                                            .map(|t0| {
+                                                now_inst.duration_since(t0).as_secs_f64().min(2.5)
+                                            })
+                                            .unwrap_or(0.0);
+                                        let clock_x1 = (p.x1 - live_lag + elapsed).min(live_ceil);
+                                        let err = clock_x1 - self.anim_x1;
+                                        let speed = (1.0 + err * 1.4).clamp(0.0, 2.2);
+                                        self.anim_x1 = (self.anim_x1 + speed * dt).min(live_ceil);
+                                        if self.anim_x1 < live_ceil - 0.01 {
+                                            need_repaint = true;
+                                        }
+                                    } else if !is_custom {
+                                        let diff_x = p.x1 - self.anim_x1;
+                                        if diff_x.abs() > 0.05 {
+                                            let ease = 1.0 - (-dt * 7.0).exp();
+                                            self.anim_x1 += diff_x * ease;
+                                            need_repaint = true;
+                                        } else {
+                                            self.anim_x1 = p.x1;
+                                        }
+                                    } else {
+                                        self.anim_x1 = p.x1;
+                                    }
+
+                                    let ease_y = 1.0 - (-dt * 8.0).exp();
+                                    if (target_y_top - self.anim_y_top).abs()
+                                        > target_y_top * 0.002
+                                    {
+                                        self.anim_y_top +=
+                                            (target_y_top - self.anim_y_top) * ease_y;
+                                        need_repaint = true;
+                                    } else {
+                                        self.anim_y_top = target_y_top;
+                                    }
+                                    if (target_k - self.anim_k).abs()
+                                        > target_k.max(1.0) * 0.002
+                                    {
+                                        self.anim_k += (target_k - self.anim_k) * ease_y;
+                                        need_repaint = true;
+                                    } else {
+                                        self.anim_k = target_k;
+                                    }
+                                }
+
+                                let view_x1 = self.anim_x1.clamp(min_x1, live_ceil);
+                                let view_x0 = (view_x1 - vis_span).max(p.x0);
+                                let y_top = self.anim_y_top.max(1024.0);
+                                let y_step = nice_step(target_y_top / 8.0);
+                                let cur_k = self.anim_k;
+                                if need_repaint {
+                                    ctx.request_repaint_after(Duration::from_millis(16));
+                                }
+
+                                let visible_series: Vec<Vec<[f64; 2]>> = rendered
+                                    .iter()
+                                    .map(|pts| clip_and_scale(pts, view_x0, view_x1, cur_k, cap))
+                                    .collect();
 
                                 let plot = Plot::new("traffic")
                                     .x_grid_spacer(move |input| {
@@ -2363,45 +2598,56 @@ impl PacketlyApp {
                                     .show_axes([false, true])
                                     .height((ui.available_height() * 0.88).max(300.0));
                                 let plot = plot
+                                    .include_x(view_x0)
+                                    .include_x(view_x1)
                                     .include_y(0.0)
                                     .include_y(y_top * 1.04);
                                 let dark_theme = t.text.r() > 128;
                                 let presp = plot.show(ui, |plot_ui| {
-                                    // dark muted fills first (occlude like the
-                                    // reference), then bright strokes on top
-                                    for (s, pts) in p.series.iter().zip(rendered.iter()) {
+                                    // luminous fills first (baseline y=0.0), crisp strokes on top
+                                    for (s, pts) in p.series.iter().zip(visible_series.iter()) {
                                         let fill_color = if dark_theme {
                                             egui::Color32::from_rgb(
-                                                (s.color.r() as f32 * 0.42) as u8,
-                                                (s.color.g() as f32 * 0.42) as u8,
-                                                (s.color.b() as f32 * 0.42) as u8,
+                                                (s.color.r() as f32 * 0.56) as u8,
+                                                (s.color.g() as f32 * 0.56) as u8,
+                                                (s.color.b() as f32 * 0.56) as u8,
                                             )
                                         } else {
-                                            Theme::alpha(s.color, 80)
+                                            Theme::alpha(s.color, 95)
                                         };
-                                        let fill_alpha = if dark_theme { 1.0 } else { 0.45 };
                                         plot_ui.line(
                                             Line::new(PlotPoints::from(pts.clone()))
                                                 .color(fill_color)
-                                                .fill(fill_alpha)
+                                                .fill(0.0_f32)
                                                 .width(0.0_f32),
                                         );
                                     }
-                                    for (s, pts) in p.series.iter().zip(rendered.iter()) {
+                                    for (s, pts) in p.series.iter().zip(visible_series.iter()) {
                                         plot_ui.line(
                                             Line::new(PlotPoints::from(pts.clone()))
                                                 .name(s.name.clone())
                                                 .color(s.color)
-                                                .width(1.8_f32),
+                                                .width(1.6_f32),
                                         );
                                     }
                                 });
 
                                 {
                                     let rect = presp.transform.frame();
-                                    let painter = ui.painter();
-                                    for ts in time_ticks(p.x0, p.x1, x_step) {
+                                    let painter = ui.painter().with_clip_rect(rect);
+                                    let vgrid = Theme::alpha(
+                                        t.grid,
+                                        ((t.grid.a() as f32) * 0.65).round().max(3.0) as u8,
+                                    );
+                                    for ts in time_ticks(view_x0, view_x1, x_step) {
                                         let px = presp.transform.position_from_point_x(ts);
+                                        painter.line_segment(
+                                            [
+                                                egui::Pos2::new(px, rect.top()),
+                                                egui::Pos2::new(px, rect.bottom() - 20.0),
+                                            ],
+                                            egui::Stroke::new(1.0, vgrid),
+                                        );
                                         painter.text(
                                             egui::Pos2::new(px, rect.bottom() - 8.0),
                                             egui::Align2::CENTER_BOTTOM,
@@ -2411,22 +2657,27 @@ impl PacketlyApp {
                                         );
                                     }
                                     let mut yv = y_step;
-                                    while yv <= y_top {
+                                    while yv <= y_top * 1.02 {
                                         let py = presp.transform.position_from_point_y(yv);
-                                        painter.line_segment(
-                                            [egui::Pos2::new(rect.left(), py), egui::Pos2::new(rect.right(), py)],
-                                            egui::Stroke::new(1.0, t.grid),
-                                        );
-                                        // labels hugging the top edge collide with the
-                                        // Auto-scale/cap button row above the plot
-                                        if py >= rect.top() + 10.0 {
-                                            painter.text(
-                                                egui::Pos2::new(rect.left() + 6.0, py - 4.0),
-                                                egui::Align2::LEFT_BOTTOM,
-                                                fmt_b(yv),
-                                                egui::FontId::proportional(11.0),
-                                                t.axis,
+                                        if py >= rect.top() && py <= rect.bottom() {
+                                            painter.line_segment(
+                                                [
+                                                    egui::Pos2::new(rect.left(), py),
+                                                    egui::Pos2::new(rect.right(), py),
+                                                ],
+                                                egui::Stroke::new(1.0, t.grid),
                                             );
+                                            // labels hugging the top edge collide with the
+                                            // Auto-scale/cap button row above the plot
+                                            if py >= rect.top() + 10.0 {
+                                                painter.text(
+                                                    egui::Pos2::new(rect.left() + 6.0, py - 4.0),
+                                                    egui::Align2::LEFT_BOTTOM,
+                                                    fmt_b(yv),
+                                                    egui::FontId::proportional(11.0),
+                                                    t.axis,
+                                                );
+                                            }
                                         }
                                         yv += y_step;
                                     }
@@ -2434,9 +2685,9 @@ impl PacketlyApp {
 
                                 {
                                     let rect = presp.transform.frame();
-                                    let painter = ui.painter();
+                                    let painter = ui.painter().with_clip_rect(rect);
                                     for e in &snap.events {
-                                        if e.kind < 2 || e.ts < p.x0 || e.ts > p.x1 {
+                                        if e.kind < 2 || e.ts < view_x0 || e.ts > view_x1 {
                                             continue;
                                         }
                                         let px = presp.transform.position_from_point_x(e.ts);
@@ -2475,7 +2726,7 @@ impl PacketlyApp {
                                                     .transform
                                                     .value_from_position(pos)
                                                     .x
-                                                    .clamp(p.x0, p.x1);
+                                                    .clamp(view_x0, view_x1);
                                                 self.sel_drag = Some((ts, ts));
                                             }
                                         }
@@ -2487,7 +2738,7 @@ impl PacketlyApp {
                                                 .transform
                                                 .value_from_position(pos)
                                                 .x
-                                                .clamp(p.x0, p.x1);
+                                                .clamp(view_x0, view_x1);
                                             self.sel_drag = Some((s0, ts));
                                         }
                                     }
@@ -2511,11 +2762,11 @@ impl PacketlyApp {
                                     .or_else(|| snap.sel.as_ref().map(|s| (s.t0, s.t1)));
                                 if let Some((lo, hi)) = band {
                                     let rect = presp.transform.frame();
-                                    let painter = ui.painter();
+                                    let painter = ui.painter().with_clip_rect(rect);
                                     let x0px =
-                                        presp.transform.position_from_point_x(lo.min(p.x1));
+                                        presp.transform.position_from_point_x(lo.min(view_x1));
                                     let x1px =
-                                        presp.transform.position_from_point_x(hi.max(p.x0));
+                                        presp.transform.position_from_point_x(hi.max(view_x0));
                                     let alpha = if t.text.r() > 128 { 38u8 } else { 70u8 };
                                     painter.rect_filled(
                                         egui::Rect::from_min_max(
@@ -3604,8 +3855,14 @@ fn main() -> eframe::Result {
             let mut sel_data: Option<SelData> = None;
             let mut app_detail_req: Option<(i64, i64, i64)> = None;
             let mut paused_dirty = false;
+            let mut tick: u64 = 0;
+            let mut last_fetch_dur = Duration::ZERO;
             loop {
-                let timeout = sel.refresh();
+                let timeout = if tick == 0 {
+                    Duration::from_millis(1)
+                } else {
+                    sel.refresh().saturating_sub(last_fetch_dur)
+                };
                 match rx.recv_timeout(timeout) {
                     Ok(msg) => match msg {
                         UiMsg::Refresh(t, s, p) => {
@@ -3614,6 +3871,7 @@ fn main() -> eframe::Result {
                             period = p;
                             sel_data = None;
                             app_detail_req = None;
+                            tick = 0;
                         }
                         UiMsg::AppDetail(s) => {
                             app_detail_req = s;
@@ -3703,7 +3961,21 @@ fn main() -> eframe::Result {
                     }
                     continue;
                 }
-                let mut fresh = Some(fetch_snapshot(&tab, &sel, period));
+                let fetch_t0 = std::time::Instant::now();
+                let prev_snap = snap.lock().unwrap().clone();
+                let mut fresh = Some(fetch_snapshot(
+                    &tab,
+                    &sel,
+                    period,
+                    if prev_snap.traffic.is_some() {
+                        Some(prev_snap.as_ref())
+                    } else {
+                        None
+                    },
+                    tick,
+                ));
+                last_fetch_dur = fetch_t0.elapsed();
+                tick = tick.wrapping_add(1);
                 if let Some((aid, f, t)) = app_detail_req {
                     let detail = fetch_json(&format!(
                         "{}/api/appinfo?app_id={}&from={}&to={}",
@@ -3825,6 +4097,13 @@ fn main() -> eframe::Result {
                 settings_open: false,
                 start_minimized,
                 flags: flags_for_app,
+                anim_x1: 0.0,
+                anim_y_top: 0.0,
+                anim_k: 1.0,
+                anim_last: None,
+                anim_sel_key: String::new(),
+                snap_x1_seen: 0.0,
+                snap_x1_at: None,
             }))
         }),
     )

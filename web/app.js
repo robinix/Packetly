@@ -1,6 +1,7 @@
 /* Packetly Web — pixel replica of the desktop Traffic Monitor screen.
- * Chart pipeline mirrors packetly-ui/src/main.rs exactly: 3-pass box
- * smoothing -> Catmull-Rom -> peak normalization -> honest raw-peak scale.
+ * Chart pipeline mirrors packetly-ui/src/main.rs exactly: sharper 3-pass box
+ * smoothing (n/130, clamp 1..120) -> stride-bounded Catmull-Rom -> joint peak
+ * normalization -> honest raw-peak scale + 60fps smooth viewport glide.
  * Demo mode in hosted previews; live mode when served by the collector. */
 (() => {
   'use strict';
@@ -8,6 +9,7 @@
   const DOWN = [224, 80, 200];
   const UP = [110, 147, 232];
   const GRID = 'rgba(255,255,255,0.035)';
+  const VGRID = 'rgba(255,255,255,0.022)';
   const AXIS = 'rgba(160,172,200,0.8)';
   const RANGE_LABEL = { '5m': '5 Minutes', '3h': '3 Hours', '24h': '24 Hours', '7d': '7 Days', '30d': '30 Days', unlimited: 'All Time' };
   const LADDER = [
@@ -17,7 +19,28 @@
     ['500 MB', 524288000], ['1 GB', 1073741824], ['2 GB', 2147483648], ['5 GB', 5368709120],
   ];
 
-  const state = { range: '3h', live: false, timer: null, demo: null, autoScale: true, scaleCap: 104857600 };
+  const state = {
+    range: '3h',
+    live: false,
+    pollTimer: null,
+    demoTickTimer: null,
+    rafId: null,
+    data: null,
+    cached: null, // { ver, upPts, downPts, targetK, rawMax, x0, x1, bucket, miniUp, miniDown, miniMax }
+    autoScale: true,
+    scaleCap: 104857600,
+    // 60fps smooth viewport glide & scale easing (mirrors packetly-ui/src/main.rs)
+    animX1: 0,
+    animYTop: 0,
+    animK: 1,
+    animLast: 0,
+    animRange: '',
+    snapX1Seen: 0,
+    snapX1At: 0,
+    demoRnd: null,
+    demoBurstDown: 0,
+    demoBurstUp: 0,
+  };
 
   const $ = (id) => document.getElementById(id);
 
@@ -37,11 +60,9 @@
     return s * e;
   }
   function css(c) { return `rgb(${c[0]},${c[1]},${c[2]})`; }
-  function dim(c) {
-    return `rgb(${Math.round(c[0] * 0.42)},${Math.round(c[1] * 0.42)},${Math.round(c[2] * 0.42)})`;
-  }
+  function fillRgba(c, a) { return `rgba(${c[0]},${c[1]},${c[2]},${a})`; }
 
-  // ---------- smoothing (ported from packetly-ui/src/main.rs) ----------
+  // ---------- smoothing (direct port of packetly-ui/src/main.rs) ----------
   function movingAvg(pts, radius) {
     if (!radius || pts.length === 0) return pts;
     const n = pts.length;
@@ -54,41 +75,80 @@
     }
     return out;
   }
-  function catmull(pts, target) {
+  function catmull(pts, maxOut) {
     if (pts.length < 3) return pts;
-    const n = pts.length, segs = n - 1;
-    const per = Math.max(2, Math.round(target / segs));
-    const out = [];
-    for (let i = 0; i < segs; i++) {
-      const p0 = pts[Math.max(0, i - 1)], p1 = pts[i], p2 = pts[i + 1], p3 = pts[Math.min(n - 1, i + 2)];
-      for (let j = 0; j < per; j++) {
-        const t = j / per, t2 = t * t, t3 = t2 * t;
-        out.push([
-          0.5 * (2 * p1[0] + (-p0[0] + p2[0]) * t + (2 * p0[0] - 5 * p1[0] + 4 * p2[0] - p3[0]) * t2 + (-p0[0] + 3 * p1[0] - 3 * p2[0] + p3[0]) * t3),
-          0.5 * (2 * p1[1] + (-p0[1] + p2[1]) * t + (2 * p0[1] - 5 * p1[1] + 4 * p2[1] - p3[1]) * t2 + (-p0[1] + 3 * p1[1] - 3 * p2[1] + p3[1]) * t3),
-        ]);
+    let ctrl = pts;
+    if (pts.length > 600) {
+      const targetCtrl = 480;
+      const last = pts.length - 1;
+      ctrl = new Array(targetCtrl);
+      for (let i = 0; i < targetCtrl; i++) {
+        const idx = Math.floor((i * last + Math.floor((targetCtrl - 1) / 2)) / (targetCtrl - 1));
+        ctrl[i] = pts[idx];
       }
     }
-    out.push([pts[n - 1][0], pts[n - 1][1]]);
+    const n = ctrl.length, segs = n - 1;
+    const per = Math.max(1, Math.min(12, Math.ceil(maxOut / n)));
+    const out = [];
+    for (let i = 0; i < segs; i++) {
+      const p0 = ctrl[Math.max(0, i - 1)], p1 = ctrl[i], p2 = ctrl[i + 1], p3 = ctrl[Math.min(n - 1, i + 2)];
+      for (let j = 0; j < per; j++) {
+        const t = j / per, t2 = t * t, t3 = t2 * t;
+        const x = 0.5 * (2 * p1[0] + (-p0[0] + p2[0]) * t + (2 * p0[0] - 5 * p1[0] + 4 * p2[0] - p3[0]) * t2 + (-p0[0] + 3 * p1[0] - 3 * p2[0] + p3[0]) * t3);
+        const y = Math.max(0, 0.5 * (2 * p1[1] + (-p0[1] + p2[1]) * t + (2 * p0[1] - 5 * p1[1] + 4 * p2[1] - p3[1]) * t2 + (-p0[1] + 3 * p1[1] - 3 * p2[1] + p3[1]) * t3));
+        out.push([x, y]);
+      }
+    }
+    out.push([ctrl[n - 1][0], ctrl[n - 1][1]]);
     return out;
   }
-  function pipeline(ts, values, target) {
+  function smoothSeries(ts, values, div, maxOut) {
     const n = values.length;
-    let rawMax = 0;
-    for (const v of values) if (v > rawMax) rawMax = v;
-    const r = Math.max(2, Math.min(400, Math.round(n / 20)));
-    let pts = values.map((v, i) => [ts[i], v]);
+    const r = Math.max(1, Math.min(120, Math.round(n / div)));
+    const r2 = Math.max(1, Math.floor((r * 2) / 3));
+    const r3 = Math.max(1, Math.floor(r / 3));
+    let pts = new Array(n);
+    for (let i = 0; i < n; i++) pts[i] = [ts[i], values[i]];
     pts = movingAvg(pts, r);
-    pts = movingAvg(pts, Math.max(1, Math.round((r * 2) / 3)));
-    pts = movingAvg(pts, Math.max(1, Math.round(r / 3)));
-    pts = catmull(pts, target);
-    let renderedMax = 0;
-    for (const p of pts) if (p[1] > renderedMax) renderedMax = p[1];
-    if (renderedMax > 0 && rawMax > 0) {
-      const k = rawMax / renderedMax;
-      pts = pts.map((p) => [p[0], p[1] * k]);
+    pts = movingAvg(pts, r2);
+    pts = movingAvg(pts, r3);
+    return catmull(pts, maxOut);
+  }
+  function clipAndScale(pts, vx0, vx1, k, cap) {
+    const n = pts.length;
+    if (n === 0 || vx1 <= vx0) return [];
+    // binary search first index with x >= vx0
+    let lo = 0, hi = n;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if (pts[mid][0] < vx0) lo = mid + 1; else hi = mid;
     }
-    return { pts, rawMax };
+    const start = lo;
+    const out = [];
+    if (start > 0 && start < n) {
+      const a = pts[start - 1], b = pts[start];
+      const dx = b[0] - a[0];
+      const t = dx > 0 ? Math.max(0, Math.min(1, (vx0 - a[0]) / dx)) : 0;
+      const y = a[1] + (b[1] - a[1]) * t;
+      out.push([vx0, Math.max(0, Math.min(cap, y * k))]);
+    } else if (start === 0 && pts[0][0] > vx0) {
+      out.push([vx0, Math.max(0, Math.min(cap, pts[0][1] * k))]);
+    }
+    let end = start;
+    while (end < n && pts[end][0] <= vx1) {
+      out.push([pts[end][0], Math.max(0, Math.min(cap, pts[end][1] * k))]);
+      end++;
+    }
+    if (end > 0 && end < n) {
+      const a = pts[end - 1], b = pts[end];
+      const dx = b[0] - a[0];
+      const t = dx > 0 ? Math.max(0, Math.min(1, (vx1 - a[0]) / dx)) : 0;
+      const y = a[1] + (b[1] - a[1]) * t;
+      out.push([vx1, Math.max(0, Math.min(cap, y * k))]);
+    } else if (end === n && pts[n - 1][0] < vx1) {
+      out.push([vx1, Math.max(0, Math.min(cap, pts[n - 1][1] * k))]);
+    }
+    return out;
   }
 
   // ---------- canvas ----------
@@ -108,8 +168,9 @@
 
   function timeStep(span) {
     // GlassWire-matching label intervals for the preset spans
-    const exact = { 300: 20, 10800: 600, 86400: 3600, 604800: 43200, 2592000: 172800 };
-    if (exact[span]) return exact[span];
+    const exact = { 300: 20, 297: 20, 10800: 600, 86400: 3600, 604800: 43200, 2592000: 172800 };
+    if (exact[Math.round(span)]) return exact[Math.round(span)];
+    if (span <= 320) return 20;
     const steps = [10, 20, 30, 60, 120, 300, 600, 1200, 1800, 3600, 7200, 14400, 21600, 43200, 86400, 172800, 691200, 1382400, 2764800];
     for (const s of steps) if (span / s <= 15) return s;
     return Math.ceil(span / 15 / 86400) * 86400;
@@ -134,15 +195,39 @@
     const p = prep(canvas);
     if (!p) return;
     const { ctx, w, h } = p;
-    const top = 14, bottom = 24, left = 2, right = 2;
+    const top = opts.labels === false ? 3 : 14;
+    const bottom = opts.labels === false ? 2 : 24;
+    const left = 2, right = 2;
     const pw = w - left - right, ph = h - top - bottom;
     const x0 = opts.x0, x1 = opts.x1, yTop = opts.yTop || 1;
+    const span = Math.max(1e-6, x1 - x0);
+    const base = top + ph;
 
-    // grid lines first (labels draw after the series, like the desktop overlay)
+    // subtle vertical time gridlines + horizontal gridlines
     const yLabelPos = [];
+    const xTicks = [];
+    if (opts.labels !== false) {
+      const step = timeStep(span);
+      const d0 = new Date(x0 * 1000);
+      d0.setHours(0, 0, 0, 0);
+      const anchor = d0.getTime() / 1000;
+      let ts = anchor + Math.ceil((x0 - anchor) / step) * step;
+      while (ts <= x1) {
+        const px = left + ((ts - x0) / span) * pw;
+        xTicks.push([ts, px, step]);
+        ctx.strokeStyle = VGRID;
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(px, top);
+        ctx.lineTo(px, base);
+        ctx.stroke();
+        ts += step;
+      }
+    }
     if (opts.gridStep) {
-      for (let yv = opts.gridStep; yv <= yTop + 1e-9; yv += opts.gridStep) {
-        const py = top + ph - (yv / yTop) * ph;
+      for (let yv = opts.gridStep; yv <= yTop * 1.02; yv += opts.gridStep) {
+        const py = base - (yv / yTop) * ph;
+        if (py < top - 4 || py > base) continue;
         ctx.strokeStyle = GRID;
         ctx.lineWidth = 1;
         ctx.beginPath();
@@ -157,49 +242,50 @@
     ctx.beginPath();
     ctx.rect(left, top - 6, pw, ph + 6);
     ctx.clip();
-    const base = top + ph;
+    const pxFn = (ts) => left + ((ts - x0) / span) * pw;
+    const pyFn = (v) => base - (Math.min(v, yTop) / yTop) * ph;
+
+    // translucent gradient fills first, crisp strokes on top (matches desktop layering)
     for (const s of series) {
       const pts = s.pts;
       if (!pts || pts.length < 2) continue;
-      const px = (ts) => left + ((ts - x0) / (x1 - x0)) * pw;
-      const py = (v) => base - (Math.min(v, yTop) / yTop) * ph;
       ctx.beginPath();
-      ctx.moveTo(px(pts[0][0]), base);
-      for (const [ts, v] of pts) ctx.lineTo(px(ts), py(v));
-      ctx.lineTo(px(pts[pts.length - 1][0]), base);
+      ctx.moveTo(pxFn(pts[0][0]), base);
+      for (const [ts, v] of pts) ctx.lineTo(pxFn(ts), pyFn(v));
+      ctx.lineTo(pxFn(pts[pts.length - 1][0]), base);
       ctx.closePath();
-      ctx.fillStyle = dim(s.color);
+      const grad = ctx.createLinearGradient(0, top, 0, base);
+      grad.addColorStop(0, fillRgba(s.color, opts.labels === false ? 0.32 : 0.34));
+      grad.addColorStop(1, fillRgba(s.color, opts.labels === false ? 0.08 : 0.07));
+      ctx.fillStyle = grad;
       ctx.fill();
+    }
+    for (const s of series) {
+      const pts = s.pts;
+      if (!pts || pts.length < 2) continue;
       ctx.beginPath();
       for (let i = 0; i < pts.length; i++) {
-        const x = px(pts[i][0]), y = py(pts[i][1]);
+        const x = pxFn(pts[i][0]), y = pyFn(pts[i][1]);
         if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
       }
       ctx.strokeStyle = css(s.color);
-      ctx.lineWidth = 1.8;
+      ctx.lineWidth = opts.labels === false ? 1.1 : 1.6;
       ctx.lineJoin = 'round';
       ctx.stroke();
     }
     ctx.restore();
 
-    // x labels on top, anchored to LOCAL midnight like the desktop
-    // (epoch multiples were offset by the timezone)
     if (opts.labels !== false) {
       ctx.font = '11px "Segoe UI", system-ui, sans-serif';
       ctx.textBaseline = 'alphabetic';
       ctx.textAlign = 'left';
       ctx.fillStyle = AXIS;
       for (const [yv, py] of yLabelPos) ctx.fillText(fmtB(yv), left + 6, py - 4);
-      const step = timeStep(x1 - x0);
-      const d0 = new Date(x0 * 1000);
-      d0.setHours(0, 0, 0, 0);
-      const anchor = d0.getTime() / 1000;
-      let ts = anchor + Math.ceil((x0 - anchor) / step) * step;
       ctx.textAlign = 'center';
-      while (ts <= x1) {
-        const px = left + ((ts - x0) / (x1 - x0)) * pw;
-        ctx.fillText(fmtTime(ts, step), px, h - 7);
-        ts += step;
+      for (const [ts, px, step] of xTicks) {
+        if (px > left + 18 && px < left + pw - 18) {
+          ctx.fillText(fmtTime(ts, step), px, h - 7);
+        }
       }
     }
   }
@@ -223,7 +309,7 @@
     ctx.arc(cx, cy, r, 0, Math.PI * 2);
     ctx.stroke();
     const tot = down + up || 1;
-    const sweep = Math.PI * 2 * 0.82; // gap at the bottom like the reference
+    const sweep = Math.PI * 2 * 0.82;
     const start = Math.PI * 0.5 + (Math.PI * 2 - sweep) / 2;
     const downShare = Math.max(0.06, Math.min(0.94, down / tot));
     ctx.strokeStyle = css(DOWN);
@@ -236,7 +322,7 @@
     ctx.stroke();
   }
 
-  // ---------- demo data ----------
+  // ---------- demo data (realistic multi-peak profiles) ----------
   function mulberry32(seed) {
     return function () {
       let t = (seed += 0x6d2b79f5);
@@ -270,17 +356,20 @@
   ];
 
   const DEMO_CFG = {
-    '5m': { n: 300, bucket: 1, ambient: 60e3, bursts: 2, bMin: 2e6, bMax: 9e6, upMax: 1.5e6, seed: 11 },
-    '3h': { n: 181, bucket: 60, ambient: 6e6, bursts: 4, bMin: 60e6, bMax: 750e6, upMax: 200e6, seed: 22 },
-    '24h': { n: 1440, bucket: 60, ambient: 3e6, bursts: 9, bMin: 200e6, bMax: 3e9, upMax: 700e6, seed: 33 },
-    '7d': { n: 10080, bucket: 60, ambient: 2e6, bursts: 22, bMin: 300e6, bMax: 5e9, upMax: 1.2e9, seed: 44 },
-    '30d': { n: 720, bucket: 3600, ambient: 150e6, bursts: 15, bMin: 2e9, bMax: 40e9, upMax: 9e9, seed: 55 },
-    unlimited: { n: 400, bucket: 86400, ambient: 400e6, bursts: 13, bMin: 5e9, bMax: 90e9, upMax: 25e9, seed: 66 },
+    '5m': { n: 300, bucket: 1, ambient: 45e3, bursts: 8, bMin: 1.4e6, bMax: 8.5e6, upMax: 3.5e6, seed: 11 },
+    '3h': { n: 181, bucket: 60, ambient: 3.5e6, bursts: 9, bMin: 40e6, bMax: 650e6, upMax: 240e6, seed: 22 },
+    '24h': { n: 1440, bucket: 60, ambient: 2e6, bursts: 14, bMin: 120e6, bMax: 1.4e9, upMax: 900e6, seed: 33 },
+    '7d': { n: 10080, bucket: 60, ambient: 1.5e6, bursts: 26, bMin: 250e6, bMax: 4.2e9, upMax: 1.5e9, seed: 44 },
+    '30d': { n: 720, bucket: 3600, ambient: 120e6, bursts: 18, bMin: 2e9, bMax: 40e9, upMax: 12e9, seed: 55 },
+    unlimited: { n: 400, bucket: 86400, ambient: 320e6, bursts: 16, bMin: 5e9, bMax: 90e9, upMax: 28e9, seed: 66 },
   };
 
   function genDemo(range) {
     const cfg = DEMO_CFG[range];
     const rnd = mulberry32(cfg.seed);
+    state.demoRnd = rnd;
+    state.demoBurstDown = 0;
+    state.demoBurstUp = 0;
     const n = cfg.n, bucket = cfg.bucket;
     const now = Math.floor(Date.now() / 1000 / bucket) * bucket;
     const ts = new Array(n);
@@ -288,41 +377,55 @@
 
     const down = new Float64Array(n), up = new Float64Array(n);
     for (let i = 0; i < n; i++) {
-      down[i] = cfg.ambient * (0.4 + rnd() * 1.2);
-      up[i] = cfg.ambient * (0.15 + rnd() * 0.5);
+      down[i] = cfg.ambient * (0.2 + rnd() * 0.9);
+      up[i] = cfg.ambient * (0.1 + rnd() * 0.45);
     }
-    const addBurst = (arr, maxV) => {
-      const c = Math.floor(rnd() * n);
-      const width = 1 + Math.floor(rnd() * 3);
-      const mag = cfg.bMin + rnd() * (maxV - cfg.bMin);
-      for (let i = c - width; i <= c + width; i++) {
+    const addPeak = (arr, c, width, mag) => {
+      for (let i = c - width * 2; i <= c + width * 2; i++) {
         if (i < 0 || i >= n) continue;
-        const d = Math.abs(i - c) / (width + 1);
-        arr[i] += mag * Math.exp(-d * d * 2.2);
+        const d = (i - c) / Math.max(1, width);
+        arr[i] += mag * Math.exp(-d * d * 1.8);
       }
     };
-    for (let b = 0; b < cfg.bursts; b++) addBurst(down, cfg.bMax);
-    for (let b = 0; b < Math.max(1, Math.round(cfg.bursts / 2)); b++) addBurst(up, cfg.upMax);
+    const baseW = Math.max(1, Math.round(n / 180));
+    for (let b = 0; b < cfg.bursts; b++) {
+      const c = Math.floor(rnd() * n);
+      const w = baseW + Math.floor(rnd() * baseW * 2);
+      const mag = cfg.bMin + rnd() * (cfg.bMax - cfg.bMin);
+      addPeak(down, c, w, mag);
+      // occasionally add a nearby companion peak to showcase sharp valley separation
+      if (rnd() > 0.55) {
+        addPeak(down, c + Math.round(w * 3.5), Math.max(1, Math.round(w * 0.85)), mag * (0.55 + rnd() * 0.45));
+      }
+    }
+    for (let b = 0; b < Math.max(2, Math.round(cfg.bursts * 0.65)); b++) {
+      const c = Math.floor(rnd() * n);
+      const w = baseW + Math.floor(rnd() * baseW * 1.5);
+      addPeak(up, c, w, cfg.bMin * 0.4 + rnd() * cfg.upMax);
+    }
 
-    const totalDown = down.reduce((a, b) => a + b, 0);
-    const totalUp = up.reduce((a, b) => a + b, 0);
+    return finalizeDemo(ts, down, up, bucket, rnd);
+  }
 
+  function finalizeDemo(ts, down, up, bucket, rnd) {
+    let totalDown = 0, totalUp = 0;
+    for (let i = 0; i < down.length; i++) { totalDown += down[i]; totalUp += up[i]; }
     let wsum = 0;
     for (const a of APP_POOL) wsum += a[1];
     const apps = APP_POOL.map(([name, w, color]) => {
-      const share = (w / wsum) * (0.75 + rnd() * 0.5);
+      const share = (w / wsum) * (0.8 + rnd() * 0.4);
       return {
         name, color,
         count: 2 + Math.floor(rnd() * 140),
-        inBytes: totalDown * share * (0.75 + rnd() * 0.4),
-        outBytes: totalUp * share * (0.6 + rnd() * 0.8),
+        inBytes: totalDown * share * (0.8 + rnd() * 0.35),
+        outBytes: totalUp * share * (0.7 + rnd() * 0.6),
       };
     }).sort((a, b) => b.inBytes + b.outBytes - (a.inBytes + a.outBytes));
 
     const hosts = HOST_POOL.slice(0, 6).map(([h, flag, region], i) => ({
       host: h, flag, region,
-      inBytes: totalDown * (0.22 - i * 0.03) * (0.8 + rnd() * 0.5),
-      outBytes: totalUp * (0.25 - i * 0.035) * (0.8 + rnd() * 0.5),
+      inBytes: totalDown * (0.22 - i * 0.03) * (0.85 + rnd() * 0.3),
+      outBytes: totalUp * (0.25 - i * 0.035) * (0.85 + rnd() * 0.3),
     }));
 
     const wan = (totalDown + totalUp) * 0.975;
@@ -330,55 +433,190 @@
     return { ts, down, up, bucket, totalDown, totalUp, wan, lan, apps, hosts };
   }
 
-  // ---------- rendering ----------
-  function render(d) {
-    const pd = pipeline(d.ts, Array.from(d.down), 2400);
-    const pu = pipeline(d.ts, Array.from(d.up), 2400);
-
-    let rawMax = 0;
-    for (const v of d.down) if (v > rawMax) rawMax = v;
-    for (const v of d.up) if (v > rawMax) rawMax = v;
-    const yTop = state.autoScale
-      ? (() => {
-          const target = Math.max(rawMax * 1.25, 1024);
-          const st = niceStep(target / 8);
-          return Math.ceil(target / st) * st;
-        })()
-      : state.scaleCap;
-
-    drawChart($('main-chart'), [
-      { color: DOWN, pts: pd.pts },
-      { color: UP, pts: pu.pts },
-    ], { x0: d.ts[0], x1: d.ts[d.ts.length - 1], yTop, gridStep: niceStep(yTop / 8) });
-
+  // Append 1 live second in demo 5m mode so the 60fps right-to-left glide is visible in AI Studio
+  function tickDemo5m() {
+    if (state.live || state.range !== '5m' || !state.data) return;
+    const d = state.data;
+    const cfg = DEMO_CFG['5m'];
+    const rnd = state.demoRnd || Math.random;
     const n = d.ts.length;
-    const total = new Array(n);
-    for (let i = 0; i < n; i++) total[i] = d.down[i] + d.up[i];
-    const mr = Math.max(2, Math.min(400, Math.round(n / 25)));
-    let mpts = total.map((v, i) => [d.ts[i], v]);
-    mpts = movingAvg(mpts, mr);
-    mpts = movingAvg(mpts, Math.max(1, Math.round((mr * 2) / 3)));
-    mpts = movingAvg(mpts, Math.max(1, Math.round(mr / 3)));
-    mpts = catmull(mpts, 400);
-    let mMax = 0;
-    for (const p of mpts) if (p[1] > mMax) mMax = p[1];
-    drawChart($('mini-chart'), [{ color: DOWN, pts: mpts }], {
-      x0: d.ts[0], x1: d.ts[d.ts.length - 1],
-      yTop: mMax * 1.12, labels: false,
-    });
+    const nextTs = d.ts[n - 1] + 1;
+
+    if (state.demoBurstDown <= 0 && rnd() < 0.09) {
+      state.demoBurstDown = 2 + Math.floor(rnd() * 6);
+      state.demoBurstDownMag = cfg.bMin * 0.7 + rnd() * (cfg.bMax - cfg.bMin) * 0.75;
+    }
+    if (state.demoBurstUp <= 0 && rnd() < 0.07) {
+      state.demoBurstUp = 2 + Math.floor(rnd() * 5);
+      state.demoBurstUpMag = cfg.bMin * 0.3 + rnd() * cfg.upMax * 0.7;
+    }
+    let nd = cfg.ambient * (0.25 + rnd() * 0.9);
+    let nu = cfg.ambient * (0.12 + rnd() * 0.45);
+    if (state.demoBurstDown > 0) {
+      nd += state.demoBurstDownMag * (0.55 + rnd() * 0.55);
+      state.demoBurstDown--;
+    }
+    if (state.demoBurstUp > 0) {
+      nu += state.demoBurstUpMag * (0.5 + rnd() * 0.6);
+      state.demoBurstUp--;
+    }
+
+    const dropDown = d.down[0], dropUp = d.up[0];
+    d.ts.shift(); d.ts.push(nextTs);
+    d.down.copyWithin(0, 1); d.down[n - 1] = nd;
+    d.up.copyWithin(0, 1); d.up[n - 1] = nu;
+    d.totalDown = Math.max(0, d.totalDown - dropDown + nd);
+    d.totalUp = Math.max(0, d.totalUp - dropUp + nu);
+    d.wan = (d.totalDown + d.totalUp) * 0.975;
+    d.lan = (d.totalDown + d.totalUp) * 0.025;
+
+    ingestData(d, false);
+  }
+
+  // ---------- cache + 60fps animation loop ----------
+  function ingestData(d, updateLists) {
+    state.data = d;
+    const n = d.ts.length;
+    let rawMax = 0;
+    for (let i = 0; i < n; i++) {
+      if (d.down[i] > rawMax) rawMax = d.down[i];
+      if (d.up[i] > rawMax) rawMax = d.up[i];
+    }
+
+    const upPts = smoothSeries(d.ts, d.up, 130, 1400);
+    const downPts = smoothSeries(d.ts, d.down, 130, 1400);
+    let renderedMax = 0;
+    for (const pt of upPts) if (pt[1] > renderedMax) renderedMax = pt[1];
+    for (const pt of downPts) if (pt[1] > renderedMax) renderedMax = pt[1];
+    const targetK = renderedMax > 0 && rawMax > 0 ? rawMax / renderedMax : 1;
+
+    const miniUp = smoothSeries(d.ts, d.up, 110, 420);
+    const miniDown = smoothSeries(d.ts, d.down, 110, 420);
+    let miniMax = 0;
+    for (const pt of miniUp) if (pt[1] > miniMax) miniMax = pt[1];
+    for (const pt of miniDown) if (pt[1] > miniMax) miniMax = pt[1];
+
+    const x0 = d.ts[0], x1 = d.ts[n - 1];
+    if (Math.abs(x1 - state.snapX1Seen) > 0.01) {
+      state.snapX1Seen = x1;
+      state.snapX1At = performance.now();
+    }
+
+    state.cached = {
+      upPts, downPts, targetK, rawMax, x0, x1, bucket: d.bucket,
+      miniUp, miniDown, miniMax: Math.max(miniMax, 1),
+    };
+
+    // Update summary stats & mini timeline
+    drawChart($('mini-chart'), [
+      { color: UP, pts: miniUp },
+      { color: DOWN, pts: miniDown },
+    ], { x0, x1, yTop: Math.max(miniMax, 1) * 1.12, labels: false });
 
     drawRing(d.totalDown, d.totalUp);
     $('stat-down').textContent = fmtB(d.totalDown);
     $('stat-up').textContent = fmtB(d.totalUp);
-    $('stat-down-rate').textContent = fmtB(d.down[n - 1] / d.bucket) + '/s';
-    $('stat-up-rate').textContent = fmtB(d.up[n - 1] / d.bucket) + '/s';
+    const spanSecs = Math.max(1, x1 - x0);
+    $('stat-down-rate').textContent = fmtB(d.totalDown / spanSecs) + '/s';
+    $('stat-up-rate').textContent = fmtB(d.totalUp / spanSecs) + '/s';
     $('stat-wan').textContent = fmtB(d.wan);
     $('stat-lan').textContent = fmtB(d.lan);
     const wl = d.wan + d.lan || 1;
     $('bar-wan').style.width = ((d.wan / wl) * 100).toFixed(1) + '%';
     $('bar-lan').style.width = Math.max(1.5, (d.lan / wl) * 100).toFixed(1) + '%';
 
-    renderLists(d);
+    if (updateLists !== false) renderLists(d);
+    scheduleFrame();
+  }
+
+  function scheduleFrame() {
+    if (!state.rafId) {
+      state.rafId = requestAnimationFrame(paintFrame);
+    }
+  }
+
+  function paintFrame(nowMs) {
+    state.rafId = null;
+    const c = state.cached;
+    if (!c) return;
+
+    const dt = state.animLast ? Math.max(0, Math.min(0.05, (nowMs - state.animLast) / 1000)) : 0;
+    state.animLast = nowMs;
+
+    const targetYTop = state.autoScale
+      ? (() => {
+          const target = Math.max(c.rawMax * 1.25, 1024);
+          const st = niceStep(target / 8);
+          return Math.ceil(target / st) * st;
+        })()
+      : state.scaleCap;
+
+    const isLive5m = state.range === '5m';
+    const spanFull = Math.max(c.bucket, c.x1 - c.x0);
+    const liveLag = isLive5m && spanFull > 6 ? 2.25 : 0;
+    const liveCeil = isLive5m && spanFull > 6 ? c.x1 - 1.0 : c.x1;
+    const visSpan = isLive5m && spanFull > 6 ? Math.max(1, spanFull - 3.0) : spanFull;
+
+    const rangeChanged =
+      state.animRange !== state.range ||
+      state.animX1 < c.x0 ||
+      state.animX1 > c.x1 + c.bucket * 4;
+
+    let needMore = false;
+    if (rangeChanged) {
+      state.animRange = state.range;
+      state.animX1 = Math.max(c.x0 + c.bucket, Math.min(liveCeil, c.x1 - liveLag));
+      state.animYTop = targetYTop;
+      state.animK = c.targetK;
+      state.snapX1Seen = c.x1;
+      state.snapX1At = nowMs;
+    } else {
+      if (isLive5m && spanFull > 6) {
+        const elapsed = state.snapX1At ? Math.min(2.5, (nowMs - state.snapX1At) / 1000) : 0;
+        const clockX1 = Math.min(liveCeil, c.x1 - liveLag + elapsed);
+        const err = clockX1 - state.animX1;
+        const speed = Math.max(0, Math.min(2.2, 1.0 + err * 1.4));
+        state.animX1 = Math.min(liveCeil, state.animX1 + speed * dt);
+        if (state.animX1 < liveCeil - 0.01) needMore = true;
+      } else {
+        const diffX = c.x1 - state.animX1;
+        if (Math.abs(diffX) > 0.05) {
+          state.animX1 += diffX * (1 - Math.exp(-dt * 7));
+          needMore = true;
+        } else {
+          state.animX1 = c.x1;
+        }
+      }
+
+      const easeY = 1 - Math.exp(-dt * 8);
+      if (Math.abs(targetYTop - state.animYTop) > targetYTop * 0.002) {
+        state.animYTop += (targetYTop - state.animYTop) * easeY;
+        needMore = true;
+      } else {
+        state.animYTop = targetYTop;
+      }
+      if (Math.abs(c.targetK - state.animK) > Math.max(1, c.targetK) * 0.002) {
+        state.animK += (c.targetK - state.animK) * easeY;
+        needMore = true;
+      } else {
+        state.animK = c.targetK;
+      }
+    }
+
+    const vx1 = Math.max(c.x0 + c.bucket, Math.min(liveCeil, state.animX1));
+    const vx0 = Math.max(c.x0, vx1 - visSpan);
+    const yTop = Math.max(1024, state.animYTop);
+    const cap = state.autoScale ? Infinity : state.scaleCap;
+
+    const visUp = clipAndScale(c.upPts, vx0, vx1, state.animK, cap);
+    const visDown = clipAndScale(c.downPts, vx0, vx1, state.animK, cap);
+
+    drawChart($('main-chart'), [
+      { color: UP, pts: visUp },
+      { color: DOWN, pts: visDown },
+    ], { x0: vx0, x1: vx1, yTop: yTop * 1.04, gridStep: niceStep(targetYTop / 8) });
+
+    if (needMore) scheduleFrame();
   }
 
   function renderLists(d) {
@@ -440,20 +678,20 @@
       const idx = Math.round((t - x0) / bucket);
       if (idx >= 0 && idx < n) { down[idx] += i; up[idx] += o; }
     }
-    return {
-      ts, down, up, bucket,
-      totalDown: down.reduce((a, b) => a + b, 0),
-      totalUp: up.reduce((a, b) => a + b, 0),
-      wan: 0, lan: 0, apps: [], hosts: [],
-    };
+    let totalDown = 0, totalUp = 0;
+    for (let i = 0; i < n; i++) { totalDown += down[i]; totalUp += up[i]; }
+    return { ts, down, up, bucket, totalDown, totalUp, wan: 0, lan: 0, apps: [], hosts: [] };
   }
 
+  let liveTick = 0;
   async function loadLive() {
     const range = state.range;
+    const fetchLists = liveTick === 0 || liveTick % 5 === 0 || !state.data;
+    liveTick++;
     const [traffic, apps, hosts] = await Promise.all([
       fetchJson(`/api/traffic?range=${range}`),
-      fetchJson(`/api/apps?range=${range}&limit=10`).catch(() => null),
-      fetchJson(`/api/hosts?range=${range}&limit=8`).catch(() => null),
+      fetchLists ? fetchJson(`/api/apps?range=${range}&limit=10`).catch(() => null) : Promise.resolve(null),
+      fetchLists ? fetchJson(`/api/hosts?range=${range}&limit=8`).catch(() => null) : Promise.resolve(null),
     ]);
     const d = fromTraffic(traffic);
     const palette = APP_POOL.map((p) => p[2]);
@@ -462,6 +700,8 @@
         name: a.name || 'unknown', color: palette[i % palette.length], count: 0,
         inBytes: a.inBytes || 0, outBytes: a.outBytes || 0,
       })).sort((a, b) => b.inBytes + b.outBytes - (a.inBytes + a.outBytes));
+    } else if (state.data) {
+      d.apps = state.data.apps;
     }
     if (hosts && hosts.hosts) {
       const flags = { DE: '🇩🇪', IR: '🇮🇷', NL: '🇳🇱', US: '🇺🇸', FR: '🇫🇷', GB: '🇬🇧', TR: '🇹🇷', SE: '🇸🇪' };
@@ -471,6 +711,8 @@
         region: h.region || h.ip || '',
         inBytes: h.inBytes || 0, outBytes: h.outBytes || 0,
       }));
+    } else if (state.data) {
+      d.hosts = state.data.hosts;
     }
     if (d.apps.length === 0) d.apps = genDemo(state.range).apps;
     if (d.hosts.length === 0) d.hosts = genDemo(state.range).hosts;
@@ -481,7 +723,23 @@
     const tot = d.totalDown + d.totalUp;
     d.lan = Math.min(priv, tot * 0.5);
     d.wan = tot - d.lan;
-    render(d);
+    ingestData(d, fetchLists);
+  }
+
+  function pollMs() {
+    if (state.range === '5m') return 1000;
+    if (state.range === '3h') return 5000;
+    return 60000;
+  }
+
+  function resetTimers() {
+    if (state.pollTimer) { clearInterval(state.pollTimer); state.pollTimer = null; }
+    if (state.demoTickTimer) { clearInterval(state.demoTickTimer); state.demoTickTimer = null; }
+    if (state.live) {
+      state.pollTimer = setInterval(refresh, pollMs());
+    } else if (state.range === '5m') {
+      state.demoTickTimer = setInterval(tickDemo5m, 1000);
+    }
   }
 
   async function refresh() {
@@ -493,8 +751,7 @@
         setLive(false);
       }
     }
-    state.demo = genDemo(state.range);
-    render(state.demo);
+    ingestData(genDemo(state.range), true);
   }
 
   function setLive(live, version) {
@@ -505,14 +762,13 @@
       badge.className = 'badge live';
       badge.innerHTML = `<span class="dot"></span>live v${version || '?'}`;
       banner.hidden = true;
-      if (!state.timer) state.timer = setInterval(refresh, 3000);
     } else {
       badge.className = 'badge demo';
       badge.innerHTML = '<span class="dot"></span>demo data';
       banner.hidden = false;
       banner.textContent = 'Demo data — hosted previews cannot reach your PC. Open http://127.0.0.1:8912 for live numbers.';
-      if (state.timer) { clearInterval(state.timer); state.timer = null; }
     }
+    resetTimers();
   }
 
   // ---------- menus (combo replicas) ----------
@@ -530,11 +786,13 @@
     const btn = e.target.closest('button[data-range]');
     if (!btn) return;
     state.range = btn.dataset.range;
+    liveTick = 0;
     for (const b of $('period-menu').querySelectorAll('button')) {
       b.classList.toggle('sel', b === btn);
     }
     $('period-btn').firstChild.textContent = RANGE_LABEL[state.range] + ' ';
     closeMenus();
+    resetTimers();
     refresh();
   });
   $('scale-btn').addEventListener('click', (e) => {
@@ -548,7 +806,7 @@
     state.autoScale = e.target.checked;
     $('scale-ladder').hidden = state.autoScale;
     updateScaleBtn();
-    if (state.demo) render(state.demo);
+    scheduleFrame();
   });
   function buildLadder() {
     $('scale-ladder').innerHTML = LADDER.map(([lbl, val]) =>
@@ -561,7 +819,7 @@
     state.scaleCap = Number(btn.dataset.cap);
     buildLadder();
     updateScaleBtn();
-    if (state.demo) render(state.demo);
+    scheduleFrame();
   });
   function updateScaleBtn() {
     $('scale-btn').innerHTML = (state.autoScale
@@ -574,7 +832,7 @@
   updateScaleBtn();
 
   const ro = new ResizeObserver(() => {
-    if (state.demo || state.live) refresh();
+    if (state.cached) scheduleFrame();
   });
   ro.observe($('main-chart'));
 
