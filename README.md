@@ -65,6 +65,22 @@ Binaries land in `packetly/src/Packetly/bin/Release/net8.0-windows/packetly.exe`
 `packetly.exe` from an elevated prompt (serves the API on `127.0.0.1:8912` and opens
 the UI), then `packetly.exe --install-autostart` to register logon autostart.
 
+## Web dashboard (browser / AI Studio preview)
+
+`web/` is a zero-dependency browser version of the dashboard. It renders the
+same chart pipeline as the Windows app (3-pass smoothing → Catmull-Rom → peak
+normalization → honest raw-peak y-scale), on **demo data** in hosted previews
+and on **live data** automatically when served from the collector itself
+(`http://127.0.0.1:8912`, same origin as the API).
+
+```powershell
+npm run dev        # or: bun run dev  — serves web/ on localhost:5173 (honors PORT)
+```
+
+It is fully additive: the desktop build and the release pipeline never touch
+this folder, so it is safe to iterate on (e.g. in Google AI Studio) and pull
+without affecting the Windows binaries.
+
 ## Releases & updates
 
 Releases are built automatically by GitHub Actions when a `v*` tag is pushed

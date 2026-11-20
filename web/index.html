@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Packetly — Web Dashboard</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="wrap">
+
+    <header class="topbar">
+      <div class="brand">
+        <span class="logo">P</span>
+        <span class="name">Packetly</span>
+        <span class="badge" id="mode-badge"><span class="dot"></span>connecting…</span>
+      </div>
+      <nav class="periods" id="periods">
+        <button data-range="5m">5 min</button>
+        <button data-range="3h" class="active">3 hours</button>
+        <button data-range="24h">24 hours</button>
+        <button data-range="7d">7 days</button>
+        <button data-range="30d">30 days</button>
+        <button data-range="unlimited">All time</button>
+      </nav>
+    </header>
+
+    <div class="banner" id="banner" hidden></div>
+
+    <section class="stats">
+      <div class="card stat">
+        <div class="stat-label">Download</div>
+        <div class="stat-value down" id="stat-down">—</div>
+        <div class="stat-rate" id="stat-down-rate">—</div>
+        <div class="bar"><div class="bar-fill down-fill" id="bar-down"></div></div>
+      </div>
+      <div class="card stat">
+        <div class="stat-label">Upload</div>
+        <div class="stat-value up" id="stat-up">—</div>
+        <div class="stat-rate" id="stat-up-rate">—</div>
+        <div class="bar"><div class="bar-fill up-fill" id="bar-up"></div></div>
+      </div>
+      <div class="card stat">
+        <div class="stat-label">WAN</div>
+        <div class="stat-value" id="stat-wan">—</div>
+        <div class="stat-rate" id="stat-wan-sub">total in window</div>
+        <div class="bar"><div class="bar-fill wan-fill" id="bar-wan"></div></div>
+      </div>
+      <div class="card stat">
+        <div class="stat-label">LAN</div>
+        <div class="stat-value" id="stat-lan">—</div>
+        <div class="stat-rate" id="stat-lan-sub">local traffic</div>
+        <div class="bar"><div class="bar-fill lan-fill" id="bar-lan"></div></div>
+      </div>
+    </section>
+
+    <section class="card chart-card">
+      <div class="chart-head">
+        <span class="chart-title">Traffic monitor</span>
+        <span class="chart-legend">
+          <span class="swatch down-swatch"></span>download
+          <span class="swatch up-swatch"></span>upload
+        </span>
+      </div>
+      <div class="chart-holder"><canvas id="main-chart"></canvas></div>
+      <div class="mini-holder"><canvas id="mini-chart"></canvas></div>
+    </section>
+
+    <section class="two-col">
+      <div class="card list-card">
+        <div class="list-head">
+          <span class="chart-title">Apps</span>
+          <span class="dim" id="apps-sub"></span>
+        </div>
+        <div id="app-rows"></div>
+      </div>
+      <div class="card list-card">
+        <div class="list-head">
+          <span class="chart-title">Hosts</span>
+          <span class="dim">top remote peers</span>
+        </div>
+        <div id="host-rows"></div>
+      </div>
+    </section>
+
+    <footer class="foot">
+      Packetly Web · runs on demo data in hosted previews · point it at your PC's
+      collector (127.0.0.1:8912) for live data
+    </footer>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

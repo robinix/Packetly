@@ -1,0 +1,12 @@
+{
+  "name": "packetly",
+  "version": "1.5.2",
+  "private": true,
+  "description": "Packetly — Windows network monitor. This root manifest only drives web preview/dev servers (Google AI Studio, static hosting); the desktop app itself is packetly/ (.NET 8 ETW collector) plus packetly-ui/ (Rust egui) and does not use Node.",
+  "scripts": {
+    "dev": "node web/server.mjs",
+    "start": "node web/server.mjs",
+    "preview": "node web/server.mjs",
+    "build": "node -e \"console.log('Packetly web is a static site — nothing to build')\""
+  }
+}
