@@ -2634,7 +2634,7 @@ impl PacketlyApp {
 
                                 {
                                     let rect = presp.transform.frame();
-                                    let painter = ui.painter().with_clip_rect(rect);
+                                    let painter = ui.painter_at(rect);
                                     let vgrid = Theme::alpha(
                                         t.grid,
                                         ((t.grid.a() as f32) * 0.65).round().max(3.0) as u8,
@@ -2685,7 +2685,7 @@ impl PacketlyApp {
 
                                 {
                                     let rect = presp.transform.frame();
-                                    let painter = ui.painter().with_clip_rect(rect);
+                                    let painter = ui.painter_at(rect);
                                     for e in &snap.events {
                                         if e.kind < 2 || e.ts < view_x0 || e.ts > view_x1 {
                                             continue;
@@ -2762,7 +2762,7 @@ impl PacketlyApp {
                                     .or_else(|| snap.sel.as_ref().map(|s| (s.t0, s.t1)));
                                 if let Some((lo, hi)) = band {
                                     let rect = presp.transform.frame();
-                                    let painter = ui.painter().with_clip_rect(rect);
+                                    let painter = ui.painter_at(rect);
                                     let x0px =
                                         presp.transform.position_from_point_x(lo.min(view_x1));
                                     let x1px =
