@@ -112,6 +112,25 @@ auto-generated notes. To publish an update, bump the version and push a new tag.
 - ETW kernel sessions require elevation; the scheduled task runs at the highest
   integrity level for this reason.
 
+## Troubleshooting
+
+**Collector crashes at logon with `0xE0434352` / API won't start (SocketException
+10013 on port 8912).** On machines with Hyper-V / WSL2 / Docker Desktop, Windows
+reshuffles dynamic port-exclusion ranges at every boot and can swallow Packetly's
+loopback ports (8912 API, 8913 single-instance guard), making the bind fail. Check
+with `netsh interface ipv4 show excludedportrange protocol=tcp` and pin the ports
+permanently (elevated prompt):
+
+```bat
+net stop winnat
+netsh int ipv4 add excludedportrange protocol=tcp startport=8912 numberofports=1 store=persistent
+netsh int ipv4 add excludedportrange protocol=tcp startport=8913 numberofports=1 store=persistent
+net start winnat
+```
+
+Then start Packetly again (`schtasks /run /tn Packetly` or just relaunch). The
+reservation survives reboots, so this is a one-time fix.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
