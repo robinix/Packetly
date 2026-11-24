@@ -54,7 +54,7 @@ internal static class AppApi
             return new
             {
                 app = "packetly",
-                version = "1.7.3",
+                version = "1.7.4",
                 now,
                 startedAt = svc.StartedAt,
                 uptimeSeconds = now - svc.StartedAt,
@@ -296,29 +296,44 @@ internal static class AppApi
             var now = Now();
             long start;
             long end = to ?? now;
-            Dictionary<int, long> usage;
+            Dictionary<int, (long In, long Out)> usage;
             string p;
             if (from != null)
             {
                 // arbitrary window (5m/3h/24h/7d/30d/all/custom from the UI)
                 start = from.Value;
                 p = "range";
-                usage = svc.Db.UsageByAppBetween(start, end);
+                var tier = start == 0 ? "traffic_86400s" : TierFor(start, end);
+                usage = svc.Db.UsageSplitByApp(tier, start, end);
             }
             else
             {
                 p = period switch { "today" => "daily", "week" => "weekly", "month" => "monthly", "daily" => "daily", "weekly" => "weekly", "monthly" => "monthly", _ => "daily" };
                 start = Periods.StartUtc(p);
-                usage = svc.Db.UsageByAppSince(start);
+                usage = svc.Db.UsageSplitByApp("traffic_60s", start, null);
             }
+            long totalIn = 0, totalOut = 0;
+            foreach (var v in usage.Values) { totalIn += v.In; totalOut += v.Out; }
             return Results.Json(new
             {
                 period = p,
                 start,
                 now,
-                total = usage.Values.Sum(),
-                perApp = usage.OrderByDescending(kv => kv.Value)
-                    .Select(kv => new { appId = kv.Key, name = names.GetValueOrDefault(kv.Key, $"app {kv.Key}"), bytes = kv.Value }),
+                total = totalIn + totalOut,
+                inBytes = totalIn,
+                outBytes = totalOut,
+                perApp = usage
+                    .OrderByDescending(kv => kv.Value.In + kv.Value.Out)
+                    .ThenBy(kv => names.GetValueOrDefault(kv.Key, $"app {kv.Key}"), StringComparer.OrdinalIgnoreCase)
+                    .ThenBy(kv => kv.Key)
+                    .Select(kv => new
+                    {
+                        appId = kv.Key,
+                        name = names.GetValueOrDefault(kv.Key, $"app {kv.Key}"),
+                        bytes = kv.Value.In + kv.Value.Out,
+                        inBytes = kv.Value.In,
+                        outBytes = kv.Value.Out,
+                    }),
             });
         });
 
@@ -386,7 +401,19 @@ internal static class AppApi
         {
             if (!int.TryParse(ctx.Request.Query["app_id"], out var appId)) return Results.BadRequest();
             var png = svc.Db.GetAppIcon(appId);
-            if (png == null) return Results.NotFound();
+            if (png == null)
+            {
+                // Extract on-demand on first request so newly seen or un-backfilled apps
+                // get their icon immediately instead of waiting for background backfill.
+                var appRow = svc.Db.GetAppById(appId);
+                if (appRow != null)
+                    png = IconExtractor.TryExtract(svc.Db, appId, appRow.Value.Path);
+            }
+            if (png == null)
+            {
+                ctx.Response.Headers.CacheControl = "no-cache";
+                return Results.NotFound();
+            }
             ctx.Response.Headers.CacheControl = "public,max-age=86400";
             return Results.File(png, "image/png");
         });

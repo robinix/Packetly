@@ -207,6 +207,21 @@ internal sealed class Db : IDisposable
         return list;
     }
 
+    /// <summary>All exe-backed apps for one-time icon quality migration.</summary>
+    public List<(int Id, string Path)> AllExeApps(int limit)
+    {
+        var list = new List<(int, string)>();
+        lock (_gate)
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = "SELECT id, path FROM apps WHERE path LIKE '%.exe' ORDER BY id DESC LIMIT $l";
+            cmd.Parameters.AddWithValue("$l", limit);
+            using var r = cmd.ExecuteReader();
+            while (r.Read()) list.Add((r.GetInt32(0), r.GetString(1)));
+        }
+        return list;
+    }
+
     public (string? Name, string? Path, string? Publisher)? GetAppById(int id)
     {
         lock (_gate)
@@ -231,7 +246,7 @@ internal sealed class Db : IDisposable
                 SELECT hex(t.host) AS iphex, h.hostname, h.region, SUM(t.inb), SUM(t.outb)
                 FROM {table} t LEFT JOIN hosts h ON h.ip = t.host
                 WHERE t.ts >= $f AND t.ts < $t AND t.app_id = $id
-                GROUP BY t.host ORDER BY SUM(t.inb + t.outb) DESC LIMIT $l
+                GROUP BY t.host ORDER BY SUM(t.inb + t.outb) DESC, t.host ASC LIMIT $l
                 """;
             cmd.Parameters.AddWithValue("$f", from);
             cmd.Parameters.AddWithValue("$t", to);
@@ -282,7 +297,7 @@ internal sealed class Db : IDisposable
                 SELECT a.id, COALESCE(a.name, a.path), COUNT(DISTINCT t.host), SUM(t.inb), SUM(t.outb)
                 FROM {table} t JOIN apps a ON a.id = t.app_id
                 WHERE t.ts >= $f AND t.ts < $t
-                GROUP BY a.id ORDER BY SUM(t.inb + t.outb) DESC LIMIT $l
+                GROUP BY a.id ORDER BY SUM(t.inb + t.outb) DESC, a.id ASC LIMIT $l
                 """;
             cmd.Parameters.AddWithValue("$f", from);
             cmd.Parameters.AddWithValue("$t", to);
@@ -468,7 +483,7 @@ internal sealed class Db : IDisposable
                 SELECT COALESCE(a.name, a.path), SUM(t.inb), SUM(t.outb)
                 FROM {table} t JOIN apps a ON a.id = t.app_id
                 WHERE t.ts >= $f AND t.ts < $t
-                GROUP BY t.app_id ORDER BY SUM(t.inb + t.outb) DESC LIMIT $l
+                GROUP BY t.app_id ORDER BY SUM(t.inb + t.outb) DESC, t.app_id ASC LIMIT $l
                 """;
             cmd.Parameters.AddWithValue("$f", from);
             cmd.Parameters.AddWithValue("$t", to);
@@ -489,7 +504,7 @@ internal sealed class Db : IDisposable
                 SELECT a.id, COALESCE(a.name, a.path), a.path, SUM(t.inb), SUM(t.outb)
                 FROM {table} t JOIN apps a ON a.id = t.app_id
                 WHERE t.ts >= $f AND t.ts < $t
-                GROUP BY a.id ORDER BY SUM(t.inb + t.outb) DESC LIMIT $l
+                GROUP BY a.id ORDER BY SUM(t.inb + t.outb) DESC, a.id ASC LIMIT $l
                 """;
             cmd.Parameters.AddWithValue("$f", from);
             cmd.Parameters.AddWithValue("$t", to);
@@ -510,7 +525,7 @@ internal sealed class Db : IDisposable
                 SELECT hex(t.host) AS iphex, h.hostname, h.region, SUM(t.inb), SUM(t.outb)
                 FROM {table} t LEFT JOIN hosts h ON h.ip = t.host
                 WHERE t.ts >= $f AND t.ts < $t
-                GROUP BY t.host ORDER BY SUM(t.inb + t.outb) DESC LIMIT $l
+                GROUP BY t.host ORDER BY SUM(t.inb + t.outb) DESC, t.host ASC LIMIT $l
                 """;
             cmd.Parameters.AddWithValue("$f", from);
             cmd.Parameters.AddWithValue("$t", to);
@@ -642,6 +657,24 @@ internal sealed class Db : IDisposable
             cmd.Parameters.AddWithValue("$e", endTs);
             using var r = cmd.ExecuteReader();
             while (r.Read()) map[r.GetInt32(0)] = r.GetInt64(1);
+        }
+        return map;
+    }
+
+    /// <summary>Per-app (in, out) byte breakdown for a given rollup tier and time window.</summary>
+    public Dictionary<int, (long In, long Out)> UsageSplitByApp(string table, long startTs, long? endTs = null)
+    {
+        var map = new Dictionary<int, (long In, long Out)>();
+        lock (_gate)
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = endTs == null
+                ? $"SELECT app_id, SUM(inb), SUM(outb) FROM {table} WHERE ts >= $s GROUP BY app_id"
+                : $"SELECT app_id, SUM(inb), SUM(outb) FROM {table} WHERE ts >= $s AND ts < $e GROUP BY app_id";
+            cmd.Parameters.AddWithValue("$s", startTs);
+            if (endTs != null) cmd.Parameters.AddWithValue("$e", endTs.Value);
+            using var r = cmd.ExecuteReader();
+            while (r.Read()) map[r.GetInt32(0)] = (r.GetInt64(1), r.GetInt64(2));
         }
         return map;
     }

@@ -2,6 +2,37 @@
 
 All notable changes to Packetly are documented here, including technical handoff notes for the local Windows build/verification agent.
 
+## v1.7.4 — Modern Usage Dashboard, Stable Tie-Breaking & Reliable Fast App Icons
+
+### User-facing changes
+- **Modern, responsive Usage tab overhaul:** Rebuilt the Usage tab to match Packetly's deep-navy (`#121a2a`) Elite design language with:
+  - A **4-card KPI summary strip** (`Total Traffic` with live Upload/Download ratio bar, `Download`, `Upload`, and clickable `Top Application` with icon & share %).
+  - A full-height **Applications Breakdown** card displaying up to 100 apps (previously truncated at 15 and capped at `380px` height) with ranked `38px` rows, inline icons, share percentages, split **blue Upload + magenta Download** proportional bars, live top-bar search filtering, sorting (`Total`, `Down`, `Up`, `Name`), and detailed hover tooltips.
+  - A custom vector **Usage Distribution Donut Chart** (`Top 5 + Other`) with centered total and clickable interactive legend.
+  - A redesigned **Data Quotas** manager with nested status cards (color-coded green / amber / red progress bars, app/global icons, quick `✕` delete) and an inline quota creator supporting `Enter` to submit and input validation.
+  - Automatic responsive stacking on narrower windows (`< 860px`).
+- **Fixed Traffic tab row flickering on tied usage:** Eliminated rapid back-and-forth row swapping when two apps, hosts, traffic types, or countries have identical byte totals by adding strict deterministic tie-breaking (by display name + ID) across both the UI sorters and SQLite queries.
+- **Faster, more reliable & cleaner app icons:**
+  - Replaced legacy `Icon.ExtractAssociatedIcon` with Windows Shell **`SHGetFileInfoW`** 32-bit ARGB extraction (`32×32` normalized PNGs with clean alpha transparency and blank-icon validation), plus a one-time automatic background upgrade of previously cached icons.
+  - Added **on-demand icon extraction** directly inside `/api/icon` so newly seen apps return their icon on the very first request instead of 404-ing until backfill finishes.
+  - Replaced the UI's permanent `icon_failed` blacklist with exponential retry backoff (reset on tab/range switch), prioritized top visible apps first, raised per-tick icon batching to `40` with fast `150ms` draining while icons are pending, added byte-hash texture invalidation, and preserved icon aspect ratios.
+
+### Local agent handoff notes
+- **Files changed:**
+  - `packetly/src/Packetly/Core/IconExtractor.cs` — new `SHGetFileInfoW` (`SHGFI_ICON | SHGFI_LARGEICON`) + `DestroyIcon` extractor with `ExtractAssociatedIcon` fallback, `32×32` `Format32bppArgb` PNG normalization, and transparent-bitmap guard.
+  - `packetly/src/Packetly/Storage/Db.cs` — added `AllExeApps`, `UsageSplitByApp` (returning separate `In`/`Out` totals per app across any rollup tier), and deterministic secondary `ORDER BY` tie-breakers (`a.id ASC` / `t.host ASC`) on `AppsInWindow`, `TopApps`, `TopHosts`, `AppHostsBetween`, and `AppsHostsBetween`.
+  - `packetly/src/Packetly/Api/AppApi.cs` — version `1.7.4`; extended `/api/usage` (backward-compatible) with `inBytes`/`outBytes` totals and per-app split + deterministic `.ThenBy(...)` tie-breakers + tier selection (`TierFor`) for custom/range windows; added on-demand `IconExtractor.TryExtract` inside `/api/icon`.
+  - `packetly/src/Packetly/Program.cs` — async `Task.Run` icon extraction on `AppCreated` (no longer holds `Db` lock), 1s startup backfill with one-time `icon_v2_migrated` re-extraction of existing `.exe` icons, and periodic 5-minute backfill for missing icons.
+  - `packetly-ui/src/main.rs` — added `RowIcon::sort_key`, `tie_break_traffic`, `UsageAppRow`, `fnv1a64`, `paint_icon_fit`, `usage_sort`, `usage_filter`, `quota_err`, `icon_tex_hash`; upgraded background icon loader (priority-preserving dedup, 40/tick + `150ms` fast drain, exponential retry backoff, includes quota/detail/selection apps); enabled top-bar Filter on `Tab::Usage`; completely overhauled `usage_tab`.
+  - `packetly-ui/Cargo.toml`, `packetly-ui/Cargo.lock`, `package.json` — version bumped to `1.7.4`.
+- **Verify locally on Windows:**
+  1. `git pull`
+  2. `dotnet build packetly/src/Packetly -c Release`
+  3. `cargo build --release --manifest-path packetly-ui/Cargo.toml`
+  4. Open **Usage** tab across `Today`, `This week`, `5 Minutes`, and `All Time` in **Elite (navy)**, **Dark**, and **Light** themes: verify KPI cards, split Download/Upload bars, vector donut chart, full-height scrollable app list, live Filter/Sort, App Details click-through, and creating/deleting quotas (including pressing Enter and testing invalid input).
+  5. Open **Traffic** tab when multiple rows share identical totals (e.g., `150 B` hosts/countries or tied apps) and confirm zero row flickering/swapping across refreshes.
+  6. Verify app icons appear quickly (<1s) across Traffic, Usage, and Quotas, look crisp without black alpha artifacts, and automatically repair previously broken cached icons after first startup (`icon_v2_migrated`).
+
 ## v1.7.3 — Polished Responsive Traffic Panel Overhaul
 
 ### User-facing changes

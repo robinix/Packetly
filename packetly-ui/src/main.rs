@@ -518,6 +518,18 @@ enum RowIcon {
     None,
 }
 
+impl RowIcon {
+    fn sort_key(&self) -> (u8, i64, &str) {
+        match self {
+            RowIcon::App(id) => (0, *id, ""),
+            RowIcon::Flag(c) => (1, 0, c.as_str()),
+            RowIcon::Lan => (2, 0, ""),
+            RowIcon::Globe => (3, 0, ""),
+            RowIcon::None => (4, 0, ""),
+        }
+    }
+}
+
 #[derive(Clone)]
 struct TrafficRow {
     label: String,
@@ -527,24 +539,71 @@ struct TrafficRow {
     out_bytes: f64,
 }
 
+#[derive(Clone)]
+struct UsageAppRow {
+    id: i64,
+    name: String,
+    in_bytes: f64,
+    out_bytes: f64,
+    total_bytes: f64,
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+/// Paint a texture centered inside `slot` while preserving its natural aspect ratio.
+fn paint_icon_fit(painter: &egui::Painter, tex: &egui::TextureHandle, slot: egui::Rect) {
+    let sz = tex.size_vec2();
+    let dest = if sz.x > 0.0 && sz.y > 0.0 {
+        let scale = (slot.width() / sz.x).min(slot.height() / sz.y);
+        egui::Rect::from_center_size(slot.center(), egui::vec2(sz.x * scale, sz.y * scale))
+    } else {
+        slot
+    };
+    painter.image(
+        tex.id(),
+        dest,
+        egui::Rect::from_min_max(egui::Pos2::new(0.0, 0.0), egui::Pos2::new(1.0, 1.0)),
+        egui::Color32::WHITE,
+    );
+}
+
+fn tie_break_traffic(a: &TrafficRow, b: &TrafficRow) -> std::cmp::Ordering {
+    a.label
+        .to_lowercase()
+        .cmp(&b.label.to_lowercase())
+        .then_with(|| a.label.cmp(&b.label))
+        .then_with(|| a.sub.cmp(&b.sub))
+        .then_with(|| a.icon.sort_key().cmp(&b.icon.sort_key()))
+}
+
 fn sort_traffic_rows(rows: &mut [TrafficRow], key: SortKey) {
     match key {
         SortKey::Total | SortKey::Hosts => rows.sort_by(|a, b| {
             (b.in_bytes + b.out_bytes)
                 .partial_cmp(&(a.in_bytes + a.out_bytes))
                 .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| tie_break_traffic(a, b))
         }),
         SortKey::Down => rows.sort_by(|a, b| {
             b.in_bytes
                 .partial_cmp(&a.in_bytes)
                 .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| tie_break_traffic(a, b))
         }),
         SortKey::Up => rows.sort_by(|a, b| {
             b.out_bytes
                 .partial_cmp(&a.out_bytes)
                 .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| tie_break_traffic(a, b))
         }),
-        SortKey::Name => rows.sort_by(|a, b| a.label.to_lowercase().cmp(&b.label.to_lowercase())),
+        SortKey::Name => rows.sort_by(tie_break_traffic),
     }
 }
 
@@ -604,8 +663,10 @@ struct Snapshot {
     country_data: Option<GroupData>,
     icons: HashMap<i64, Vec<u8>>,
     lanwan: LanWan,
-    usage_per_app: Vec<(i64, String, f64)>,
+    usage_per_app: Vec<UsageAppRow>,
     usage_total: f64,
+    usage_in: f64,
+    usage_out: f64,
     quotas: Vec<QuotaRow>,
     events: Vec<EventRow>,
     unseen: i64,
@@ -1436,19 +1497,30 @@ fn fetch_snapshot(
                     d["start"].as_i64().unwrap_or(0),
                     d["now"].as_i64().unwrap_or(0),
                 );
+                let mut sum_in = 0.0_f64;
+                let mut sum_out = 0.0_f64;
                 if let Some(arr) = d["perApp"].as_array() {
                     snap.usage_per_app = arr
                         .iter()
-                        .take(15)
+                        .take(100)
                         .map(|a| {
-                            (
-                                a["appId"].as_i64().unwrap_or(0),
-                                a["name"].as_str().unwrap_or("?").to_string(),
-                                a["bytes"].as_f64().unwrap_or(0.0),
-                            )
+                            let total = a["bytes"].as_f64().unwrap_or(0.0);
+                            let in_b = a["inBytes"].as_f64().unwrap_or(total);
+                            let out_b = a["outBytes"].as_f64().unwrap_or(0.0);
+                            sum_in += in_b;
+                            sum_out += out_b;
+                            UsageAppRow {
+                                id: a["appId"].as_i64().unwrap_or(0),
+                                name: a["name"].as_str().unwrap_or("?").to_string(),
+                                in_bytes: in_b,
+                                out_bytes: out_b,
+                                total_bytes: total,
+                            }
                         })
                         .collect();
                 }
+                snap.usage_in = d["inBytes"].as_f64().unwrap_or(sum_in);
+                snap.usage_out = d["outBytes"].as_f64().unwrap_or(sum_out);
             }
             if let Ok(d) = fetch_json(&format!("{}/api/quotas", API)) {
                 if let Some(arr) = d["quotas"].as_array() {
@@ -2240,16 +2312,20 @@ struct PacketlyApp {
     tx: std::sync::mpsc::Sender<UiMsg>,
     cache: Mutex<ChartCache>,
     icon_tex: HashMap<i64, egui::TextureHandle>,
+    icon_tex_hash: HashMap<i64, u64>,
     quota_app: String,
     quota_period: String,
     quota_value: String,
     quota_unit: i64,
+    quota_err: Option<String>,
     auto_scale: bool,
     scale_cap: f64,
     show_scale: bool,
     sel_drag: Option<(f64, f64)>,
     traffic_sort: SortKey,
     traffic_filter: String,
+    usage_sort: SortKey,
+    usage_filter: String,
     sel_sort: SortKey,
     detail_tab: usize,
     detail_sort: SortKey,
@@ -2362,21 +2438,31 @@ impl PacketlyApp {
     }
 
     fn icon_texture(&mut self, ctx: &egui::Context, id: i64) -> Option<egui::TextureHandle> {
-        if let Some(tex) = self.icon_tex.get(&id) {
-            return Some(tex.clone());
-        }
         let snap = self.snap.lock().unwrap().clone();
-        let bytes = snap.icons.get(&id)?;
-        if bytes.is_empty() {
-            return None;
+        if let Some(bytes) = snap.icons.get(&id) {
+            if !bytes.is_empty() {
+                let h = fnv1a64(bytes);
+                if self.icon_tex_hash.get(&id) == Some(&h) {
+                    if let Some(tex) = self.icon_tex.get(&id) {
+                        return Some(tex.clone());
+                    }
+                }
+                if let Ok(img) = image::load_from_memory(bytes) {
+                    let rgba = img.to_rgba8();
+                    let size = [rgba.width() as usize, rgba.height() as usize];
+                    let color_img = egui::ColorImage::from_rgba_unmultiplied(size, &rgba.into_raw());
+                    let tex = ctx.load_texture(
+                        format!("icon-{}-{:x}", id, h),
+                        color_img,
+                        egui::TextureOptions::LINEAR,
+                    );
+                    self.icon_tex.insert(id, tex.clone());
+                    self.icon_tex_hash.insert(id, h);
+                    return Some(tex);
+                }
+            }
         }
-        let img = image::load_from_memory(bytes).ok()?;
-        let rgba = img.to_rgba8();
-        let size = [rgba.width() as usize, rgba.height() as usize];
-        let color_img = egui::ColorImage::from_rgba_unmultiplied(size, &rgba.into_raw());
-        let tex = ctx.load_texture(format!("icon-{}", id), color_img, egui::TextureOptions::LINEAR);
-        self.icon_tex.insert(id, tex.clone());
-        Some(tex)
+        self.icon_tex.get(&id).cloned()
     }
 
     fn nav(&mut self, ctx: &egui::Context) {
@@ -2447,6 +2533,15 @@ impl PacketlyApp {
                         );
                         if !self.traffic_filter.is_empty() && ui.small_button("✕").clicked() {
                             self.traffic_filter.clear();
+                        }
+                    } else if self.tab == Tab::Usage {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.usage_filter)
+                                .hint_text("Filter applications…")
+                                .desired_width(230.0),
+                        );
+                        if !self.usage_filter.is_empty() && ui.small_button("✕").clicked() {
+                            self.usage_filter.clear();
                         }
                     } else {
                         ui.weak("Filter");
@@ -3763,15 +3858,7 @@ impl PacketlyApp {
                                             if let Some(tex) =
                                                 app.app_icon_opt(ui.ctx(), *id, &row.label)
                                             {
-                                                painter.image(
-                                                    tex.id(),
-                                                    ir,
-                                                    egui::Rect::from_min_max(
-                                                        egui::Pos2::new(0.0, 0.0),
-                                                        egui::Pos2::new(1.0, 1.0),
-                                                    ),
-                                                    egui::Color32::WHITE,
-                                                );
+                                                paint_icon_fit(&painter, &tex, ir);
                                             } else {
                                                 painter.rect_filled(ir, 3.5, t.card2);
                                                 painter.rect_stroke(
@@ -4131,203 +4218,1293 @@ impl PacketlyApp {
 
     fn usage_tab(&mut self, ctx: &egui::Context) {
         let t = self.theme();
+        let dark_theme = t.text.r() > 128;
+        let card_border = if dark_theme {
+            srgb_alpha(egui::Color32::WHITE, 0.06)
+        } else {
+            t.border
+        };
+        let divider_col = if dark_theme {
+            srgb_alpha(egui::Color32::WHITE, 0.06)
+        } else {
+            t.border
+        };
+        let hover_fill = if dark_theme {
+            srgb_alpha(egui::Color32::WHITE, 0.055)
+        } else {
+            srgb_alpha(egui::Color32::BLACK, 0.045)
+        };
+        let bar_track = if dark_theme {
+            srgb_alpha(egui::Color32::WHITE, 0.055)
+        } else {
+            srgb_alpha(egui::Color32::BLACK, 0.075)
+        };
+        let inset_fill = if dark_theme {
+            egui::Color32::from_rgb(24, 33, 50)
+        } else {
+            t.card2
+        };
+        let val_color = if dark_theme {
+            egui::Color32::from_rgb(186, 198, 224)
+        } else {
+            t.text
+        };
+
         egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(t.bg).inner_margin(egui::Margin::symmetric(16.0, 4.0)))
+            .frame(
+                egui::Frame::none()
+                    .fill(t.bg)
+                    .inner_margin(egui::Margin::symmetric(16.0, 6.0)),
+            )
             .show(ctx, |ui| {
                 let snap = self.snap.lock().unwrap().clone();
+                let filter_lc = self.usage_filter.trim().to_lowercase();
+                let total_apps_count = snap.usage_per_app.len();
 
-                ui.horizontal(|ui| {
-                    ui.strong("Usage");
-                    ui.add_space(10.0);
-                    ui.weak(egui::RichText::new(self.period.label()).size(12.0).color(t.dim));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.weak(format!("total: {}", fmt_b(snap.usage_total)));
-                    });
-                });
-                ui.add_space(6.0);
-                if !snap.quotas.is_empty() {
-                    egui::Grid::new("quotas")
-                        .num_columns(5)
-                        .spacing([12.0, 4.0])
-                        .show(ui, |ui| {
-                            for q in &snap.quotas {
-                                let pct = (q.ratio * 100.0) as i32;
-                                let color = if q.ratio >= 1.0 {
-                                    t.danger
-                                } else if q.ratio >= 0.75 {
-                                    t.out_c
-                                } else {
-                                    t.in_c
-                                };
-                                ui.label(egui::RichText::new(&q.app_name).color(t.text));
-                                ui.weak(format!("{} · {}", q.period, fmt_b(q.limit)));
-                                let (rect, _) = ui
-                                    .allocate_exact_size(egui::vec2(160.0, 8.0), egui::Sense::hover());
-                                ui.painter().rect_filled(rect, 4.0, t.card2);
-                                ui.painter().rect_filled(
-                                    egui::Rect::from_min_size(
-                                        rect.left_top(),
-                                        egui::vec2(rect.width() * q.ratio.min(1.0) as f32, 8.0),
-                                    ),
-                                    4.0,
-                                    color,
-                                );
-                                ui.weak(format!(
-                                    "{} / {} ({}%)",
-                                    fmt_b(q.used),
-                                    fmt_b(q.limit),
-                                    pct
-                                ));
-                                if ui.button("del").on_hover_text("Delete quota").clicked() {
-                                    let mut url =
-                                        format!("{}/api/quotas?period={}", API, q.period);
-                                    if let Some(id) = q.app_id {
-                                        url.push_str(&format!("&appId={}", id));
-                                    }
-                                    let _ = ureq::delete(&url)
-                                        .timeout(Duration::from_secs(5))
-                                        .call();
-                                    let _ = self.tx.send(UiMsg::Refresh(self.tab, self.sel.clone(), self.period));
-                                }
-                                ui.end_row();
-                            }
-                        });
-                    ui.add_space(8.0);
+                let mut rows: Vec<UsageAppRow> = snap
+                    .usage_per_app
+                    .iter()
+                    .filter(|r| {
+                        filter_lc.is_empty() || r.name.to_lowercase().contains(&filter_lc)
+                    })
+                    .cloned()
+                    .collect();
+
+                let tie_break_usage = |a: &UsageAppRow, b: &UsageAppRow| -> std::cmp::Ordering {
+                    a.name
+                        .to_lowercase()
+                        .cmp(&b.name.to_lowercase())
+                        .then_with(|| a.name.cmp(&b.name))
+                        .then_with(|| a.id.cmp(&b.id))
+                };
+                match self.usage_sort {
+                    SortKey::Total | SortKey::Hosts => rows.sort_by(|a, b| {
+                        b.total_bytes
+                            .partial_cmp(&a.total_bytes)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                            .then_with(|| tie_break_usage(a, b))
+                    }),
+                    SortKey::Down => rows.sort_by(|a, b| {
+                        b.in_bytes
+                            .partial_cmp(&a.in_bytes)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                            .then_with(|| tie_break_usage(a, b))
+                    }),
+                    SortKey::Up => rows.sort_by(|a, b| {
+                        b.out_bytes
+                            .partial_cmp(&a.out_bytes)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                            .then_with(|| tie_break_usage(a, b))
+                    }),
+                    SortKey::Name => rows.sort_by(tie_break_usage),
                 }
 
-                ui.horizontal(|ui| {
-                    ui.weak("Set quota:");
-                    let app_label = if self.quota_app.is_empty() {
-                        "All apps (global)".to_string()
-                    } else {
-                        snap.all_apps
-                            .iter()
-                            .find(|(id, _)| id.to_string() == self.quota_app)
-                            .map(|(_, n)| n.clone())
-                            .unwrap_or_else(|| "app".to_string())
-                    };
-                    egui::ComboBox::from_id_source("quota_app")
-                        .selected_text(app_label)
-                        .width(170.0)
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(
-                                &mut self.quota_app,
-                                String::new(),
-                                "All apps (global)",
-                            );
-                            for (id, name) in &snap.all_apps {
-                                ui.selectable_value(&mut self.quota_app, id.to_string(), name);
-                            }
-                        });
-                    egui::ComboBox::from_id_source("quota_period")
-                        .selected_text(match self.quota_period.as_str() {
-                            "weekly" => "Weekly",
-                            "monthly" => "Monthly",
-                            _ => "Daily",
-                        })
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut self.quota_period, "daily".into(), "Daily");
-                            ui.selectable_value(&mut self.quota_period, "weekly".into(), "Weekly");
-                            ui.selectable_value(&mut self.quota_period, "monthly".into(), "Monthly");
-                        });
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.quota_value)
-                            .desired_width(70.0)
-                            .hint_text("Limit"),
-                    );
-                    egui::ComboBox::from_id_source("quota_unit")
-                        .selected_text(if self.quota_unit == 1073741824 { "GB" } else { "MB" })
-                        .width(60.0)
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut self.quota_unit, 1048576, "MB");
-                            ui.selectable_value(&mut self.quota_unit, 1073741824, "GB");
-                        });
-                    if ui.button("Set quota").clicked() {
-                        if let Ok(n) = self.quota_value.trim().parse::<f64>() {
-                            if n > 0.0 {
-                                let body = serde_json::json!({
-                                    "appId": if self.quota_app.is_empty() {
-                                        serde_json::Value::Null
-                                    } else {
-                                        serde_json::json!(self.quota_app.parse::<i64>().unwrap_or(0))
-                                    },
-                                    "period": self.quota_period,
-                                    "limitBytes": (n * self.quota_unit as f64) as i64,
-                                });
-                                let _ = ureq::post(&format!("{}/api/quotas", API))
-                                    .timeout(Duration::from_secs(5))
-                                    .send_json(body)
-                                    .ok();
-                                self.quota_value.clear();
-                                let _ = self.tx.send(UiMsg::Refresh(self.tab, self.sel.clone(), self.period));
-                            }
-                        }
-                    }
-                });
-                ui.add_space(6.0);
-                ui.separator();
-                ui.add_space(4.0);
+                let total_all = snap.usage_total.max(0.0);
+                let total_in = snap.usage_in.max(0.0);
+                let total_out = snap.usage_out.max(0.0);
+                let split_denom = (total_in + total_out).max(1.0);
+                let down_pct = (total_in / split_denom * 100.0).clamp(0.0, 100.0);
+                let up_pct = (total_out / split_denom * 100.0).clamp(0.0, 100.0);
+                let top_app = snap.usage_per_app.first().cloned();
+                let (ur_f, ur_t) = snap.usage_range;
+                let period_lbl = self.period.label();
 
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .max_height(380.0)
-                    .show(ui, |ui| {
-                        if snap.usage_per_app.is_empty() {
-                            ui.weak("no usage recorded in this period");
-                            return;
-                        }
-                        let max = snap
-                            .usage_per_app
-                            .iter()
-                            .map(|r| r.2)
-                            .fold(1.0_f64, f64::max);
-                        let (ur_f, ur_t) = snap.usage_range;
-                        for (id, name, bytes) in &snap.usage_per_app {
-                            let c = color_for(&id.to_string());
-                            ui.horizontal(|ui| {
-                                if let Some(tex) =
-                                    self.app_icon_opt(ui.ctx(), *id, name)
-                                {
-                                    ui.add(
-                                        egui::Image::from_texture(&tex)
-                                            .max_size(egui::vec2(17.0, 17.0)),
+                // Top header bar
+                ui.horizontal(|ui| {
+                    ui.strong(egui::RichText::new("Usage").size(15.0).color(t.text));
+                    ui.add_space(6.0);
+                    egui::Frame::none()
+                        .fill(inset_fill)
+                        .stroke(egui::Stroke::new(1.0, card_border))
+                        .rounding(4.0)
+                        .inner_margin(egui::Margin::symmetric(7.0, 2.0))
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new(period_lbl)
+                                    .size(11.0)
+                                    .color(t.accent),
+                            );
+                        });
+                    ui.add_space(8.0);
+                    let count_text = if filter_lc.is_empty() {
+                        format!("{} apps", total_apps_count)
+                    } else {
+                        format!("{} of {} apps", rows.len(), total_apps_count)
+                    };
+                    ui.label(egui::RichText::new(count_text).size(11.5).color(t.dim));
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        egui::ComboBox::from_id_source("usage_sort")
+                            .selected_text(self.usage_sort.label())
+                            .width(96.0)
+                            .show_ui(ui, |ui| {
+                                for k in SortKey::all() {
+                                    ui.selectable_value(&mut self.usage_sort, k, k.label());
+                                }
+                            });
+                        ui.weak(egui::RichText::new("Sort").size(12.0).color(t.dim));
+                        ui.add_space(14.0);
+                        ui.label(egui::RichText::new("Download").size(11.5).color(t.dim));
+                        let (dr, _) =
+                            ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                        ui.painter().circle_filled(dr.center(), 3.5, t.in_c);
+                        ui.add_space(8.0);
+                        ui.label(egui::RichText::new("Upload").size(11.5).color(t.dim));
+                        let (ur, _) =
+                            ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                        ui.painter().circle_filled(ur.center(), 3.5, t.out_c);
+                    });
+                });
+                ui.add_space(8.0);
+
+                // KPI card helper
+                let kpi_card_frame = || {
+                    egui::Frame::none()
+                        .fill(t.plot_bg)
+                        .stroke(egui::Stroke::new(1.0, card_border))
+                        .rounding(8.0)
+                        .inner_margin(egui::Margin::symmetric(14.0, 10.0))
+                };
+
+                let draw_kpi_total = |ui: &mut egui::Ui, w: f32| {
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(w, 74.0),
+                        egui::Layout::top_down(egui::Align::LEFT),
+                        |ui| {
+                            kpi_card_frame().show(ui, |ui| {
+                                ui.set_min_width((w - 28.0).max(80.0));
+                                ui.set_min_height(54.0);
+                                ui.label(
+                                    egui::RichText::new("TOTAL TRAFFIC")
+                                        .size(10.0)
+                                        .strong()
+                                        .color(t.dim),
+                                );
+                                ui.add_space(2.0);
+                                ui.label(
+                                    egui::RichText::new(fmt_b(total_all))
+                                        .size(20.0)
+                                        .strong()
+                                        .color(t.text),
+                                );
+                                ui.add_space(4.0);
+                                let bw = ui.available_width().max(20.0);
+                                let (br, _) = ui.allocate_exact_size(
+                                    egui::vec2(bw, 3.5),
+                                    egui::Sense::hover(),
+                                );
+                                let p = ui.painter();
+                                p.rect_filled(br, 1.75, bar_track);
+                                if total_in + total_out > 0.0 {
+                                    let up_w = br.width() * (total_out / split_denom) as f32;
+                                    let dn_w = (br.width() - up_w).max(0.0);
+                                    if up_w > 0.5 {
+                                        p.rect_filled(
+                                            egui::Rect::from_min_size(
+                                                br.left_top(),
+                                                egui::vec2(up_w, br.height()),
+                                            ),
+                                            1.75,
+                                            t.out_c,
+                                        );
+                                    }
+                                    if dn_w > 0.5 {
+                                        p.rect_filled(
+                                            egui::Rect::from_min_size(
+                                                egui::Pos2::new(br.left() + up_w, br.top()),
+                                                egui::vec2(dn_w, br.height()),
+                                            ),
+                                            1.75,
+                                            t.in_c,
+                                        );
+                                    }
+                                }
+                            });
+                        },
+                    );
+                };
+
+                let draw_kpi_dir =
+                    |ui: &mut egui::Ui, w: f32, title: &str, bytes: f64, pct: f64, col: egui::Color32| {
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(w, 74.0),
+                            egui::Layout::top_down(egui::Align::LEFT),
+                            |ui| {
+                                kpi_card_frame().show(ui, |ui| {
+                                    ui.set_min_width((w - 28.0).max(80.0));
+                                    ui.set_min_height(54.0);
+                                    ui.horizontal(|ui| {
+                                        let (dr, _) = ui.allocate_exact_size(
+                                            egui::vec2(7.0, 7.0),
+                                            egui::Sense::hover(),
+                                        );
+                                        ui.painter().circle_filled(dr.center(), 3.2, col);
+                                        ui.label(
+                                            egui::RichText::new(title)
+                                                .size(10.0)
+                                                .strong()
+                                                .color(t.dim),
+                                        );
+                                    });
+                                    ui.add_space(2.0);
+                                    ui.label(
+                                        egui::RichText::new(fmt_b(bytes))
+                                            .size(20.0)
+                                            .strong()
+                                            .color(col),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new(format!("{:.1}% of total", pct))
+                                            .size(10.5)
+                                            .color(t.dim),
+                                    );
+                                });
+                            },
+                        );
+                    };
+
+                let draw_kpi_top = |app: &mut PacketlyApp, ui: &mut egui::Ui, w: f32| {
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(w, 74.0),
+                        egui::Layout::top_down(egui::Align::LEFT),
+                        |ui| {
+                            kpi_card_frame().show(ui, |ui| {
+                                ui.set_min_width((w - 28.0).max(80.0));
+                                ui.set_min_height(54.0);
+                                ui.label(
+                                    egui::RichText::new("TOP APPLICATION")
+                                        .size(10.0)
+                                        .strong()
+                                        .color(t.dim),
+                                );
+                                ui.add_space(3.0);
+                                if let Some(ref top) = top_app {
+                                    let row_w = ui.available_width().max(40.0);
+                                    let (rr, rresp) = ui.allocate_exact_size(
+                                        egui::vec2(row_w, 22.0),
+                                        egui::Sense::click(),
+                                    );
+                                    let p = ui.painter_at(rr);
+                                    if rresp.hovered() {
+                                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                    }
+                                    let ir = egui::Rect::from_center_size(
+                                        egui::Pos2::new(rr.left() + 9.0, rr.center().y),
+                                        egui::vec2(18.0, 18.0),
+                                    );
+                                    if let Some(tex) = app.app_icon_opt(ui.ctx(), top.id, &top.name)
+                                    {
+                                        paint_icon_fit(&p, &tex, ir);
+                                    } else {
+                                        p.rect_filled(ir, 3.5, inset_fill);
+                                        p.rect_stroke(ir, 3.5, egui::Stroke::new(0.8, t.border));
+                                    }
+                                    let mut job = egui::text::LayoutJob::default();
+                                    job.append(
+                                        &top.name,
+                                        0.0,
+                                        egui::TextFormat {
+                                            font_id: egui::FontId::proportional(14.0),
+                                            color: t.text,
+                                            ..Default::default()
+                                        },
+                                    );
+                                    job.wrap.max_width = (row_w - 26.0).max(20.0);
+                                    job.wrap.max_rows = 1;
+                                    job.wrap.break_anywhere = true;
+                                    job.wrap.overflow_character = Some('…');
+                                    let g = p.layout_job(job);
+                                    p.galley(
+                                        egui::Pos2::new(
+                                            rr.left() + 24.0,
+                                            rr.center().y - g.size().y * 0.5,
+                                        ),
+                                        g,
+                                        t.text,
+                                    );
+                                    if rresp.clicked() {
+                                        let _ = app.tx.send(UiMsg::AppDetail(Some((
+                                            top.id, ur_f, ur_t,
+                                        ))));
+                                    }
+                                    let share = if total_all > 0.0 {
+                                        (top.total_bytes / total_all * 100.0).clamp(0.0, 100.0)
+                                    } else {
+                                        0.0
+                                    };
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "{} · {:.1}% of total",
+                                            fmt_b(top.total_bytes),
+                                            share
+                                        ))
+                                        .size(10.5)
+                                        .color(t.dim),
                                     );
                                 } else {
-                                    ui.colored_label(c, "●");
+                                    ui.label(
+                                        egui::RichText::new("—").size(18.0).color(t.dim),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new("No activity yet")
+                                            .size(10.5)
+                                            .color(t.dim),
+                                    );
                                 }
-                                let lbl = ui.add(
-                                    egui::Label::new(egui::RichText::new(name).color(t.text))
-                                        .sense(egui::Sense::click()),
+                            });
+                        },
+                    );
+                };
+
+                // Applications breakdown card renderer
+                let draw_apps_card = |app: &mut PacketlyApp, ui: &mut egui::Ui, w: f32, h: f32| {
+                    egui::Frame::none()
+                        .fill(t.plot_bg)
+                        .stroke(egui::Stroke::new(1.0, card_border))
+                        .rounding(8.0)
+                        .inner_margin(egui::Margin::symmetric(14.0, 12.0))
+                        .show(ui, |ui| {
+                            ui.set_min_width((w - 28.0).max(160.0));
+                            ui.set_min_height((h - 24.0).max(140.0));
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new("Applications")
+                                        .size(13.5)
+                                        .strong()
+                                        .color(t.text),
                                 );
-                                if lbl.hovered() {
-                                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                                }
-                                if lbl.clicked() {
-                                    let _ = self.tx.send(UiMsg::AppDetail(Some((
-                                        *id, ur_f, ur_t,
-                                    ))));
-                                }
+                                ui.add_space(6.0);
+                                ui.label(
+                                    egui::RichText::new(format!("{}", rows.len()))
+                                        .size(11.0)
+                                        .color(t.dim),
+                                );
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
-                                        ui.weak(fmt_b(*bytes));
+                                        ui.label(
+                                            egui::RichText::new("Share · Total")
+                                                .size(11.0)
+                                                .color(t.dim),
+                                        );
                                     },
                                 );
                             });
-                            let rect = ui.available_rect_before_wrap();
-                            ui.painter().rect_filled(
-                                egui::Rect::from_min_size(
-                                    egui::Pos2::new(rect.left(), rect.top()),
-                                    egui::vec2(rect.width() * (bytes / max).min(1.0) as f32, 2.5),
-                                ),
-                                1.0,
-                                Theme::alpha(c, 170),
+                            ui.add_space(5.0);
+                            let sep = ui.available_rect_before_wrap();
+                            ui.painter().line_segment(
+                                [
+                                    egui::Pos2::new(sep.left(), sep.top()),
+                                    egui::Pos2::new(sep.right(), sep.top()),
+                                ],
+                                egui::Stroke::new(1.0, divider_col),
                             );
                             ui.add_space(6.0);
-                        }
+
+                            let scroll_h = (h - 58.0).max(120.0);
+                            egui::ScrollArea::vertical()
+                                .id_source("usage_apps_scroll")
+                                .max_height(scroll_h)
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    if rows.is_empty() {
+                                        ui.add_space(18.0);
+                                        ui.label(
+                                            egui::RichText::new(if filter_lc.is_empty() {
+                                                "No usage recorded in this period yet."
+                                            } else {
+                                                "No applications match your filter."
+                                            })
+                                            .size(12.5)
+                                            .color(t.dim),
+                                        );
+                                        return;
+                                    }
+
+                                    let max_row = rows
+                                        .iter()
+                                        .map(|r| r.total_bytes)
+                                        .fold(1.0_f64, f64::max);
+                                    let row_w = (ui.available_width() - 4.0).max(180.0);
+                                    let row_h = 38.0_f32;
+
+                                    for (idx, row) in rows.iter().enumerate() {
+                                        let (rect, resp) = ui.allocate_exact_size(
+                                            egui::vec2(row_w, row_h),
+                                            egui::Sense::click(),
+                                        );
+                                        let painter = ui.painter_at(rect);
+
+                                        if resp.hovered() {
+                                            painter.rect_filled(rect, 5.0, hover_fill);
+                                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                        }
+
+                                        let pad_x = 6.0_f32;
+                                        let cy = rect.top() + 14.5;
+
+                                        // Rank index
+                                        let rank_text = format!("{}", idx + 1);
+                                        painter.text(
+                                            egui::Pos2::new(rect.left() + pad_x + 14.0, cy),
+                                            egui::Align2::RIGHT_CENTER,
+                                            rank_text,
+                                            egui::FontId::proportional(11.0),
+                                            t.dim,
+                                        );
+
+                                        // App icon (19x19)
+                                        let icon_x = rect.left() + pad_x + 22.0;
+                                        let ir = egui::Rect::from_center_size(
+                                            egui::Pos2::new(icon_x + 9.5, cy),
+                                            egui::vec2(19.0, 19.0),
+                                        );
+                                        if let Some(tex) =
+                                            app.app_icon_opt(ui.ctx(), row.id, &row.name)
+                                        {
+                                            paint_icon_fit(&painter, &tex, ir);
+                                        } else {
+                                            let badge_col = color_for(&row.id.to_string());
+                                            painter.rect_filled(
+                                                ir,
+                                                4.0,
+                                                srgb_alpha(badge_col, 0.22),
+                                            );
+                                            painter.rect_stroke(
+                                                ir,
+                                                4.0,
+                                                egui::Stroke::new(
+                                                    0.8,
+                                                    srgb_alpha(badge_col, 0.55),
+                                                ),
+                                            );
+                                            let ch = row
+                                                .name
+                                                .chars()
+                                                .next()
+                                                .unwrap_or('?')
+                                                .to_uppercase()
+                                                .to_string();
+                                            painter.text(
+                                                ir.center(),
+                                                egui::Align2::CENTER_CENTER,
+                                                ch,
+                                                egui::FontId::proportional(10.5),
+                                                badge_col,
+                                            );
+                                        }
+
+                                        let text_left = icon_x + 26.0;
+
+                                        // Right-aligned byte total
+                                        let val_galley = painter.layout_no_wrap(
+                                            fmt_b(row.total_bytes),
+                                            egui::FontId::proportional(12.5),
+                                            val_color,
+                                        );
+                                        let val_x = rect.right() - pad_x - val_galley.size().x;
+                                        let val_h = val_galley.size().y;
+                                        painter.galley(
+                                            egui::Pos2::new(val_x, cy - val_h * 0.5),
+                                            val_galley,
+                                            val_color,
+                                        );
+
+                                        // Share percentage badge to the left of total
+                                        let share_pct = if total_all > 0.0 {
+                                            (row.total_bytes / total_all * 100.0).clamp(0.0, 100.0)
+                                        } else {
+                                            0.0
+                                        };
+                                        let share_str = if share_pct >= 0.1 {
+                                            format!("{:.1}%", share_pct)
+                                        } else {
+                                            "<0.1%".to_string()
+                                        };
+                                        let share_galley = painter.layout_no_wrap(
+                                            share_str,
+                                            egui::FontId::proportional(11.0),
+                                            t.dim,
+                                        );
+                                        let share_x = val_x - 10.0 - share_galley.size().x;
+                                        let share_h = share_galley.size().y;
+                                        if share_x > text_left + 44.0 {
+                                            painter.galley(
+                                                egui::Pos2::new(share_x, cy - share_h * 0.5),
+                                                share_galley,
+                                                t.dim,
+                                            );
+                                        }
+
+                                        // Single-line ellipsized app name
+                                        let name_right = if share_x > text_left + 44.0 {
+                                            share_x - 10.0
+                                        } else {
+                                            val_x - 10.0
+                                        };
+                                        let name_max_w = (name_right - text_left).max(24.0);
+                                        let mut job = egui::text::LayoutJob::default();
+                                        job.append(
+                                            &row.name,
+                                            0.0,
+                                            egui::TextFormat {
+                                                font_id: egui::FontId::proportional(12.5),
+                                                color: t.text,
+                                                ..Default::default()
+                                            },
+                                        );
+                                        job.wrap.max_width = name_max_w;
+                                        job.wrap.max_rows = 1;
+                                        job.wrap.break_anywhere = true;
+                                        job.wrap.overflow_character = Some('…');
+                                        let name_galley = painter.layout_job(job);
+                                        let name_h = name_galley.size().y;
+                                        painter.galley(
+                                            egui::Pos2::new(text_left, cy - name_h * 0.5),
+                                            name_galley,
+                                            t.text,
+                                        );
+
+                                        // Bottom proportional split Upload (blue) + Download (magenta) bar
+                                        let bar_x0 = text_left;
+                                        let bar_x1 = rect.right() - pad_x;
+                                        let bar_w = (bar_x1 - bar_x0).max(1.0);
+                                        let bar_y = rect.bottom() - 6.5;
+                                        let bar_h = 3.0_f32;
+                                        painter.rect_filled(
+                                            egui::Rect::from_min_size(
+                                                egui::Pos2::new(bar_x0, bar_y),
+                                                egui::vec2(bar_w, bar_h),
+                                            ),
+                                            1.5,
+                                            bar_track,
+                                        );
+                                        if row.total_bytes > 0.0 {
+                                            let ratio =
+                                                (row.total_bytes / max_row).clamp(0.0, 1.0) as f32;
+                                            let fill_w = (bar_w * ratio).max(3.5).min(bar_w);
+                                            let row_sum = (row.in_bytes + row.out_bytes).max(1.0);
+                                            let up_frac =
+                                                (row.out_bytes / row_sum).clamp(0.0, 1.0) as f32;
+                                            let up_w = fill_w * up_frac;
+                                            let dn_w = (fill_w - up_w).max(0.0);
+                                            if up_w > 0.5 {
+                                                painter.rect_filled(
+                                                    egui::Rect::from_min_size(
+                                                        egui::Pos2::new(bar_x0, bar_y),
+                                                        egui::vec2(up_w, bar_h),
+                                                    ),
+                                                    1.5,
+                                                    t.out_c,
+                                                );
+                                            }
+                                            if dn_w > 0.5 {
+                                                painter.rect_filled(
+                                                    egui::Rect::from_min_size(
+                                                        egui::Pos2::new(bar_x0 + up_w, bar_y),
+                                                        egui::vec2(dn_w, bar_h),
+                                                    ),
+                                                    1.5,
+                                                    t.in_c,
+                                                );
+                                            }
+                                        }
+
+                                        if resp.clicked() {
+                                            let _ = app.tx.send(UiMsg::AppDetail(Some((
+                                                row.id, ur_f, ur_t,
+                                            ))));
+                                        }
+
+                                        resp.on_hover_ui(|ui| {
+                                            ui.strong(
+                                                egui::RichText::new(&row.name)
+                                                    .size(12.5)
+                                                    .color(t.text),
+                                            );
+                                            ui.add_space(2.0);
+                                            ui.horizontal(|ui| {
+                                                ui.label(
+                                                    egui::RichText::new(format!(
+                                                        "↓ {}",
+                                                        fmt_b(row.in_bytes)
+                                                    ))
+                                                    .size(11.5)
+                                                    .color(t.in_c),
+                                                );
+                                                ui.label(
+                                                    egui::RichText::new(format!(
+                                                        "↑ {}",
+                                                        fmt_b(row.out_bytes)
+                                                    ))
+                                                    .size(11.5)
+                                                    .color(t.out_c),
+                                                );
+                                                ui.weak(
+                                                    egui::RichText::new(format!(
+                                                        "({:.1}% of total)",
+                                                        share_pct
+                                                    ))
+                                                    .size(11.0)
+                                                    .color(t.dim),
+                                                );
+                                            });
+                                            ui.label(
+                                                egui::RichText::new("Click for app details")
+                                                    .size(10.5)
+                                                    .color(t.dim),
+                                            );
+                                        });
+                                    }
+                                });
+                        });
+                };
+
+                // Top apps distribution donut card
+                let slice_palette = [
+                    t.in_c,
+                    t.out_c,
+                    egui::Color32::from_rgb(139, 92, 246),
+                    egui::Color32::from_rgb(45, 212, 191),
+                    egui::Color32::from_rgb(245, 158, 11),
+                    egui::Color32::from_rgb(100, 116, 139),
+                ];
+
+                let draw_donut_card = |app: &mut PacketlyApp, ui: &mut egui::Ui, w: f32| {
+                    egui::Frame::none()
+                        .fill(t.plot_bg)
+                        .stroke(egui::Stroke::new(1.0, card_border))
+                        .rounding(8.0)
+                        .inner_margin(egui::Margin::symmetric(14.0, 12.0))
+                        .show(ui, |ui| {
+                            ui.set_min_width((w - 28.0).max(160.0));
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new("Usage Distribution")
+                                        .size(13.5)
+                                        .strong()
+                                        .color(t.text),
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        ui.label(
+                                            egui::RichText::new("Top 5 + Other")
+                                                .size(11.0)
+                                                .color(t.dim),
+                                        );
+                                    },
+                                );
+                            });
+                            ui.add_space(5.0);
+                            let sep = ui.available_rect_before_wrap();
+                            ui.painter().line_segment(
+                                [
+                                    egui::Pos2::new(sep.left(), sep.top()),
+                                    egui::Pos2::new(sep.right(), sep.top()),
+                                ],
+                                egui::Stroke::new(1.0, divider_col),
+                            );
+                            ui.add_space(8.0);
+
+                            // Build slices: top 5 apps + "Other"
+                            let mut slices: Vec<(Option<i64>, String, f64, egui::Color32)> =
+                                Vec::new();
+                            let mut top_sum = 0.0_f64;
+                            for (i, a) in snap.usage_per_app.iter().take(5).enumerate() {
+                                if a.total_bytes > 0.0 {
+                                    slices.push((
+                                        Some(a.id),
+                                        a.name.clone(),
+                                        a.total_bytes,
+                                        slice_palette[i],
+                                    ));
+                                    top_sum += a.total_bytes;
+                                }
+                            }
+                            let other_b = (total_all - top_sum).max(0.0);
+                            if other_b > 0.5 && snap.usage_per_app.len() > 5 {
+                                slices.push((None, "Other".to_string(), other_b, slice_palette[5]));
+                            }
+                            let slice_total: f64 =
+                                slices.iter().map(|s| s.2).sum::<f64>().max(1.0);
+
+                            ui.horizontal_top(|ui| {
+                                // Vector donut ring (118x118)
+                                let ring_box = 118.0_f32;
+                                let (ring_rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(ring_box, ring_box),
+                                    egui::Sense::hover(),
+                                );
+                                let p = ui.painter_at(ring_rect);
+                                let center = ring_rect.center();
+                                let radius = 45.0_f32;
+                                let thick = 11.5_f32;
+                                p.circle_stroke(center, radius, egui::Stroke::new(thick, bar_track));
+
+                                if !slices.is_empty() && total_all > 0.0 {
+                                    let tau = std::f32::consts::TAU;
+                                    let gap = if slices.len() > 1 { 0.04_f32 } else { 0.0 };
+                                    let mut angle = -std::f32::consts::FRAC_PI_2;
+                                    for (_, _, bytes, col) in &slices {
+                                        let frac = (*bytes / slice_total) as f32;
+                                        let sweep = (frac * tau - gap).max(0.025);
+                                        let steps = ((sweep * 22.0).ceil() as usize).clamp(4, 72);
+                                        let mut pts = Vec::with_capacity(steps + 1);
+                                        for s in 0..=steps {
+                                            let a = angle + sweep * (s as f32 / steps as f32);
+                                            pts.push(egui::Pos2::new(
+                                                center.x + radius * a.cos(),
+                                                center.y + radius * a.sin(),
+                                            ));
+                                        }
+                                        p.add(egui::Shape::line(pts, egui::Stroke::new(thick, *col)));
+                                        angle += frac * tau;
+                                    }
+                                }
+
+                                // Centered metric inside donut hole
+                                p.text(
+                                    egui::Pos2::new(center.x, center.y - 6.0),
+                                    egui::Align2::CENTER_CENTER,
+                                    fmt_b(total_all),
+                                    egui::FontId::proportional(13.5),
+                                    t.text,
+                                );
+                                p.text(
+                                    egui::Pos2::new(center.x, center.y + 10.0),
+                                    egui::Align2::CENTER_CENTER,
+                                    "TOTAL",
+                                    egui::FontId::proportional(9.0),
+                                    t.dim,
+                                );
+
+                                ui.add_space(10.0);
+
+                                // Legend list
+                                let leg_w = (ui.available_width() - 2.0).max(90.0);
+                                ui.vertical(|ui| {
+                                    ui.set_min_width(leg_w);
+                                    if slices.is_empty() {
+                                        ui.add_space(36.0);
+                                        ui.label(
+                                            egui::RichText::new("No usage data yet")
+                                                .size(11.5)
+                                                .color(t.dim),
+                                        );
+                                    } else {
+                                        for (opt_id, name, bytes, col) in &slices {
+                                            let pct = (*bytes / slice_total * 100.0).clamp(0.0, 100.0);
+                                            let sense = if opt_id.is_some() {
+                                                egui::Sense::click()
+                                            } else {
+                                                egui::Sense::hover()
+                                            };
+                                            let (lr, lresp) = ui.allocate_exact_size(
+                                                egui::vec2(leg_w, 19.5),
+                                                sense,
+                                            );
+                                            let lp = ui.painter_at(lr);
+                                            if lresp.hovered() {
+                                                lp.rect_filled(lr, 3.5, hover_fill);
+                                                if opt_id.is_some() {
+                                                    ui.ctx().set_cursor_icon(
+                                                        egui::CursorIcon::PointingHand,
+                                                    );
+                                                }
+                                            }
+                                            lp.circle_filled(
+                                                egui::Pos2::new(lr.left() + 6.0, lr.center().y),
+                                                3.5,
+                                                *col,
+                                            );
+                                            let pct_g = lp.layout_no_wrap(
+                                                format!("{:.1}%", pct),
+                                                egui::FontId::proportional(11.0),
+                                                val_color,
+                                            );
+                                            let pct_x = lr.right() - 4.0 - pct_g.size().x;
+                                            let pct_h = pct_g.size().y;
+                                            lp.galley(
+                                                egui::Pos2::new(pct_x, lr.center().y - pct_h * 0.5),
+                                                pct_g,
+                                                val_color,
+                                            );
+                                            let mut job = egui::text::LayoutJob::default();
+                                            job.append(
+                                                name,
+                                                0.0,
+                                                egui::TextFormat {
+                                                    font_id: egui::FontId::proportional(11.5),
+                                                    color: t.text,
+                                                    ..Default::default()
+                                                },
+                                            );
+                                            job.wrap.max_width = (pct_x - lr.left() - 22.0).max(20.0);
+                                            job.wrap.max_rows = 1;
+                                            job.wrap.break_anywhere = true;
+                                            job.wrap.overflow_character = Some('…');
+                                            let ng = lp.layout_job(job);
+                                            lp.galley(
+                                                egui::Pos2::new(
+                                                    lr.left() + 15.0,
+                                                    lr.center().y - ng.size().y * 0.5,
+                                                ),
+                                                ng,
+                                                t.text,
+                                            );
+                                            if let Some(aid) = opt_id {
+                                                if lresp.clicked() {
+                                                    let _ = app.tx.send(UiMsg::AppDetail(Some((
+                                                        *aid, ur_f, ur_t,
+                                                    ))));
+                                                }
+                                            }
+                                            lresp.on_hover_text(format!(
+                                                "{} — {} ({:.1}%)",
+                                                name,
+                                                fmt_b(*bytes),
+                                                pct
+                                            ));
+                                        }
+                                    }
+                                });
+                            });
+                        });
+                };
+
+                // Data Quotas manager card
+                let draw_quotas_card = |app: &mut PacketlyApp, ui: &mut egui::Ui, w: f32, min_h: f32| {
+                    egui::Frame::none()
+                        .fill(t.plot_bg)
+                        .stroke(egui::Stroke::new(1.0, card_border))
+                        .rounding(8.0)
+                        .inner_margin(egui::Margin::symmetric(14.0, 12.0))
+                        .show(ui, |ui| {
+                            ui.set_min_width((w - 28.0).max(160.0));
+                            ui.set_min_height((min_h - 24.0).max(160.0));
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new("Data Quotas")
+                                        .size(13.5)
+                                        .strong()
+                                        .color(t.text),
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        let badge = if snap.quotas.is_empty() {
+                                            "None active".to_string()
+                                        } else {
+                                            format!("{} active", snap.quotas.len())
+                                        };
+                                        ui.label(
+                                            egui::RichText::new(badge).size(11.0).color(t.dim),
+                                        );
+                                    },
+                                );
+                            });
+                            ui.add_space(5.0);
+                            let sep = ui.available_rect_before_wrap();
+                            ui.painter().line_segment(
+                                [
+                                    egui::Pos2::new(sep.left(), sep.top()),
+                                    egui::Pos2::new(sep.right(), sep.top()),
+                                ],
+                                egui::Stroke::new(1.0, divider_col),
+                            );
+                            ui.add_space(6.0);
+
+                            // Active quota cards list
+                            let list_max_h = (min_h - 165.0).max(76.0);
+                            egui::ScrollArea::vertical()
+                                .id_source("usage_quotas_scroll")
+                                .max_height(list_max_h)
+                                .auto_shrink([false, true])
+                                .show(ui, |ui| {
+                                    if snap.quotas.is_empty() {
+                                        ui.label(
+                                            egui::RichText::new(
+                                                "No data limits configured. Add a daily, weekly, or monthly cap below.",
+                                            )
+                                            .size(11.5)
+                                            .color(t.dim),
+                                        );
+                                    } else {
+                                        let emerald = egui::Color32::from_rgb(52, 211, 153);
+                                        let amber = egui::Color32::from_rgb(245, 158, 11);
+                                        for q in &snap.quotas {
+                                            let pct = (q.ratio * 100.0).round() as i32;
+                                            let bar_col = if q.ratio >= 1.0 {
+                                                t.danger
+                                            } else if q.ratio >= 0.75 {
+                                                amber
+                                            } else {
+                                                emerald
+                                            };
+                                            egui::Frame::none()
+                                                .fill(inset_fill)
+                                                .stroke(egui::Stroke::new(1.0, card_border))
+                                                .rounding(6.0)
+                                                .inner_margin(egui::Margin::symmetric(10.0, 8.0))
+                                                .show(ui, |ui| {
+                                                    ui.horizontal(|ui| {
+                                                        if let Some(aid) = q.app_id {
+                                                            let (ir, _) = ui.allocate_exact_size(
+                                                                egui::vec2(15.0, 15.0),
+                                                                egui::Sense::hover(),
+                                                            );
+                                                            if let Some(tex) = app.app_icon_opt(
+                                                                ui.ctx(),
+                                                                aid,
+                                                                &q.app_name,
+                                                            ) {
+                                                                paint_icon_fit(
+                                                                    ui.painter(),
+                                                                    &tex,
+                                                                    ir,
+                                                                );
+                                                            } else {
+                                                                draw_globe_icon(
+                                                                    ui.painter(),
+                                                                    &ir,
+                                                                    t.dim,
+                                                                );
+                                                            }
+                                                        } else {
+                                                            let (ir, _) = ui.allocate_exact_size(
+                                                                egui::vec2(15.0, 15.0),
+                                                                egui::Sense::hover(),
+                                                            );
+                                                            draw_globe_icon(
+                                                                ui.painter(),
+                                                                &ir,
+                                                                t.accent,
+                                                            );
+                                                        }
+                                                        ui.label(
+                                                            egui::RichText::new(&q.app_name)
+                                                                .size(12.0)
+                                                                .strong()
+                                                                .color(t.text),
+                                                        );
+                                                        ui.label(
+                                                            egui::RichText::new(
+                                                                q.period.to_uppercase(),
+                                                            )
+                                                            .size(9.5)
+                                                            .color(t.dim),
+                                                        );
+                                                        ui.with_layout(
+                                                            egui::Layout::right_to_left(
+                                                                egui::Align::Center,
+                                                            ),
+                                                            |ui| {
+                                                                if ui
+                                                                    .small_button("✕")
+                                                                    .on_hover_text("Delete quota")
+                                                                    .clicked()
+                                                                {
+                                                                    let mut url = format!(
+                                                                        "{}/api/quotas?period={}",
+                                                                        API, q.period
+                                                                    );
+                                                                    if let Some(id) = q.app_id {
+                                                                        url.push_str(&format!(
+                                                                            "&appId={}",
+                                                                            id
+                                                                        ));
+                                                                    }
+                                                                    let _ = ureq::delete(&url)
+                                                                        .timeout(
+                                                                            Duration::from_secs(5),
+                                                                        )
+                                                                        .call();
+                                                                    let _ = app.tx.send(
+                                                                        UiMsg::Refresh(
+                                                                            app.tab,
+                                                                            app.sel.clone(),
+                                                                            app.period,
+                                                                        ),
+                                                                    );
+                                                                }
+                                                            },
+                                                        );
+                                                    });
+                                                    ui.add_space(5.0);
+                                                    let bw = ui.available_width().max(40.0);
+                                                    let (br, _) = ui.allocate_exact_size(
+                                                        egui::vec2(bw, 5.5),
+                                                        egui::Sense::hover(),
+                                                    );
+                                                    let p = ui.painter();
+                                                    p.rect_filled(br, 2.75, bar_track);
+                                                    let fill_w = (br.width()
+                                                        * q.ratio.clamp(0.0, 1.0) as f32)
+                                                        .max(if q.used > 0.0 { 3.0 } else { 0.0 })
+                                                        .min(br.width());
+                                                    if fill_w > 0.5 {
+                                                        p.rect_filled(
+                                                            egui::Rect::from_min_size(
+                                                                br.left_top(),
+                                                                egui::vec2(fill_w, br.height()),
+                                                            ),
+                                                            2.75,
+                                                            bar_col,
+                                                        );
+                                                    }
+                                                    ui.add_space(4.0);
+                                                    ui.horizontal(|ui| {
+                                                        ui.label(
+                                                            egui::RichText::new(format!(
+                                                                "{} / {}",
+                                                                fmt_b(q.used),
+                                                                fmt_b(q.limit)
+                                                            ))
+                                                            .size(11.0)
+                                                            .color(t.dim),
+                                                        );
+                                                        ui.with_layout(
+                                                            egui::Layout::right_to_left(
+                                                                egui::Align::Center,
+                                                            ),
+                                                            |ui| {
+                                                                let status_txt = if q.ratio >= 1.0 {
+                                                                    format!("OVER · {}%", pct)
+                                                                } else {
+                                                                    format!("{}%", pct)
+                                                                };
+                                                                ui.label(
+                                                                    egui::RichText::new(status_txt)
+                                                                        .size(11.0)
+                                                                        .strong()
+                                                                        .color(bar_col),
+                                                                );
+                                                            },
+                                                        );
+                                                    });
+                                                });
+                                            ui.add_space(6.0);
+                                        }
+                                    }
+                                });
+
+                            ui.add_space(6.0);
+                            let sep2 = ui.available_rect_before_wrap();
+                            ui.painter().line_segment(
+                                [
+                                    egui::Pos2::new(sep2.left(), sep2.top()),
+                                    egui::Pos2::new(sep2.right(), sep2.top()),
+                                ],
+                                egui::Stroke::new(1.0, divider_col),
+                            );
+                            ui.add_space(8.0);
+
+                            // Add / Update Quota form
+                            ui.label(
+                                egui::RichText::new("SET / UPDATE QUOTA")
+                                    .size(10.0)
+                                    .strong()
+                                    .color(t.dim),
+                            );
+                            ui.add_space(4.0);
+
+                            let app_label = if app.quota_app.is_empty() {
+                                "All apps (global)".to_string()
+                            } else {
+                                snap.all_apps
+                                    .iter()
+                                    .find(|(id, _)| id.to_string() == app.quota_app)
+                                    .map(|(_, n)| n.clone())
+                                    .unwrap_or_else(|| "Selected app".to_string())
+                            };
+                            let full_w = (ui.available_width() - 4.0).max(140.0);
+                            egui::ComboBox::from_id_source("quota_app")
+                                .selected_text(app_label)
+                                .width(full_w)
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(
+                                        &mut app.quota_app,
+                                        String::new(),
+                                        "All apps (global)",
+                                    );
+                                    for (id, name) in &snap.all_apps {
+                                        ui.selectable_value(
+                                            &mut app.quota_app,
+                                            id.to_string(),
+                                            name,
+                                        );
+                                    }
+                                });
+                            ui.add_space(5.0);
+                            let mut submit_quota = false;
+                            ui.horizontal(|ui| {
+                                egui::ComboBox::from_id_source("quota_period")
+                                    .selected_text(match app.quota_period.as_str() {
+                                        "weekly" => "Weekly",
+                                        "monthly" => "Monthly",
+                                        _ => "Daily",
+                                    })
+                                    .width(78.0)
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(
+                                            &mut app.quota_period,
+                                            "daily".into(),
+                                            "Daily",
+                                        );
+                                        ui.selectable_value(
+                                            &mut app.quota_period,
+                                            "weekly".into(),
+                                            "Weekly",
+                                        );
+                                        ui.selectable_value(
+                                            &mut app.quota_period,
+                                            "monthly".into(),
+                                            "Monthly",
+                                        );
+                                    });
+                                let te = ui.add(
+                                    egui::TextEdit::singleline(&mut app.quota_value)
+                                        .desired_width(64.0)
+                                        .hint_text("Limit"),
+                                );
+                                if te.lost_focus()
+                                    && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                                {
+                                    submit_quota = true;
+                                }
+                                egui::ComboBox::from_id_source("quota_unit")
+                                    .selected_text(if app.quota_unit == 1073741824 {
+                                        "GB"
+                                    } else {
+                                        "MB"
+                                    })
+                                    .width(50.0)
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(&mut app.quota_unit, 1048576, "MB");
+                                        ui.selectable_value(&mut app.quota_unit, 1073741824, "GB");
+                                    });
+                                let btn = egui::Button::new(
+                                    egui::RichText::new("Set")
+                                        .color(egui::Color32::WHITE)
+                                        .strong(),
+                                )
+                                .fill(t.accent);
+                                if ui.add(btn).clicked() {
+                                    submit_quota = true;
+                                }
+                            });
+
+                            if submit_quota {
+                                match app.quota_value.trim().parse::<f64>() {
+                                    Ok(n) if n > 0.0 && n.is_finite() => {
+                                        let body = serde_json::json!({
+                                            "appId": if app.quota_app.is_empty() {
+                                                serde_json::Value::Null
+                                            } else {
+                                                serde_json::json!(app.quota_app.parse::<i64>().unwrap_or(0))
+                                            },
+                                            "period": app.quota_period,
+                                            "limitBytes": (n * app.quota_unit as f64) as i64,
+                                        });
+                                        let _ = ureq::post(&format!("{}/api/quotas", API))
+                                            .timeout(Duration::from_secs(5))
+                                            .send_json(body)
+                                            .ok();
+                                        app.quota_value.clear();
+                                        app.quota_err = None;
+                                        let _ = app.tx.send(UiMsg::Refresh(
+                                            app.tab,
+                                            app.sel.clone(),
+                                            app.period,
+                                        ));
+                                    }
+                                    _ => {
+                                        app.quota_err =
+                                            Some("Enter a positive number (e.g. 5 or 500)".into());
+                                    }
+                                }
+                            }
+                            if let Some(ref err) = app.quota_err {
+                                ui.add_space(3.0);
+                                ui.label(
+                                    egui::RichText::new(err.as_str())
+                                        .size(11.0)
+                                        .color(t.danger),
+                                );
+                            }
+                        });
+                };
+
+                // Responsive master layout
+                let avail_w = ui.available_width();
+                let gap = 12.0_f32;
+
+                if avail_w >= 860.0 {
+                    // 4-up KPI summary strip
+                    let kpi_w = ((avail_w - gap * 3.0) / 4.0).max(160.0);
+                    ui.horizontal_top(|ui| {
+                        ui.spacing_mut().item_spacing.x = gap;
+                        draw_kpi_total(ui, kpi_w);
+                        draw_kpi_dir(ui, kpi_w, "DOWNLOAD", total_in, down_pct, t.in_c);
+                        draw_kpi_dir(ui, kpi_w, "UPLOAD", total_out, up_pct, t.out_c);
+                        draw_kpi_top(self, ui, kpi_w);
                     });
+                    ui.add_space(12.0);
+
+                    // 2-column main workspace (62% Applications | 38% Donut + Quotas)
+                    let main_h = ui.available_height().max(320.0);
+                    let left_w = ((avail_w - gap) * 0.61).max(340.0);
+                    let right_w = (avail_w - gap - left_w).max(260.0);
+                    ui.horizontal_top(|ui| {
+                        ui.spacing_mut().item_spacing.x = gap;
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(left_w, main_h),
+                            egui::Layout::top_down(egui::Align::LEFT),
+                            |ui| {
+                                draw_apps_card(self, ui, left_w, main_h);
+                            },
+                        );
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(right_w, main_h),
+                            egui::Layout::top_down(egui::Align::LEFT),
+                            |ui| {
+                                draw_donut_card(self, ui, right_w);
+                                ui.add_space(12.0);
+                                let rem_h = ui.available_height().max(180.0);
+                                draw_quotas_card(self, ui, right_w, rem_h);
+                            },
+                        );
+                    });
+                } else {
+                    // Narrow responsive stacked layout
+                    egui::ScrollArea::vertical()
+                        .id_source("usage_narrow_scroll")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            let w = ui.available_width();
+                            let kpi_w = ((w - gap) / 2.0).max(140.0);
+                            ui.horizontal_top(|ui| {
+                                ui.spacing_mut().item_spacing.x = gap;
+                                draw_kpi_total(ui, kpi_w);
+                                draw_kpi_dir(ui, kpi_w, "DOWNLOAD", total_in, down_pct, t.in_c);
+                            });
+                            ui.add_space(8.0);
+                            ui.horizontal_top(|ui| {
+                                ui.spacing_mut().item_spacing.x = gap;
+                                draw_kpi_dir(ui, kpi_w, "UPLOAD", total_out, up_pct, t.out_c);
+                                draw_kpi_top(self, ui, kpi_w);
+                            });
+                            ui.add_space(12.0);
+                            draw_donut_card(self, ui, w);
+                            ui.add_space(12.0);
+                            draw_quotas_card(self, ui, w, 240.0);
+                            ui.add_space(12.0);
+                            draw_apps_card(self, ui, w, 360.0);
+                        });
+                }
             });
-}
+    }
 
     fn alerts_tab(&mut self, ctx: &egui::Context) {
         let t = self.theme();
@@ -4792,7 +5969,7 @@ fn main() -> eframe::Result {
         let snap = snap.clone();
         let ui_ctx = ui_ctx.clone();
         let mut icon_cache: HashMap<i64, Vec<u8>> = HashMap::new();
-        let mut icon_failed: HashSet<i64> = HashSet::new();
+        let mut icon_retry: HashMap<i64, (u8, std::time::Instant)> = HashMap::new();
         std::thread::spawn(move || {
             let mut tab = Tab::Graph;
             let mut sel = RangeSel::Preset(Range::M5);
@@ -4802,9 +5979,12 @@ fn main() -> eframe::Result {
             let mut paused_dirty = false;
             let mut tick: u64 = 0;
             let mut last_fetch_dur = Duration::ZERO;
+            let mut icons_pending = false;
             loop {
                 let timeout = if tick == 0 {
                     Duration::from_millis(1)
+                } else if icons_pending {
+                    Duration::from_millis(150)
                 } else {
                     sel.refresh().saturating_sub(last_fetch_dur)
                 };
@@ -4816,6 +5996,7 @@ fn main() -> eframe::Result {
                             period = p;
                             sel_data = None;
                             app_detail_req = None;
+                            icon_retry.clear();
                             tick = 0;
                         }
                         UiMsg::AppDetail(s) => {
@@ -4933,22 +6114,54 @@ fn main() -> eframe::Result {
                     }
                     app_detail_req = None;
                 }
+                icons_pending = false;
                 if let Some(fr) = fresh.as_mut() {
                     fr.sel = sel_data.clone();
-                    let mut want: Vec<i64> = fr.apps.iter().map(|a| a.id).collect();
-                    want.extend(fr.usage_per_app.iter().map(|r| r.0));
-                    want.sort_unstable();
-                    want.dedup();
+                    // Preserve display priority (top-usage apps first) while deduplicating.
+                    let mut seen: HashSet<i64> = HashSet::new();
+                    let mut want: Vec<i64> = Vec::new();
+                    let mut push_id = |id: i64| {
+                        if id > 0 && seen.insert(id) {
+                            want.push(id);
+                        }
+                    };
+                    for a in &fr.apps {
+                        push_id(a.id);
+                    }
+                    for r in &fr.usage_per_app {
+                        push_id(r.id);
+                    }
+                    for q in &fr.quotas {
+                        if let Some(id) = q.app_id {
+                            push_id(id);
+                        }
+                    }
+                    if let Some(ref d) = fr.app_detail {
+                        push_id(d.app_id);
+                    }
+                    if let Some(ref s) = fr.sel {
+                        for a in &s.apps {
+                            push_id(a.app_id);
+                        }
+                    }
+                    let now_inst = std::time::Instant::now();
                     let mut fetched = 0;
                     for id in want {
-                        if fetched >= 12 {
-                            break;
-                        }
-                        if icon_cache.contains_key(&id) || icon_failed.contains(&id) {
+                        if icon_cache.contains_key(&id) {
                             continue;
                         }
+                        if let Some(&(attempts, next_at)) = icon_retry.get(&id) {
+                            if attempts >= 3 || now_inst < next_at {
+                                continue;
+                            }
+                        }
+                        if fetched >= 40 {
+                            icons_pending = true;
+                            break;
+                        }
+                        fetched += 1;
                         match ureq::get(&format!("{}/api/icon?app_id={}", API, id))
-                            .timeout(Duration::from_secs(4))
+                            .timeout(Duration::from_secs(3))
                             .call()
                         {
                             Ok(resp) => {
@@ -4963,14 +6176,43 @@ fn main() -> eframe::Result {
                                         && !bytes.is_empty()
                                     {
                                         icon_cache.insert(id, bytes);
-                                        fetched += 1;
+                                        icon_retry.remove(&id);
+                                    } else {
+                                        let prev_n = icon_retry.get(&id).map(|x| x.0).unwrap_or(0);
+                                        let backoff = match prev_n {
+                                            0 => 3,
+                                            1 => 15,
+                                            _ => 60,
+                                        };
+                                        icon_retry.insert(
+                                            id,
+                                            (prev_n + 1, now_inst + Duration::from_secs(backoff)),
+                                        );
                                     }
                                 } else {
-                                    icon_failed.insert(id);
+                                    let prev_n = icon_retry.get(&id).map(|x| x.0).unwrap_or(0);
+                                    let backoff = match prev_n {
+                                        0 => 3,
+                                        1 => 15,
+                                        _ => 60,
+                                    };
+                                    icon_retry.insert(
+                                        id,
+                                        (prev_n + 1, now_inst + Duration::from_secs(backoff)),
+                                    );
                                 }
                             }
                             Err(_) => {
-                                icon_failed.insert(id);
+                                let prev_n = icon_retry.get(&id).map(|x| x.0).unwrap_or(0);
+                                let backoff = match prev_n {
+                                    0 => 3,
+                                    1 => 15,
+                                    _ => 60,
+                                };
+                                icon_retry.insert(
+                                    id,
+                                    (prev_n + 1, now_inst + Duration::from_secs(backoff)),
+                                );
                             }
                         }
                     }
@@ -5027,16 +6269,20 @@ fn main() -> eframe::Result {
                     mini: None,
                 }),
                 icon_tex: HashMap::new(),
+                icon_tex_hash: HashMap::new(),
                 quota_app: String::new(),
                 quota_period: "daily".to_string(),
                 quota_value: String::new(),
                 quota_unit: 1048576,
+                quota_err: None,
                 auto_scale,
                 scale_cap,
                 show_scale: false,
                 sel_drag: None,
                 traffic_sort: SortKey::Total,
                 traffic_filter: String::new(),
+                usage_sort: SortKey::Total,
+                usage_filter: String::new(),
                 sel_sort: SortKey::Total,
                 detail_tab: 0,
                 detail_sort: SortKey::Down,

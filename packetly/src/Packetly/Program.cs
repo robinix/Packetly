@@ -424,7 +424,7 @@ async Task<int> RunServeAsync(string dbPath, string mode, int port, bool elevate
     db.AppCreated += (id, path) =>
     {
         try { alerts.OnAppCreated(id, path); } catch { /* alerting must never break collection */ }
-        try { TryExtractIcon(db, (int)id, path); } catch { }
+        _ = Task.Run(() => { try { IconExtractor.TryExtract(db, (int)id, path); } catch { } });
     };
     Log($"process tracker: {tracker.Count} processes resolved ({tracker.LastDiagnostic})");
 
@@ -547,12 +547,26 @@ async Task<int> RunServeAsync(string dbPath, string mode, int port, bool elevate
 
     _ = Task.Run(async () =>
     {
-        // backfill icons for apps registered before this feature existed
-        try { await Task.Delay(5000, ct); } catch (OperationCanceledException) { return; }
-        foreach (var (appId, path) in db.AppsWithoutIcon(300))
+        // Fast startup backfill + one-time v2 icon upgrade (replaces legacy ExtractAssociatedIcon
+        // icons that could have broken alpha or wrong images with clean SHGetFileInfoW 32bpp PNGs).
+        try { await Task.Delay(1000, ct); } catch (OperationCanceledException) { return; }
+        if (db.GetMetaLong("icon_v2_migrated", 0) == 0)
         {
-            if (ct.IsCancellationRequested) return;
-            try { TryExtractIcon(db, appId, path); } catch { }
+            foreach (var (appId, path) in db.AllExeApps(500))
+            {
+                if (ct.IsCancellationRequested) return;
+                try { IconExtractor.TryExtract(db, appId, path); } catch { }
+            }
+            db.SetMetaLong("icon_v2_migrated", 1);
+        }
+        while (!ct.IsCancellationRequested)
+        {
+            foreach (var (appId, path) in db.AppsWithoutIcon(300))
+            {
+                if (ct.IsCancellationRequested) return;
+                try { IconExtractor.TryExtract(db, appId, path); } catch { }
+            }
+            try { await Task.Delay(300_000, ct); } catch (OperationCanceledException) { return; }
         }
     });
 
@@ -682,20 +696,6 @@ static void Log(string msg)
 }
 
 
-static void TryExtractIcon(Packetly.Storage.Db db, int appId, string path)
-{
-    try
-    {
-        if (!File.Exists(path) || !path.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)) return;
-        using var icon = System.Drawing.Icon.ExtractAssociatedIcon(path);
-        if (icon == null) return;
-        using var bmp = icon.ToBitmap();
-        using var ms = new MemoryStream();
-        bmp.Save(ms, System.Drawing.Imaging.ImageFormat.Png);
-        if (ms.Length > 0 && ms.Length < 200_000) db.SetAppIcon(appId, ms.ToArray());
-    }
-    catch { /* protected/unreadable exes simply get no icon */ }
-}
 
 static class LogGateHolder
 {
