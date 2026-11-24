@@ -2,6 +2,25 @@
 
 All notable changes to Packetly are documented here, including technical handoff notes for the local Windows build/verification agent.
 
+## v1.7.3 — Polished Responsive Traffic Panel Overhaul
+
+### User-facing changes
+- **GlassWire-inspired 4-column Traffic panel:** Replaced the sparse, multi-line stacked layout with a unified deep-navy (`#121a2a`) card containing 4 crisp equal-width columns (**Apps**, **Hosts**, **Traffic Type**, **Countries**) with subtle vertical dividers, item count headers, and an automatic **2×2 responsive grid** fallback on narrower windows.
+- **Uniform compact single-line rows & inline icons:** Removed the colored bullet dots and stacked flag sub-lines. Every row is now a crisp `32px` single-line entry with ellipsized labels, aligned right-hand byte totals, hover highlights, and inline left icons — real app icons (or clean monogram badges) for **Apps**, crisp bordered country flags / painted **Local Network (LAN)** badges / wireframe **Globe** icons for **Hosts** & **Countries**, and clean flush labels for **Traffic Type**.
+- **Split Upload/Download bars on every column:** Replaced random per-row colors with Packetly's signature dual-color proportional bar (**blue Upload + magenta Download**) along the bottom of every row across all 4 columns, including **Traffic Type** and **Countries** (which now preserve exact in/out byte splits), plus a live hover tooltip showing exact `↓ Download`, `↑ Upload`, and `% of top`.
+- **Full country & protocol names + expanded flag coverage:** Mapped 60+ ISO country codes (`IR` → `Iran`, `US` → `United States`, `DE` → `Germany`, etc.), expanded procedural flags (adding `BE`, `SG`, `KR`, `AU`, `BR`, `MY`, `AE`, `HK`, `PK`, `CH`, `CZ`, `TW`, `IL`, `MX`, `ZA`, `ID`, `TH`, `VN`, `SA`, `NZ`, `AR`, `CL`, `SK`, `HR`, `SI`), and expanded protocol labels (`HTTPS (SSL/TLS)`, `Domain Name System (DNS)`, `Multicast DNS (mDNS)`, etc.).
+- **Live search filter, larger lists & bottom summary bar:** Turned the top-bar `Filter` into a live search box that filters all 4 columns instantaneously, increased Traffic tab list limits (`100` apps / `120` hosts) and icon-fetch batching (`12`/tick), and brought the live bottom summary bar (ring gauge + Down/Up rates + WAN/LAN bars + mini-timeline) onto the Traffic tab.
+
+### Local agent handoff notes
+- **Files changed:**
+  - `packetly-ui/src/main.rs` — added `RowIcon`, `TrafficRow`, `sort_traffic_rows`, `group_totals`, `country_name`, `traffic_type_label`, `is_local_host`, `draw_lan_icon`, `draw_globe_icon`, expanded `flag_known`/`draw_flag`; added `traffic_filter` to `PacketlyApp` & `range_bar`; increased Traffic tab `/api/apps` (`limit=100`), `/api/hosts` (`limit=120`), and icon batch (`12`); rendered `summary_bar` on `Tab::Traffic`; overhauled `traffic_tab` with custom-painted `32px` rows, split Upload/Download bars, hover tooltips, and 4-col / 2×2 responsive layout.
+  - `packetly/src/Packetly/Api/AppApi.cs`, `packetly-ui/Cargo.toml`, `packetly-ui/Cargo.lock`, `package.json` — version bumped to `1.7.3`.
+- **Verify locally on Windows:**
+  1. `git pull`
+  2. `cargo build --release --manifest-path packetly-ui/Cargo.toml`
+  3. `dotnet build packetly/src/Packetly -c Release`
+  4. Open the **Traffic** tab in **Elite (navy)** theme: verify all 4 columns align cleanly inside the `#121a2a` card with inline flags/app icons/LAN badges, full country names, split blue+pink bars, hover highlights + tooltips, clickable App Details popup, live Filter typing, bottom summary bar, and responsive 2×2 switch when resizing the window narrower than `820px`. Also spot-check **Dark (AMOLED)** and **Light** themes.
+
 ## v1.7.2 — Rich Web-Matched Elite Theme Graph Colors & Deep Navy Background
 
 ### User-facing changes

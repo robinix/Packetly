@@ -509,30 +509,42 @@ impl SortKey {
     }
 }
 
-fn sort_rows(
-    rows: &mut [(String, Option<String>, egui::Color32, Option<i64>, f64, f64)],
-    key: SortKey,
-) {
+#[derive(Clone)]
+enum RowIcon {
+    App(i64),
+    Flag(String),
+    Lan,
+    Globe,
+    None,
+}
+
+#[derive(Clone)]
+struct TrafficRow {
+    label: String,
+    sub: Option<String>,
+    icon: RowIcon,
+    in_bytes: f64,
+    out_bytes: f64,
+}
+
+fn sort_traffic_rows(rows: &mut [TrafficRow], key: SortKey) {
     match key {
-        SortKey::Total => rows.sort_by(|a, b| {
-            (b.4 + b.5)
-                .partial_cmp(&(a.4 + a.5))
+        SortKey::Total | SortKey::Hosts => rows.sort_by(|a, b| {
+            (b.in_bytes + b.out_bytes)
+                .partial_cmp(&(a.in_bytes + a.out_bytes))
                 .unwrap_or(std::cmp::Ordering::Equal)
         }),
         SortKey::Down => rows.sort_by(|a, b| {
-            b.4.partial_cmp(&a.4)
+            b.in_bytes
+                .partial_cmp(&a.in_bytes)
                 .unwrap_or(std::cmp::Ordering::Equal)
         }),
         SortKey::Up => rows.sort_by(|a, b| {
-            b.5.partial_cmp(&a.5)
+            b.out_bytes
+                .partial_cmp(&a.out_bytes)
                 .unwrap_or(std::cmp::Ordering::Equal)
         }),
-        SortKey::Name => rows.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase())),
-        SortKey::Hosts => rows.sort_by(|a, b| {
-            (b.4 + b.5)
-                .partial_cmp(&(a.4 + a.5))
-                .unwrap_or(std::cmp::Ordering::Equal)
-        }),
+        SortKey::Name => rows.sort_by(|a, b| a.label.to_lowercase().cmp(&b.label.to_lowercase())),
     }
 }
 
@@ -1307,7 +1319,7 @@ fn fetch_snapshot(
     // Apps & hosts lists are only displayed on the Traffic tab — skip them on
     // Traffic Monitor so live 1-second polling stays sub-5ms.
     if matches!(tab, Tab::Traffic) {
-        if let Ok(d) = fetch_json(&format!("{}/api/apps?{}&limit=10", API, q)) {
+        if let Ok(d) = fetch_json(&format!("{}/api/apps?{}&limit=100", API, q)) {
             if let Some(arr) = d["apps"].as_array() {
                 snap.apps = arr
                     .iter()
@@ -1321,7 +1333,7 @@ fn fetch_snapshot(
                     .collect();
             }
         }
-        if let Ok(d) = fetch_json(&format!("{}/api/hosts?{}&limit=12", API, q)) {
+        if let Ok(d) = fetch_json(&format!("{}/api/hosts?{}&limit=120", API, q)) {
             if let Some(arr) = d["hosts"].as_array() {
                 snap.hosts = arr
                     .iter()
@@ -1567,8 +1579,167 @@ fn flag_known(code: &str) -> bool {
         code,
         "DE" | "FR" | "IT" | "NL" | "BE" | "RU" | "IE" | "AT" | "BG" | "HU" | "RO" | "PL"
             | "UA" | "EE" | "LT" | "LV" | "LU" | "US" | "GB" | "CN" | "JP" | "TR" | "IR"
-            | "IN" | "ES" | "PT" | "SE" | "NO" | "FI" | "DK" | "GR" | "CA"
+            | "IN" | "ES" | "PT" | "SE" | "NO" | "FI" | "DK" | "GR" | "CA" | "SG" | "KR"
+            | "AU" | "BR" | "MY" | "AE" | "HK" | "PK" | "CH" | "CZ" | "TW" | "IL" | "MX"
+            | "ZA" | "ID" | "TH" | "VN" | "SA" | "NZ" | "AR" | "CL" | "SK" | "HR" | "SI"
     )
+}
+
+/// Human-friendly country name for ISO-3166 alpha-2 codes.
+fn country_name(code: &str) -> String {
+    match code.trim().to_uppercase().as_str() {
+        "" | "??" | "UNKNOWN" => "Unknown".to_string(),
+        "LAN" => "Local Network".to_string(),
+        "US" => "United States".to_string(),
+        "GB" | "UK" => "United Kingdom".to_string(),
+        "DE" => "Germany".to_string(),
+        "FR" => "France".to_string(),
+        "NL" => "Netherlands".to_string(),
+        "IR" => "Iran".to_string(),
+        "IE" => "Ireland".to_string(),
+        "SG" => "Singapore".to_string(),
+        "CN" => "China".to_string(),
+        "JP" => "Japan".to_string(),
+        "KR" => "South Korea".to_string(),
+        "SE" => "Sweden".to_string(),
+        "TR" => "Turkey".to_string(),
+        "HK" => "Hong Kong".to_string(),
+        "IN" => "India".to_string(),
+        "RO" => "Romania".to_string(),
+        "IT" => "Italy".to_string(),
+        "ES" => "Spain".to_string(),
+        "PT" => "Portugal".to_string(),
+        "CA" => "Canada".to_string(),
+        "AU" => "Australia".to_string(),
+        "BR" => "Brazil".to_string(),
+        "MY" => "Malaysia".to_string(),
+        "AE" => "United Arab Emirates".to_string(),
+        "PK" => "Pakistan".to_string(),
+        "RU" => "Russia".to_string(),
+        "PL" => "Poland".to_string(),
+        "UA" => "Ukraine".to_string(),
+        "CH" => "Switzerland".to_string(),
+        "BE" => "Belgium".to_string(),
+        "AT" => "Austria".to_string(),
+        "CZ" => "Czechia".to_string(),
+        "FI" => "Finland".to_string(),
+        "NO" => "Norway".to_string(),
+        "DK" => "Denmark".to_string(),
+        "GR" => "Greece".to_string(),
+        "BG" => "Bulgaria".to_string(),
+        "HU" => "Hungary".to_string(),
+        "EE" => "Estonia".to_string(),
+        "LT" => "Lithuania".to_string(),
+        "LV" => "Latvia".to_string(),
+        "LU" => "Luxembourg".to_string(),
+        "SK" => "Slovakia".to_string(),
+        "SI" => "Slovenia".to_string(),
+        "HR" => "Croatia".to_string(),
+        "RS" => "Serbia".to_string(),
+        "IS" => "Iceland".to_string(),
+        "TW" => "Taiwan".to_string(),
+        "IL" => "Israel".to_string(),
+        "MX" => "Mexico".to_string(),
+        "AR" => "Argentina".to_string(),
+        "CL" => "Chile".to_string(),
+        "ZA" => "South Africa".to_string(),
+        "NZ" => "New Zealand".to_string(),
+        "ID" => "Indonesia".to_string(),
+        "VN" => "Vietnam".to_string(),
+        "TH" => "Thailand".to_string(),
+        "PH" => "Philippines".to_string(),
+        "SA" => "Saudi Arabia".to_string(),
+        _ => code.to_string(),
+    }
+}
+
+fn traffic_type_label(name: &str) -> String {
+    match name {
+        "HTTPS" => "HTTPS (SSL/TLS)".to_string(),
+        "HTTP" => "HTTP".to_string(),
+        "DNS" => "Domain Name System (DNS)".to_string(),
+        "mDNS" => "Multicast DNS (mDNS)".to_string(),
+        "SSDP" => "SSDP (UPnP Discovery)".to_string(),
+        "QUIC" => "QUIC (HTTP/3)".to_string(),
+        "NTP" => "Network Time Protocol (NTP)".to_string(),
+        "SSH" => "Secure Shell (SSH)".to_string(),
+        "RDP" => "Remote Desktop (RDP)".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn is_local_host(host: &str) -> bool {
+    let h = host.trim().to_lowercase();
+    if h.starts_with("192.168.")
+        || h.starts_with("10.")
+        || h.starts_with("127.")
+        || h.starts_with("169.254.")
+        || h.starts_with("fe80:")
+        || h.starts_with("fc")
+        || h.starts_with("fd")
+        || h == "::1"
+        || h == "localhost"
+        || h.ends_with(".local")
+        || h.ends_with(".lan")
+        || h.ends_with(".bwrouter")
+        || h.ends_with(".home")
+        || h.ends_with(".internal")
+    {
+        return true;
+    }
+    if let Some(rest) = h.strip_prefix("172.") {
+        if let Some(oct) = rest.split('.').next().and_then(|s| s.parse::<u8>().ok()) {
+            if (16..=31).contains(&oct) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Crisp painted Local Network (LAN) badge icon.
+fn draw_lan_icon(p: &egui::Painter, rect: &egui::Rect) {
+    let outer = egui::Color32::from_rgb(138, 162, 198);
+    let screen = egui::Color32::from_rgb(36, 52, 78);
+    let accent = egui::Color32::from_rgb(86, 200, 170);
+    let body = egui::Rect::from_min_max(
+        egui::Pos2::new(rect.left() + 1.0, rect.top() + 0.5),
+        egui::Pos2::new(rect.right() - 1.0, rect.bottom() - 2.5),
+    );
+    p.rect_filled(body, 1.5, screen);
+    p.rect_stroke(body, 1.5, egui::Stroke::new(1.1, outer));
+    p.rect_filled(
+        egui::Rect::from_min_size(
+            egui::Pos2::new(body.left() + 2.5, body.center().y - 1.0),
+            egui::vec2((body.width() - 5.0).max(2.0), 2.0),
+        ),
+        1.0,
+        accent,
+    );
+    let cx = rect.center().x;
+    p.line_segment(
+        [
+            egui::Pos2::new(cx - 4.0, rect.bottom() - 0.5),
+            egui::Pos2::new(cx + 4.0, rect.bottom() - 0.5),
+        ],
+        egui::Stroke::new(1.2, outer),
+    );
+}
+
+/// Crisp painted wireframe globe icon for unknown regions.
+fn draw_globe_icon(p: &egui::Painter, rect: &egui::Rect, color: egui::Color32) {
+    let c = rect.center();
+    let r = (rect.width().min(rect.height()) * 0.44).max(3.5);
+    let stroke = egui::Stroke::new(1.0, color);
+    p.circle_stroke(c, r, stroke);
+    p.line_segment(
+        [egui::Pos2::new(c.x - r, c.y), egui::Pos2::new(c.x + r, c.y)],
+        stroke,
+    );
+    p.line_segment(
+        [egui::Pos2::new(c.x, c.y - r), egui::Pos2::new(c.x, c.y + r)],
+        stroke,
+    );
 }
 
 fn hstripe(p: &egui::Painter, rect: &egui::Rect, frac: f32, y0: f32, color: egui::Color32) {
@@ -1823,6 +1994,155 @@ fn draw_flag(p: &egui::Painter, rect: &egui::Rect, code: &str) {
                 blue,
             );
         }
+        "BE" => {
+            p.rect_filled(*rect, 0.0, dark);
+            vstripe(p, rect, 1.0 / 3.0, 1.0 / 3.0, yellow);
+            vstripe(p, rect, 1.0 / 3.0, 2.0 / 3.0, red);
+        }
+        "SG" | "ID" => {
+            p.rect_filled(*rect, 0.0, red);
+            hstripe(p, rect, 0.5, 0.5, white);
+            if code == "SG" {
+                disc(
+                    p,
+                    egui::Pos2::new(rect.left() + rect.width() * 0.24, rect.top() + rect.height() * 0.25),
+                    rect.height() * 0.14,
+                    white,
+                );
+            }
+        }
+        "KR" => {
+            p.rect_filled(*rect, 0.0, white);
+            disc(p, cx, rect.height() * 0.26, red);
+            p.rect_filled(
+                egui::Rect::from_min_max(
+                    egui::Pos2::new(cx.x - rect.height() * 0.26, cx.y),
+                    egui::Pos2::new(cx.x + rect.height() * 0.26, cx.y + rect.height() * 0.26),
+                ),
+                0.0,
+                blue,
+            );
+        }
+        "AU" | "NZ" => {
+            p.rect_filled(*rect, 0.0, blue);
+            let cw = rect.width() * 0.45;
+            let ch = rect.height() * 0.5;
+            p.rect_filled(egui::Rect::from_min_size(rect.left_top(), egui::vec2(cw, ch)), 0.0, red);
+            disc(p, egui::Pos2::new(rect.left() + rect.width() * 0.75, rect.top() + rect.height() * 0.32), rect.height() * 0.08, white);
+            disc(p, egui::Pos2::new(rect.left() + rect.width() * 0.72, rect.top() + rect.height() * 0.70), rect.height() * 0.08, white);
+        }
+        "BR" => {
+            p.rect_filled(*rect, 0.0, green);
+            disc(p, cx, rect.height() * 0.34, yellow);
+            disc(p, cx, rect.height() * 0.2, blue);
+        }
+        "MY" => {
+            p.rect_filled(*rect, 0.0, white);
+            hstripe(p, rect, 0.25, 0.0, red);
+            hstripe(p, rect, 0.25, 0.5, red);
+            p.rect_filled(
+                egui::Rect::from_min_size(rect.left_top(), egui::vec2(rect.width() * 0.45, rect.height() * 0.55)),
+                0.0,
+                blue,
+            );
+            disc(p, egui::Pos2::new(rect.left() + rect.width() * 0.22, rect.top() + rect.height() * 0.28), rect.height() * 0.14, yellow);
+        }
+        "AE" => {
+            p.rect_filled(*rect, 0.0, green);
+            hstripe(p, rect, 1.0 / 3.0, 1.0 / 3.0, white);
+            hstripe(p, rect, 1.0 / 3.0, 2.0 / 3.0, dark);
+            vstripe(p, rect, 0.26, 0.0, red);
+        }
+        "HK" => {
+            p.rect_filled(*rect, 0.0, Color32::from_rgb(212, 42, 42));
+            disc(p, cx, rect.height() * 0.22, white);
+        }
+        "PK" => {
+            p.rect_filled(*rect, 0.0, Color32::from_rgb(22, 112, 62));
+            vstripe(p, rect, 0.26, 0.0, white);
+            disc(p, egui::Pos2::new(rect.left() + rect.width() * 0.62, cx.y), rect.height() * 0.22, white);
+            disc(p, egui::Pos2::new(rect.left() + rect.width() * 0.67, cx.y - rect.height() * 0.04), rect.height() * 0.18, Color32::from_rgb(22, 112, 62));
+        }
+        "CH" => {
+            p.rect_filled(*rect, 0.0, red);
+            p.line_segment(
+                [egui::Pos2::new(cx.x, rect.top() + rect.height() * 0.2), egui::Pos2::new(cx.x, rect.bottom() - rect.height() * 0.2)],
+                egui::Stroke::new(rect.height() * 0.2, white),
+            );
+            p.line_segment(
+                [egui::Pos2::new(cx.x - rect.height() * 0.3, cx.y), egui::Pos2::new(cx.x + rect.height() * 0.3, cx.y)],
+                egui::Stroke::new(rect.height() * 0.2, white),
+            );
+        }
+        "CZ" => {
+            p.rect_filled(*rect, 0.0, white);
+            hstripe(p, rect, 0.5, 0.5, red);
+            vstripe(p, rect, 0.34, 0.0, blue);
+        }
+        "TW" => {
+            p.rect_filled(*rect, 0.0, red);
+            p.rect_filled(
+                egui::Rect::from_min_size(rect.left_top(), egui::vec2(rect.width() * 0.45, rect.height() * 0.5)),
+                0.0,
+                blue,
+            );
+            disc(p, egui::Pos2::new(rect.left() + rect.width() * 0.22, rect.top() + rect.height() * 0.25), rect.height() * 0.12, white);
+        }
+        "IL" => {
+            p.rect_filled(*rect, 0.0, white);
+            hstripe(p, rect, 0.18, 0.1, blue);
+            hstripe(p, rect, 0.18, 0.72, blue);
+            disc(p, cx, rect.height() * 0.14, blue);
+        }
+        "MX" => {
+            p.rect_filled(*rect, 0.0, green);
+            vstripe(p, rect, 1.0 / 3.0, 1.0 / 3.0, white);
+            vstripe(p, rect, 1.0 / 3.0, 2.0 / 3.0, red);
+            disc(p, cx, rect.height() * 0.12, Color32::from_rgb(138, 96, 52));
+        }
+        "ZA" => {
+            p.rect_filled(*rect, 0.0, red);
+            hstripe(p, rect, 0.5, 0.5, blue);
+            hstripe(p, rect, 0.26, 0.37, green);
+            vstripe(p, rect, 0.22, 0.0, dark);
+        }
+        "TH" => {
+            p.rect_filled(*rect, 0.0, red);
+            hstripe(p, rect, 0.66, 0.17, white);
+            hstripe(p, rect, 0.34, 0.33, blue);
+        }
+        "VN" => {
+            p.rect_filled(*rect, 0.0, Color32::from_rgb(218, 37, 29));
+            disc(p, cx, rect.height() * 0.2, yellow);
+        }
+        "SA" => {
+            p.rect_filled(*rect, 0.0, Color32::from_rgb(22, 128, 66));
+            p.line_segment(
+                [egui::Pos2::new(rect.left() + rect.width() * 0.24, cx.y), egui::Pos2::new(rect.right() - rect.width() * 0.24, cx.y)],
+                egui::Stroke::new(rect.height() * 0.14, white),
+            );
+        }
+        "AR" => {
+            let sky = Color32::from_rgb(116, 172, 223);
+            p.rect_filled(*rect, 0.0, sky);
+            hstripe(p, rect, 1.0 / 3.0, 1.0 / 3.0, white);
+            disc(p, cx, rect.height() * 0.12, yellow);
+        }
+        "CL" => {
+            p.rect_filled(*rect, 0.0, white);
+            hstripe(p, rect, 0.5, 0.5, red);
+            p.rect_filled(
+                egui::Rect::from_min_size(rect.left_top(), egui::vec2(rect.width() * 0.38, rect.height() * 0.5)),
+                0.0,
+                blue,
+            );
+        }
+        "SK" | "SI" | "HR" => {
+            p.rect_filled(*rect, 0.0, white);
+            hstripe(p, rect, 1.0 / 3.0, 1.0 / 3.0, blue);
+            hstripe(p, rect, 1.0 / 3.0, 2.0 / 3.0, red);
+            disc(p, egui::Pos2::new(rect.left() + rect.width() * 0.32, cx.y), rect.height() * 0.14, red);
+        }
         "CA" => {
             p.rect_filled(*rect, 0.0, white);
             vstripe(p, rect, 0.25, 0.0, red);
@@ -1835,6 +2155,27 @@ fn draw_flag(p: &egui::Painter, rect: &egui::Rect, code: &str) {
         }
         _ => {}
     }
+}
+
+/// Aggregate a grouped time series into `(name, in_bytes, out_bytes)` totals so
+/// Traffic Type and Countries keep their exact Upload/Download bar split.
+fn group_totals(g: &GroupData) -> Vec<(String, f64, f64)> {
+    let mut map: HashMap<i64, (f64, f64)> = HashMap::new();
+    for (_ts, id, i, o) in &g.rows {
+        let e = map.entry(*id).or_insert((0.0, 0.0));
+        e.0 += *i;
+        e.1 += *o;
+    }
+    map.into_iter()
+        .map(|(id, (i, o))| {
+            let name = g
+                .names
+                .get(&id)
+                .cloned()
+                .unwrap_or_else(|| format!("#{}", id));
+            (name, i, o)
+        })
+        .collect()
 }
 
 /// Allocate a 16x11 flag rect (only when the code is supported) and draw it.
@@ -1908,6 +2249,7 @@ struct PacketlyApp {
     show_scale: bool,
     sel_drag: Option<(f64, f64)>,
     traffic_sort: SortKey,
+    traffic_filter: String,
     sel_sort: SortKey,
     detail_tab: usize,
     detail_sort: SortKey,
@@ -2097,7 +2439,18 @@ impl PacketlyApp {
             .frame(egui::Frame::none().fill(t.bg).inner_margin(egui::Margin::symmetric(16.0, 2.0)))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.weak("Filter");
+                    if self.tab == Tab::Traffic {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.traffic_filter)
+                                .hint_text("Filter apps, hosts, types, countries…")
+                                .desired_width(230.0),
+                        );
+                        if !self.traffic_filter.is_empty() && ui.small_button("✕").clicked() {
+                            self.traffic_filter.clear();
+                        }
+                    } else {
+                        ui.weak("Filter");
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let custom_resp = ui.selectable_label(custom_active, "Custom…");
                         if custom_resp.clicked() {
@@ -3125,200 +3478,656 @@ impl PacketlyApp {
 
     fn traffic_tab(&mut self, ctx: &egui::Context) {
         let t = self.theme();
+        let dark_theme = t.text.r() > 128;
         egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(t.bg).inner_margin(egui::Margin::symmetric(16.0, 4.0)))
+            .frame(
+                egui::Frame::none()
+                    .fill(t.bg)
+                    .inner_margin(egui::Margin::symmetric(16.0, 4.0)),
+            )
             .show(ctx, |ui| {
                 let snap = self.snap.lock().unwrap().clone();
-                let type_series = snap.type_data.clone().map(|g| group_series(&g)).unwrap_or_default();
-                let country_series =
-                    snap.country_data.clone().map(|g| group_series(&g)).unwrap_or_default();
-
-                let mut col = |app: &mut PacketlyApp,
-                               ui: &mut egui::Ui,
-                               title: &str,
-                               rows: Vec<(
-                    String,
-                    Option<String>,
-                    egui::Color32,
-                    Option<i64>,
-                    f64,
-                    f64,
-                )>| {
-                    ui.vertical(|ui| {
-                        ui.strong(egui::RichText::new(title).size(13.0).color(t.text));
-                        ui.add_space(6.0);
-                        egui::ScrollArea::vertical()
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                if rows.is_empty() {
-                                    ui.weak("no data in this range");
-                                    return;
-                                }
-                                let max =
-                                    rows.iter().map(|r| r.4 + r.5).fold(1.0_f64, f64::max);
-                                let range = snap
-                                    .traffic
-                                    .as_ref()
-                                    .map(|tr| (tr.from as i64, tr.to as i64));
-                                for (name, sub, color, icon_id, i, o) in rows {
-                                    ui.horizontal(|ui| {
-                                        if let Some(tex) = icon_id
-                                            .and_then(|id| app.app_icon_opt(ui.ctx(), id, &name))
-                                        {
-                                            ui.add(
-                                                egui::Image::from_texture(&tex)
-                                                    .max_size(egui::vec2(17.0, 17.0)),
-                                            );
-                                        } else {
-                                            ui.colored_label(color, "●");
-                                        }
-                                        let aw = ui.available_width();
-                                        let name_w = (aw - 84.0).max(60.0);
-                                        ui.vertical(|ui| {
-                                            ui.set_max_width(name_w);
-                                            if name.len() == 2 && flag_known(&name) {
-                                                flag_ui(ui, &name);
-                                            }
-                                            let lbl = ui.add(
-                                                egui::Label::new(
-                                                    egui::RichText::new(&name).color(t.text),
-                                                )
-                                                .truncate()
-                                                .sense(egui::Sense::click()),
-                                            );
-                                            if icon_id.is_some() {
-                                                if lbl.hovered() {
-                                                    ui.ctx().set_cursor_icon(
-                                                        egui::CursorIcon::PointingHand,
-                                                    );
-                                                }
-                                                if lbl.clicked() {
-                                                    if let Some(id) = icon_id {
-                                                        let (f, tt) =
-                                                            range.unwrap_or((0, 0));
-                                                        let _ = app.tx.send(UiMsg::AppDetail(
-                                                            Some((id, f, tt)),
-                                                        ));
-                                                    }
-                                                }
-                                            }
-                                            if let Some(s) = &sub {
-                                                flag_ui(ui, s);
-                                                ui.weak(egui::RichText::new(s.as_str())
-                                                    .size(10.5)
-                                                    .color(t.dim));
-                                            }
-                                        });
-                                        ui.with_layout(
-                                            egui::Layout::right_to_left(egui::Align::Center),
-                                            |ui| {
-                                                ui.weak(fmt_b(i + o));
-                                            },
-                                        );
-                                    });
-                                    let rect = ui.available_rect_before_wrap();
-                                    ui.painter().rect_filled(
-                                        egui::Rect::from_min_size(
-                                            egui::Pos2::new(rect.left(), rect.top()),
-                                            egui::vec2(
-                                                rect.width() * ((i + o) / max).min(1.0) as f32,
-                                                2.0,
-                                            ),
-                                        ),
-                                        1.0,
-                                        Theme::alpha(color, 170),
-                                    );
-                                    ui.add_space(8.0);
-                                }
-                            });
-                    });
+                let filter_lc = self.traffic_filter.trim().to_lowercase();
+                let matches_filter = |name: &str, sub: Option<&str>| -> bool {
+                    if filter_lc.is_empty() {
+                        return true;
+                    }
+                    name.to_lowercase().contains(&filter_lc)
+                        || sub.map_or(false, |s| s.to_lowercase().contains(&filter_lc))
                 };
 
+                let mut app_rows: Vec<TrafficRow> = snap
+                    .apps
+                    .iter()
+                    .filter(|a| matches_filter(&a.name, None))
+                    .map(|a| TrafficRow {
+                        label: a.name.clone(),
+                        sub: None,
+                        icon: RowIcon::App(a.id),
+                        in_bytes: a.in_bytes,
+                        out_bytes: a.out_bytes,
+                    })
+                    .collect();
+
+                let mut host_rows: Vec<TrafficRow> = snap
+                    .hosts
+                    .iter()
+                    .filter_map(|h| {
+                        let raw_reg = h
+                            .region
+                            .as_deref()
+                            .map(|s| s.trim())
+                            .filter(|s| !s.is_empty());
+                        let is_lan = is_local_host(&h.label);
+                        let (icon, region_label) = if let Some(code) = raw_reg {
+                            let up = code.to_uppercase();
+                            if flag_known(&up) {
+                                (RowIcon::Flag(up.clone()), Some(country_name(&up)))
+                            } else if up == "LAN" || is_lan {
+                                (RowIcon::Lan, Some("Local Network".to_string()))
+                            } else {
+                                (RowIcon::Globe, Some(country_name(code)))
+                            }
+                        } else if is_lan {
+                            (RowIcon::Lan, Some("Local Network".to_string()))
+                        } else {
+                            (RowIcon::Globe, None)
+                        };
+                        if !matches_filter(&h.label, region_label.as_deref()) {
+                            return None;
+                        }
+                        Some(TrafficRow {
+                            label: h.label.clone(),
+                            sub: region_label,
+                            icon,
+                            in_bytes: h.in_bytes,
+                            out_bytes: h.out_bytes,
+                        })
+                    })
+                    .collect();
+
+                let mut type_rows: Vec<TrafficRow> = snap
+                    .type_data
+                    .as_ref()
+                    .map(group_totals)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|(raw_name, i, o)| {
+                        let label = traffic_type_label(&raw_name);
+                        if !matches_filter(&label, Some(&raw_name)) {
+                            return None;
+                        }
+                        Some(TrafficRow {
+                            label,
+                            sub: None,
+                            icon: RowIcon::None,
+                            in_bytes: i,
+                            out_bytes: o,
+                        })
+                    })
+                    .collect();
+
+                let mut country_rows: Vec<TrafficRow> = snap
+                    .country_data
+                    .as_ref()
+                    .map(group_totals)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|(raw_code, i, o)| {
+                        let code_up = raw_code.trim().to_uppercase();
+                        let label = country_name(&raw_code);
+                        if !matches_filter(&label, Some(&code_up)) {
+                            return None;
+                        }
+                        let icon = if code_up == "LAN" {
+                            RowIcon::Lan
+                        } else if flag_known(&code_up) {
+                            RowIcon::Flag(code_up)
+                        } else {
+                            RowIcon::Globe
+                        };
+                        Some(TrafficRow {
+                            label,
+                            sub: None,
+                            icon,
+                            in_bytes: i,
+                            out_bytes: o,
+                        })
+                    })
+                    .collect();
+
+                sort_traffic_rows(&mut app_rows, self.traffic_sort);
+                sort_traffic_rows(&mut host_rows, self.traffic_sort);
+                sort_traffic_rows(&mut type_rows, self.traffic_sort);
+                sort_traffic_rows(&mut country_rows, self.traffic_sort);
+
+                let range_pair = snap
+                    .traffic
+                    .as_ref()
+                    .map(|tr| (tr.from as i64, tr.to as i64));
+
+                // Top header strip: title on left, legend + sort selector on right
                 ui.horizontal(|ui| {
                     ui.strong(egui::RichText::new("Traffic").size(14.0).color(t.text));
+                    ui.add_space(10.0);
+                    if !filter_lc.is_empty() {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "showing {} apps · {} hosts",
+                                app_rows.len(),
+                                host_rows.len()
+                            ))
+                            .size(11.5)
+                            .color(t.dim),
+                        );
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.weak("Sort");
                         egui::ComboBox::from_id_source("traffic_sort")
                             .selected_text(self.traffic_sort.label())
-                            .width(92.0)
+                            .width(96.0)
                             .show_ui(ui, |ui| {
                                 for k in SortKey::all() {
                                     ui.selectable_value(&mut self.traffic_sort, k, k.label());
                                 }
                             });
+                        ui.weak(egui::RichText::new("Sort").size(12.0).color(t.dim));
+                        ui.add_space(14.0);
+                        ui.label(egui::RichText::new("Download").size(11.5).color(t.dim));
+                        let (dr, _) =
+                            ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                        ui.painter().circle_filled(dr.center(), 3.5, t.in_c);
+                        ui.add_space(8.0);
+                        ui.label(egui::RichText::new("Upload").size(11.5).color(t.dim));
+                        let (ur, _) =
+                            ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                        ui.painter().circle_filled(ur.center(), 3.5, t.out_c);
                     });
                 });
                 ui.add_space(6.0);
 
-                let mut app_rows: Vec<(String, Option<String>, egui::Color32, Option<i64>, f64, f64)> =
-                    snap.apps
-                        .iter()
-                        .map(|a| {
-                            (
-                                a.name.clone(),
-                                None,
-                                color_for(&a.id.to_string()),
-                                Some(a.id),
-                                a.in_bytes,
-                                a.out_bytes,
-                            )
-                        })
-                        .collect();
-                let mut host_rows: Vec<(String, Option<String>, egui::Color32, Option<i64>, f64, f64)> =
-                    snap.hosts
-                        .iter()
-                        .map(|h| {
-                            (
-                                h.label.clone(),
-                                h.region.clone().filter(|s| !s.is_empty()),
-                                color_for(&h.label),
-                                None,
-                                h.in_bytes,
-                                h.out_bytes,
-                            )
-                        })
-                        .collect();
-                let mut type_rows: Vec<(String, Option<String>, egui::Color32, Option<i64>, f64, f64)> =
-                    type_series
-                        .iter()
-                        .map(|s| {
-                            (
-                                s.name.clone(),
-                                None,
-                                s.color,
-                                None,
-                                s.points.iter().map(|p| p[1]).sum::<f64>(),
-                                0.0,
-                            )
-                        })
-                        .collect();
-                let mut country_rows: Vec<(String, Option<String>, egui::Color32, Option<i64>, f64, f64)> =
-                    country_series
-                        .iter()
-                        .map(|s| {
-                            (
-                                s.name.clone(),
-                                None,
-                                s.color,
-                                None,
-                                s.points.iter().map(|p| p[1]).sum::<f64>(),
-                                0.0,
-                            )
-                        })
-                        .collect();
-                sort_rows(&mut app_rows, self.traffic_sort);
-                sort_rows(&mut host_rows, self.traffic_sort);
-                sort_rows(&mut type_rows, self.traffic_sort);
-                sort_rows(&mut country_rows, self.traffic_sort);
+                let hover_fill = if dark_theme {
+                    srgb_alpha(egui::Color32::WHITE, 0.055)
+                } else {
+                    srgb_alpha(egui::Color32::BLACK, 0.045)
+                };
+                let bar_track = if dark_theme {
+                    srgb_alpha(egui::Color32::WHITE, 0.045)
+                } else {
+                    srgb_alpha(egui::Color32::BLACK, 0.07)
+                };
+                let divider_col = if dark_theme {
+                    srgb_alpha(egui::Color32::WHITE, 0.05)
+                } else {
+                    t.border
+                };
+                let val_color = if dark_theme {
+                    egui::Color32::from_rgb(162, 174, 200)
+                } else {
+                    t.dim
+                };
 
-                ui.columns(4, |cols| {
-                    col(self, &mut cols[0], "Apps", app_rows);
-                    col(self, &mut cols[1], "Hosts", host_rows);
-                    col(self, &mut cols[2], "Traffic Type", type_rows);
-                    col(self, &mut cols[3], "Countries", country_rows);
-                });
+                let render_column = |app: &mut PacketlyApp,
+                                     ui: &mut egui::Ui,
+                                     col_id: &str,
+                                     title: &str,
+                                     rows: &[TrafficRow],
+                                     col_h: f32| {
+                    ui.vertical(|ui| {
+                        ui.set_min_height(col_h);
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new(title)
+                                    .size(13.0)
+                                    .strong()
+                                    .color(t.text),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        egui::RichText::new(format!("{}", rows.len()))
+                                            .size(11.0)
+                                            .color(t.dim),
+                                    );
+                                },
+                            );
+                        });
+                        ui.add_space(4.0);
+                        let sep = ui.available_rect_before_wrap();
+                        ui.painter().line_segment(
+                            [
+                                egui::Pos2::new(sep.left(), sep.top()),
+                                egui::Pos2::new(sep.right(), sep.top()),
+                            ],
+                            egui::Stroke::new(1.0, divider_col),
+                        );
+                        ui.add_space(5.0);
+
+                        let scroll_h = (col_h - 32.0).max(80.0);
+                        egui::ScrollArea::vertical()
+                            .id_source(col_id)
+                            .max_height(scroll_h)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                if rows.is_empty() {
+                                    ui.add_space(12.0);
+                                    ui.label(
+                                        egui::RichText::new(if filter_lc.is_empty() {
+                                            "No traffic in this range"
+                                        } else {
+                                            "No matches"
+                                        })
+                                        .size(12.0)
+                                        .color(t.dim),
+                                    );
+                                    return;
+                                }
+
+                                let col_max = rows
+                                    .iter()
+                                    .map(|r| r.in_bytes + r.out_bytes)
+                                    .fold(1.0_f64, f64::max);
+                                let col_w = (ui.available_width() - 4.0).max(120.0);
+                                let row_h = 32.0_f32;
+
+                                for row in rows {
+                                    let total = row.in_bytes + row.out_bytes;
+                                    let clickable = matches!(row.icon, RowIcon::App(_));
+                                    let sense = if clickable {
+                                        egui::Sense::click()
+                                    } else {
+                                        egui::Sense::hover()
+                                    };
+                                    let (rect, resp) =
+                                        ui.allocate_exact_size(egui::vec2(col_w, row_h), sense);
+                                    let painter = ui.painter_at(rect);
+
+                                    if resp.hovered() {
+                                        painter.rect_filled(rect, 4.0, hover_fill);
+                                        if clickable {
+                                            ui.ctx()
+                                                .set_cursor_icon(egui::CursorIcon::PointingHand);
+                                        }
+                                    }
+
+                                    let pad_x = 6.0_f32;
+                                    let content_cy = rect.top() + 12.5;
+                                    let mut text_left = rect.left() + pad_x;
+
+                                    match &row.icon {
+                                        RowIcon::App(id) => {
+                                            let ir = egui::Rect::from_center_size(
+                                                egui::Pos2::new(text_left + 9.0, content_cy),
+                                                egui::vec2(17.0, 17.0),
+                                            );
+                                            if let Some(tex) =
+                                                app.app_icon_opt(ui.ctx(), *id, &row.label)
+                                            {
+                                                painter.image(
+                                                    tex.id(),
+                                                    ir,
+                                                    egui::Rect::from_min_max(
+                                                        egui::Pos2::new(0.0, 0.0),
+                                                        egui::Pos2::new(1.0, 1.0),
+                                                    ),
+                                                    egui::Color32::WHITE,
+                                                );
+                                            } else {
+                                                painter.rect_filled(ir, 3.5, t.card2);
+                                                painter.rect_stroke(
+                                                    ir,
+                                                    3.5,
+                                                    egui::Stroke::new(0.8, t.border),
+                                                );
+                                                let ch = row
+                                                    .label
+                                                    .chars()
+                                                    .next()
+                                                    .unwrap_or('?')
+                                                    .to_uppercase()
+                                                    .to_string();
+                                                painter.text(
+                                                    ir.center(),
+                                                    egui::Align2::CENTER_CENTER,
+                                                    ch,
+                                                    egui::FontId::proportional(10.0),
+                                                    t.dim,
+                                                );
+                                            }
+                                            text_left += 24.0;
+                                        }
+                                        RowIcon::Flag(code) => {
+                                            let fr = egui::Rect::from_center_size(
+                                                egui::Pos2::new(text_left + 9.0, content_cy),
+                                                egui::vec2(17.0, 11.5),
+                                            );
+                                            draw_flag(&painter, &fr, code);
+                                            painter.rect_stroke(
+                                                fr,
+                                                1.0,
+                                                egui::Stroke::new(
+                                                    0.75,
+                                                    srgb_alpha(egui::Color32::BLACK, 0.35),
+                                                ),
+                                            );
+                                            text_left += 24.0;
+                                        }
+                                        RowIcon::Lan => {
+                                            let lr = egui::Rect::from_center_size(
+                                                egui::Pos2::new(text_left + 9.0, content_cy),
+                                                egui::vec2(17.0, 12.0),
+                                            );
+                                            draw_lan_icon(&painter, &lr);
+                                            text_left += 24.0;
+                                        }
+                                        RowIcon::Globe => {
+                                            let gr = egui::Rect::from_center_size(
+                                                egui::Pos2::new(text_left + 9.0, content_cy),
+                                                egui::vec2(15.0, 15.0),
+                                            );
+                                            draw_globe_icon(&painter, &gr, t.dim);
+                                            text_left += 24.0;
+                                        }
+                                        RowIcon::None => {}
+                                    }
+
+                                    // Right-aligned byte figure
+                                    let val_galley = painter.layout_no_wrap(
+                                        fmt_b(total),
+                                        egui::FontId::proportional(12.0),
+                                        val_color,
+                                    );
+                                    let val_w = val_galley.size().x;
+                                    let val_h = val_galley.size().y;
+                                    let val_x = rect.right() - pad_x - val_w;
+                                    painter.galley(
+                                        egui::Pos2::new(val_x, content_cy - val_h * 0.5),
+                                        val_galley,
+                                        val_color,
+                                    );
+
+                                    // Single-line ellipsized name filling space between icon & value
+                                    let name_max_w = (val_x - 10.0 - text_left).max(20.0);
+                                    let mut job = egui::text::LayoutJob::default();
+                                    job.append(
+                                        &row.label,
+                                        0.0,
+                                        egui::TextFormat {
+                                            font_id: egui::FontId::proportional(12.5),
+                                            color: t.text,
+                                            ..Default::default()
+                                        },
+                                    );
+                                    job.wrap.max_width = name_max_w;
+                                    job.wrap.max_rows = 1;
+                                    job.wrap.break_anywhere = true;
+                                    job.wrap.overflow_character = Some('…');
+                                    let name_galley = painter.layout_job(job);
+                                    let name_h = name_galley.size().y;
+                                    painter.galley(
+                                        egui::Pos2::new(text_left, content_cy - name_h * 0.5),
+                                        name_galley,
+                                        t.text,
+                                    );
+
+                                    // Bottom split Upload (blue) + Download (magenta) bar
+                                    let bar_x0 = text_left;
+                                    let bar_x1 = rect.right() - pad_x;
+                                    let bar_w = (bar_x1 - bar_x0).max(1.0);
+                                    let bar_y = rect.bottom() - 5.0;
+                                    let bar_h = 2.5_f32;
+                                    painter.rect_filled(
+                                        egui::Rect::from_min_size(
+                                            egui::Pos2::new(bar_x0, bar_y),
+                                            egui::vec2(bar_w, bar_h),
+                                        ),
+                                        1.25,
+                                        bar_track,
+                                    );
+                                    if total > 0.0 {
+                                        let ratio = (total / col_max).clamp(0.0, 1.0) as f32;
+                                        let fill_w = (bar_w * ratio).max(3.0).min(bar_w);
+                                        let up_frac = (row.out_bytes / total).clamp(0.0, 1.0) as f32;
+                                        let up_w = fill_w * up_frac;
+                                        let down_w = (fill_w - up_w).max(0.0);
+                                        if up_w > 0.5 {
+                                            painter.rect_filled(
+                                                egui::Rect::from_min_size(
+                                                    egui::Pos2::new(bar_x0, bar_y),
+                                                    egui::vec2(up_w, bar_h),
+                                                ),
+                                                1.25,
+                                                t.out_c,
+                                            );
+                                        }
+                                        if down_w > 0.5 {
+                                            painter.rect_filled(
+                                                egui::Rect::from_min_size(
+                                                    egui::Pos2::new(bar_x0 + up_w, bar_y),
+                                                    egui::vec2(down_w, bar_h),
+                                                ),
+                                                1.25,
+                                                t.in_c,
+                                            );
+                                        }
+                                    }
+
+                                    if clickable && resp.clicked() {
+                                        if let RowIcon::App(id) = row.icon {
+                                            let (f, tt) = range_pair.unwrap_or((0, 0));
+                                            let _ = app
+                                                .tx
+                                                .send(UiMsg::AppDetail(Some((id, f, tt))));
+                                        }
+                                    }
+
+                                    resp.on_hover_ui(|ui| {
+                                        ui.strong(
+                                            egui::RichText::new(&row.label)
+                                                .size(12.5)
+                                                .color(t.text),
+                                        );
+                                        if let Some(sub) = &row.sub {
+                                            ui.label(
+                                                egui::RichText::new(sub).size(11.0).color(t.dim),
+                                            );
+                                        }
+                                        ui.add_space(2.0);
+                                        ui.horizontal(|ui| {
+                                            ui.label(
+                                                egui::RichText::new(format!(
+                                                    "↓ {}",
+                                                    fmt_b(row.in_bytes)
+                                                ))
+                                                .size(11.5)
+                                                .color(t.in_c),
+                                            );
+                                            ui.label(
+                                                egui::RichText::new(format!(
+                                                    "↑ {}",
+                                                    fmt_b(row.out_bytes)
+                                                ))
+                                                .size(11.5)
+                                                .color(t.out_c),
+                                            );
+                                            ui.weak(
+                                                egui::RichText::new(format!(
+                                                    "({:.1}%)",
+                                                    (total / col_max * 100.0).min(100.0)
+                                                ))
+                                                .size(11.0)
+                                                .color(t.dim),
+                                            );
+                                        });
+                                        if clickable {
+                                            ui.label(
+                                                egui::RichText::new("Click for app details")
+                                                    .size(10.5)
+                                                    .color(t.dim),
+                                            );
+                                        }
+                                    });
+                                }
+                            });
+                    });
+                };
+
+                // Main deep-navy rounded Traffic card (matches Traffic Monitor surface)
+                egui::Frame::none()
+                    .fill(t.plot_bg)
+                    .rounding(8.0)
+                    .inner_margin(egui::Margin::symmetric(14.0, 12.0))
+                    .show(ui, |ui| {
+                        let avail_w = ui.available_width();
+                        let avail_h = ui.available_height().max(200.0);
+
+                        if avail_w >= 820.0 {
+                            let gutter = 16.0_f32;
+                            let col_w = ((avail_w - gutter * 3.0) / 4.0).max(160.0);
+                            let top_y = ui.cursor().top();
+                            let left_x = ui.cursor().left();
+                            ui.horizontal_top(|ui| {
+                                ui.spacing_mut().item_spacing.x = gutter;
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(col_w, avail_h),
+                                    egui::Layout::top_down(egui::Align::LEFT),
+                                    |ui| {
+                                        render_column(
+                                            self,
+                                            ui,
+                                            "tr_apps",
+                                            "Apps",
+                                            &app_rows,
+                                            avail_h,
+                                        );
+                                    },
+                                );
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(col_w, avail_h),
+                                    egui::Layout::top_down(egui::Align::LEFT),
+                                    |ui| {
+                                        render_column(
+                                            self,
+                                            ui,
+                                            "tr_hosts",
+                                            "Hosts",
+                                            &host_rows,
+                                            avail_h,
+                                        );
+                                    },
+                                );
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(col_w, avail_h),
+                                    egui::Layout::top_down(egui::Align::LEFT),
+                                    |ui| {
+                                        render_column(
+                                            self,
+                                            ui,
+                                            "tr_types",
+                                            "Traffic Type",
+                                            &type_rows,
+                                            avail_h,
+                                        );
+                                    },
+                                );
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(col_w, avail_h),
+                                    egui::Layout::top_down(egui::Align::LEFT),
+                                    |ui| {
+                                        render_column(
+                                            self,
+                                            ui,
+                                            "tr_countries",
+                                            "Countries",
+                                            &country_rows,
+                                            avail_h,
+                                        );
+                                    },
+                                );
+                            });
+                            // Subtle hairline vertical dividers between the 4 columns
+                            for idx in 1..=3 {
+                                let x = left_x + col_w * idx as f32 + gutter * (idx as f32 - 0.5);
+                                ui.painter().line_segment(
+                                    [
+                                        egui::Pos2::new(x, top_y + 2.0),
+                                        egui::Pos2::new(x, top_y + avail_h - 2.0),
+                                    ],
+                                    egui::Stroke::new(1.0, divider_col),
+                                );
+                            }
+                        } else {
+                            // Responsive 2x2 grid for narrower windows
+                            let gutter = 14.0_f32;
+                            let col_w = ((avail_w - gutter) / 2.0).max(150.0);
+                            let half_h = ((avail_h - 14.0) / 2.0).max(120.0);
+                            ui.horizontal_top(|ui| {
+                                ui.spacing_mut().item_spacing.x = gutter;
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(col_w, half_h),
+                                    egui::Layout::top_down(egui::Align::LEFT),
+                                    |ui| {
+                                        render_column(
+                                            self,
+                                            ui,
+                                            "tr_apps",
+                                            "Apps",
+                                            &app_rows,
+                                            half_h,
+                                        );
+                                    },
+                                );
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(col_w, half_h),
+                                    egui::Layout::top_down(egui::Align::LEFT),
+                                    |ui| {
+                                        render_column(
+                                            self,
+                                            ui,
+                                            "tr_hosts",
+                                            "Hosts",
+                                            &host_rows,
+                                            half_h,
+                                        );
+                                    },
+                                );
+                            });
+                            ui.add_space(12.0);
+                            ui.horizontal_top(|ui| {
+                                ui.spacing_mut().item_spacing.x = gutter;
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(col_w, half_h),
+                                    egui::Layout::top_down(egui::Align::LEFT),
+                                    |ui| {
+                                        render_column(
+                                            self,
+                                            ui,
+                                            "tr_types",
+                                            "Traffic Type",
+                                            &type_rows,
+                                            half_h,
+                                        );
+                                    },
+                                );
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(col_w, half_h),
+                                    egui::Layout::top_down(egui::Align::LEFT),
+                                    |ui| {
+                                        render_column(
+                                            self,
+                                            ui,
+                                            "tr_countries",
+                                            "Countries",
+                                            &country_rows,
+                                            half_h,
+                                        );
+                                    },
+                                );
+                            });
+                        }
+                    });
             });
-}
+    }
 
     fn usage_tab(&mut self, ctx: &egui::Context) {
         let t = self.theme();
@@ -3632,6 +4441,7 @@ impl eframe::App for PacketlyApp {
             }
             Tab::Traffic => {
                 self.range_bar(ctx);
+                self.summary_bar(ctx);
                 self.traffic_tab(ctx);
             }
             Tab::Usage => {
@@ -4131,7 +4941,7 @@ fn main() -> eframe::Result {
                     want.dedup();
                     let mut fetched = 0;
                     for id in want {
-                        if fetched >= 2 {
+                        if fetched >= 12 {
                             break;
                         }
                         if icon_cache.contains_key(&id) || icon_failed.contains(&id) {
@@ -4226,6 +5036,7 @@ fn main() -> eframe::Result {
                 show_scale: false,
                 sel_drag: None,
                 traffic_sort: SortKey::Total,
+                traffic_filter: String::new(),
                 sel_sort: SortKey::Total,
                 detail_tab: 0,
                 detail_sort: SortKey::Down,

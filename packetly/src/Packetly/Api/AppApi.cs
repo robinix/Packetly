@@ -54,7 +54,7 @@ internal static class AppApi
             return new
             {
                 app = "packetly",
-                version = "1.7.2",
+                version = "1.7.3",
                 now,
                 startedAt = svc.StartedAt,
                 uptimeSeconds = now - svc.StartedAt,
