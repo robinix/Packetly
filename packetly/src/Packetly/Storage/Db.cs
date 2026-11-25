@@ -82,6 +82,23 @@ internal sealed class Db : IDisposable
             CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, type INTEGER NOT NULL, app_id INTEGER, data TEXT);
             """);
         MigrateEventsTable();
+        MigrateAppsMetadataColumns();
+    }
+
+    /// <summary>Add version / file_size / file_mtime columns to apps for the
+    /// Application Info Monitor (v1.8.0+) without breaking existing DBs.</summary>
+    private void MigrateAppsMetadataColumns()
+    {
+        var cols = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        using (var cmd = _conn.CreateCommand())
+        {
+            cmd.CommandText = "PRAGMA table_info(apps)";
+            using var r = cmd.ExecuteReader();
+            while (r.Read()) cols.Add(r.GetString(1));
+        }
+        if (!cols.Contains("version")) Exec("ALTER TABLE apps ADD COLUMN version TEXT");
+        if (!cols.Contains("file_size")) Exec("ALTER TABLE apps ADD COLUMN file_size INTEGER");
+        if (!cols.Contains("file_mtime")) Exec("ALTER TABLE apps ADD COLUMN file_mtime INTEGER");
     }
 
     /// <summary>Databases created before phase 4 have an events table without
@@ -232,6 +249,59 @@ internal sealed class Db : IDisposable
             using var r = cmd.ExecuteReader();
             if (!r.Read()) return null;
             return (r.IsDBNull(0) ? null : r.GetString(0), r.IsDBNull(1) ? null : r.GetString(1), r.IsDBNull(2) ? null : r.GetString(2));
+        }
+    }
+
+    /// <summary>Exe-backed apps with persisted version/file metadata for change monitoring.</summary>
+    public List<(int Id, string Path, string? Name, string? Publisher, string? Version, long? FileSize, long? FileMtime)> GetMonitoredApps(int limit)
+    {
+        var list = new List<(int, string, string?, string?, string?, long?, long?)>();
+        lock (_gate)
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                SELECT id, path, name, publisher, version, file_size, file_mtime
+                FROM apps
+                WHERE path LIKE '%.exe'
+                ORDER BY id DESC LIMIT $l
+                """;
+            cmd.Parameters.AddWithValue("$l", limit);
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+            {
+                list.Add((
+                    r.GetInt32(0),
+                    r.GetString(1),
+                    r.IsDBNull(2) ? null : r.GetString(2),
+                    r.IsDBNull(3) ? null : r.GetString(3),
+                    r.IsDBNull(4) ? null : r.GetString(4),
+                    r.IsDBNull(5) ? null : r.GetInt64(5),
+                    r.IsDBNull(6) ? null : r.GetInt64(6)
+                ));
+            }
+        }
+        return list;
+    }
+
+    public void UpdateAppMetadata(long appId, string? version, string? publisher, long? fileSize, long? fileMtime)
+    {
+        lock (_gate)
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                UPDATE apps
+                SET version = COALESCE($ver, version),
+                    publisher = COALESCE($pub, publisher),
+                    file_size = COALESCE($sz, file_size),
+                    file_mtime = COALESCE($mt, file_mtime)
+                WHERE id = $id
+                """;
+            cmd.Parameters.AddWithValue("$ver", (object?)version ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$pub", (object?)publisher ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$sz", (object?)fileSize ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$mt", (object?)fileMtime ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$id", appId);
+            cmd.ExecuteNonQuery();
         }
     }
 
@@ -750,6 +820,9 @@ internal sealed class Db : IDisposable
     public const int EvQuota75 = 2;
     public const int EvQuota90 = 3;
     public const int EvQuota100 = 4;
+    public const int EvAppVersionChanged = 5;
+    public const int EvAppExeChanged = 6;
+    public const int EvAppPublisherChanged = 7;
 
     public long AddEvent(long ts, int type, long? appId, string data)
     {
@@ -797,6 +870,27 @@ internal sealed class Db : IDisposable
         return list;
     }
 
+    public List<(long Id, long Ts, int Type, long? AppId, string? AppName, string Data)> GetEventsForApp(int appId, int limit)
+    {
+        var list = new List<(long, long, int, long?, string?, string)>();
+        lock (_gate)
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                SELECT e.id, e.ts, e.type, e.app_id, COALESCE(a.name, a.path), e.data
+                FROM events e LEFT JOIN apps a ON a.id = e.app_id
+                WHERE e.app_id = $id
+                ORDER BY e.id DESC LIMIT $l
+                """;
+            cmd.Parameters.AddWithValue("$id", appId);
+            cmd.Parameters.AddWithValue("$l", limit);
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+                list.Add((r.GetInt64(0), r.GetInt64(1), r.GetInt32(2), r.IsDBNull(3) ? null : r.GetInt64(3), r.IsDBNull(4) ? null : r.GetString(4), r.GetString(5)));
+        }
+        return list;
+    }
+
     public long MaxEventId()
     {
         lock (_gate)
@@ -807,12 +901,18 @@ internal sealed class Db : IDisposable
         }
     }
 
+    /// <summary>Count of unseen Important alerts (excludes low-severity unknown:pid / name: logs).</summary>
     public long UnseenEventCount()
     {
         lock (_gate)
         {
             using var cmd = _conn.CreateCommand();
-            cmd.CommandText = "SELECT COUNT(*) FROM events WHERE id > $seen";
+            cmd.CommandText = """
+                SELECT COUNT(*)
+                FROM events e LEFT JOIN apps a ON a.id = e.app_id
+                WHERE e.id > $seen
+                  AND NOT (e.type = 1 AND (COALESCE(a.path, '') LIKE 'unknown:%' OR COALESCE(a.path, '') LIKE 'name:%'))
+                """;
             cmd.Parameters.AddWithValue("$seen", GetMetaLong("events_seen_id", 0));
             return (long)(cmd.ExecuteScalar() ?? 0L);
         }

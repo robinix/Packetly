@@ -2,6 +2,32 @@
 
 All notable changes to Packetly are documented here, including technical handoff notes for the local Windows build/verification agent.
 
+## v1.8.0 — Modern Alerts Tab Overhaul, Application Info Monitor & App Details Fix
+
+### User-facing changes
+- **Modern, detailed Alerts tab overhaul:** Replaced the barebones flat alert list with a sleek GlassWire-inspired timeline view matching Packetly's deep-navy (`#121a2a`) Elite design language:
+  - **Top filter toolbar:** Pill-shaped **Severity & Alert Type dropdown** (`All Alerts`, `Important`, `Logs`, `First network activity`, `Application info monitor`, `Quota monitor`) with live per-category counts and checkmarks, **Time Range dropdown** (`All Time`, `Day`, `Week`, `Month`), **`Mark all as read`** pill button, and live **`Search`** box matching app name, path, version, publisher, or category.
+  - **Smart severity filtering (default `Important`):** Ephemeral `unknown:pid*` / `name:*` entries are separated into **`Logs`** so the default **`Important`** view and the nav bar unread counter (`Alerts (N)`) stay clean and focused on real applications, executable/version changes, and quota alerts.
+  - **Date-grouped alert cards:** Alerts are grouped under **`Today`**, **`Yesterday`**, and formatted calendar dates inside elevated rounded cards with hairline row dividers. Each row shows an unread red indicator dot (for events newer than `seenId`), a crisp circular vector severity/type badge, the inline app icon (or clean default app-window / globe badge), rich bold-highlighted messages (e.g., **Firefox** version changed from **160.0.1.575** to **161.0.0.3**.), and right-aligned two-line metadata (monitor category + exact local clock time like `5:33 am`).
+  - **Expandable details & quick App Details:** Clicking any alert row expands an inline drawer with full executable path, version, publisher, exact timestamp, and an **`App Details`** button (double-clicking also opens App Details directly).
+- **Application Info Monitor (collector):** The `.NET 8` collector now tracks executable version, publisher, file size, and last-modified timestamp for `.exe` apps (seeding existing rows silently on upgrade without alert spam) and raises rich alerts when an app's **version**, **executable binary**, or **publisher** changes.
+- **Fixed App Details popup closing immediately:** Fixed a polling-loop bug where clicking any app in **Traffic** or **Usage** opened the App Details popup only for the next background refresh tick (`150ms`–`750ms` later) to overwrite `app_detail` with `None` and shut it immediately. Also fixed closing the popup while paused on a graph selection, added instant open/close fast-path fetching, added `Escape`-to-close, aspect-fit header icons, deterministic Hosts tie-breaking, and human-readable per-app alerts inside the popup's **Alerts** tab.
+
+### Local agent handoff notes
+- **Files changed:**
+  - `packetly/src/Packetly/Storage/Db.cs` — added `MigrateAppsMetadataColumns()` (`version`, `file_size`, `file_mtime` columns on `apps`), new event type constants (`EvAppVersionChanged = 5`, `EvAppExeChanged = 6`, `EvAppPublisherChanged = 7`), `GetMonitoredApps`, `UpdateAppMetadata`, `GetEventsForApp`, and updated `UnseenEventCount()` to exclude low-severity `unknown:*`/`name:*` new-app logs.
+  - `packetly/src/Packetly/Core/AlertEngine.cs` — added periodic Application Info Monitor (`CheckAppChanges`, 120s interval, quiet baseline seeding on first scan) detecting version, binary, and publisher changes; enriched `OnAppCreated` with version/publisher metadata.
+  - `packetly/src/Packetly/Program.cs` — moved `alerts.OnAppCreated` inside `Task.Run` alongside `IconExtractor.TryExtract` so executable disk reads never stall the `Db` lock.
+  - `packetly/src/Packetly/Api/AppApi.cs` — version `1.8.0`; added `seenId` and raised limit (`500` default / `1000` max) on `GET /api/events`; added per-app `alerts` array to `GET /api/appinfo` (fully backward-compatible).
+  - `packetly-ui/src/main.rs` — added `AlertFilter`, `AlertRange`, `EventRow.app_id`, `AppDetail.alerts`, `Snapshot.events_seen_id`, `parse_event_row`, `ParsedAlert`/`parse_alert`, date/clock formatters, custom vector badge/toolbar icons, and `segoe_ui_bold` (`FontFamily::Name("bold")`) registration; completely overhauled `alerts_tab`; fixed `active_detail` persistence + instant open/close fast-path in the background thread (and added `fr.events` `app_id`s to icon fetcher); polished `app_detail_popup` with `Escape` close, `paint_icon_fit`, host tie-breaking, and formatted per-app alerts.
+  - `packetly-ui/Cargo.toml`, `packetly-ui/Cargo.lock`, `package.json` — version bumped to `1.8.0`.
+- **Verify locally on Windows:**
+  1. `git pull`
+  2. `dotnet build packetly/src/Packetly -c Release`
+  3. `cargo build --release --manifest-path packetly-ui/Cargo.toml`
+  4. Click multiple apps in **Traffic**, **Usage**, **Alerts** (via `App Details` or double-click), and paused **Traffic Monitor** selection: verify the App Details popup opens instantly, stays open stably across refreshes, shows formatted alerts on its **Alerts** sub-tab, and closes cleanly via `✕` or `Esc`.
+  5. Open **Alerts** tab across **Elite (navy)**, **Dark**, and **Light** themes: verify `Important` default view hides `unknown:pid*` noise (visible under `Logs` / `All Alerts`), test both floating dropdown menus (`Important ▾` with live counts, `All Time ▾` with `Day`/`Week`/`Month`), test live `Search`, test expanding rows, and click **`Mark all as read`** to confirm unread red dots and the nav badge clear immediately.
+
 ## v1.7.4 — Modern Usage Dashboard, Stable Tie-Breaking & Reliable Fast App Icons
 
 ### User-facing changes

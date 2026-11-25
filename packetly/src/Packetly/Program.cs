@@ -423,8 +423,11 @@ async Task<int> RunServeAsync(string dbPath, string mode, int port, bool elevate
     var geoip = new GeoIpJob(db);
     db.AppCreated += (id, path) =>
     {
-        try { alerts.OnAppCreated(id, path); } catch { /* alerting must never break collection */ }
-        _ = Task.Run(() => { try { IconExtractor.TryExtract(db, (int)id, path); } catch { } });
+        _ = Task.Run(() =>
+        {
+            try { alerts.OnAppCreated(id, path); } catch { /* alerting must never break collection */ }
+            try { IconExtractor.TryExtract(db, (int)id, path); } catch { }
+        });
     };
     Log($"process tracker: {tracker.Count} processes resolved ({tracker.LastDiagnostic})");
 

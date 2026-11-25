@@ -477,8 +477,59 @@ struct EventRow {
     id: i64,
     ts: f64,
     kind: i64,
+    app_id: Option<i64>,
     app_name: Option<String>,
     data: String,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum AlertFilter {
+    All,
+    Important,
+    Logs,
+    FirstActivity,
+    AppInfo,
+    Quota,
+}
+
+impl AlertFilter {
+    fn label(self) -> &'static str {
+        match self {
+            AlertFilter::All => "All Alerts",
+            AlertFilter::Important => "Important",
+            AlertFilter::Logs => "Logs",
+            AlertFilter::FirstActivity => "First network activity",
+            AlertFilter::AppInfo => "Application info monitor",
+            AlertFilter::Quota => "Quota monitor",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum AlertRange {
+    AllTime,
+    Day,
+    Week,
+    Month,
+}
+
+impl AlertRange {
+    fn label(self) -> &'static str {
+        match self {
+            AlertRange::AllTime => "All Time",
+            AlertRange::Day => "Day",
+            AlertRange::Week => "Week",
+            AlertRange::Month => "Month",
+        }
+    }
+    fn seconds(self) -> Option<f64> {
+        match self {
+            AlertRange::AllTime => None,
+            AlertRange::Day => Some(86_400.0),
+            AlertRange::Week => Some(7.0 * 86_400.0),
+            AlertRange::Month => Some(30.0 * 86_400.0),
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -635,6 +686,7 @@ struct AppDetail {
     out_bytes: f64,
     alert_count: i64,
     hosts: Vec<AppHostRow>,
+    alerts: Vec<EventRow>,
     range: (i64, i64),
 }
 
@@ -669,6 +721,7 @@ struct Snapshot {
     usage_out: f64,
     quotas: Vec<QuotaRow>,
     events: Vec<EventRow>,
+    events_seen_id: i64,
     unseen: i64,
     collector: String,
     status_ok: bool,
@@ -1272,6 +1325,17 @@ fn fetch_traffic(q: &str) -> Result<TrafficData, String> {
     })
 }
 
+fn parse_event_row(e: &serde_json::Value) -> EventRow {
+    EventRow {
+        id: e["id"].as_i64().unwrap_or(0),
+        ts: e["ts"].as_f64().unwrap_or(0.0),
+        kind: e["type"].as_i64().unwrap_or(0),
+        app_id: e["appId"].as_i64(),
+        app_name: e["appName"].as_str().map(|s| s.to_string()),
+        data: e["data"].as_str().unwrap_or("").to_string(),
+    }
+}
+
 fn parse_appinfo(d: &serde_json::Value, app_id: i64, f: i64, t: i64) -> AppDetail {
     AppDetail {
         app_id,
@@ -1297,6 +1361,10 @@ fn parse_appinfo(d: &serde_json::Value, app_id: i64, f: i64, t: i64) -> AppDetai
                     })
                     .collect()
             })
+            .unwrap_or_default(),
+        alerts: d["alerts"]
+            .as_array()
+            .map(|arr| arr.iter().map(parse_event_row).collect())
             .unwrap_or_default(),
         range: (f, t),
     }
@@ -1449,25 +1517,23 @@ fn fetch_snapshot(
             if full_meta {
                 if let Ok(d) = fetch_json(&format!("{}/api/events?limit=50", API)) {
                     snap.unseen = d["unseen"].as_i64().unwrap_or(0);
+                    snap.events_seen_id = d["seenId"].as_i64().unwrap_or(0);
                     if let Some(arr) = d["events"].as_array() {
-                        snap.events = arr
-                            .iter()
-                            .map(|e| EventRow {
-                                id: e["id"].as_i64().unwrap_or(0),
-                                ts: e["ts"].as_f64().unwrap_or(0.0),
-                                kind: e["type"].as_i64().unwrap_or(0),
-                                app_name: e["appName"].as_str().map(|s| s.to_string()),
-                                data: e["data"].as_str().unwrap_or("").to_string(),
-                            })
-                            .collect();
+                        snap.events = arr.iter().map(parse_event_row).collect();
                     }
                 }
             } else if let Some(p) = prev {
                 snap.events = p.events.clone();
+                snap.events_seen_id = p.events_seen_id;
                 snap.unseen = p.unseen;
             }
         }
         Tab::Traffic => {
+            if let Some(p) = prev {
+                snap.events = p.events.clone();
+                snap.events_seen_id = p.events_seen_id;
+                snap.unseen = p.unseen;
+            }
             if let Ok(d) = fetch_json(&format!("{}/api/traffic?{}&group=type", API, q)) {
                 snap.type_data = Some(parse_group(&d));
             }
@@ -1476,6 +1542,11 @@ fn fetch_snapshot(
             }
         }
         Tab::Usage => {
+            if let Some(p) = prev {
+                snap.events = p.events.clone();
+                snap.events_seen_id = p.events_seen_id;
+                snap.unseen = p.unseen;
+            }
             let usage_q = if let Some(span) = period.span() {
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -1552,20 +1623,16 @@ fn fetch_snapshot(
             }
         }
         Tab::Alerts => {
-            if let Ok(d) = fetch_json(&format!("{}/api/events?limit=100", API)) {
+            if let Ok(d) = fetch_json(&format!("{}/api/events?limit=500", API)) {
                 snap.unseen = d["unseen"].as_i64().unwrap_or(0);
+                snap.events_seen_id = d["seenId"].as_i64().unwrap_or(0);
                 if let Some(arr) = d["events"].as_array() {
-                    snap.events = arr
-                        .iter()
-                        .map(|e| EventRow {
-                            id: e["id"].as_i64().unwrap_or(0),
-                            ts: e["ts"].as_f64().unwrap_or(0.0),
-                            kind: e["type"].as_i64().unwrap_or(0),
-                            app_name: e["appName"].as_str().map(|s| s.to_string()),
-                            data: e["data"].as_str().unwrap_or("").to_string(),
-                        })
-                        .collect();
+                    snap.events = arr.iter().map(parse_event_row).collect();
                 }
+            } else if let Some(p) = prev {
+                snap.events = p.events.clone();
+                snap.events_seen_id = p.events_seen_id;
+                snap.unseen = p.unseen;
             }
         }
     }
@@ -2326,6 +2393,12 @@ struct PacketlyApp {
     traffic_filter: String,
     usage_sort: SortKey,
     usage_filter: String,
+    alert_filter: AlertFilter,
+    alert_range: AlertRange,
+    alert_search: String,
+    alert_filter_open: bool,
+    alert_range_open: bool,
+    alert_expanded: Option<i64>,
     sel_sort: SortKey,
     detail_tab: usize,
     detail_sort: SortKey,
@@ -5508,90 +5581,1350 @@ impl PacketlyApp {
 
     fn alerts_tab(&mut self, ctx: &egui::Context) {
         let t = self.theme();
+        let dark = t.text.r() > 128;
+        let snap = self.snap.lock().unwrap().clone();
+
+        // Colors tailored to Elite / Dark / Light themes matching the reference layout
+        let card_bg = if dark { t.plot_bg } else { t.card };
+        let row_hover = if dark {
+            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 11)
+        } else {
+            egui::Color32::from_rgba_unmultiplied(15, 23, 42, 10)
+        };
+        let row_expanded_bg = if dark {
+            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 7)
+        } else {
+            egui::Color32::from_rgba_unmultiplied(15, 23, 42, 6)
+        };
+        let divider_col = if dark {
+            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 16)
+        } else {
+            t.border
+        };
+        let pill_bg = if dark { t.card2 } else { t.card2 };
+        let pill_hover = if dark {
+            egui::Color32::from_rgb(42, 54, 80)
+        } else {
+            egui::Color32::from_rgb(232, 238, 240)
+        };
+        let strong_col = if dark {
+            egui::Color32::from_rgb(242, 246, 255)
+        } else {
+            egui::Color32::from_rgb(15, 23, 42)
+        };
+        let body_col = if dark {
+            egui::Color32::from_rgb(178, 189, 210)
+        } else {
+            egui::Color32::from_rgb(75, 85, 99)
+        };
+
+        // Pre-compute time cutoff & live counts for the dropdown menu
+        let now_sec = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        let cutoff = self.alert_range.seconds().map(|s| now_sec - s);
+
+        let mut cnt_all = 0usize;
+        let mut cnt_important = 0usize;
+        let mut cnt_logs = 0usize;
+        let mut cnt_first = 0usize;
+        let mut cnt_appinfo = 0usize;
+        let mut cnt_quota = 0usize;
+        for e in &snap.events {
+            if let Some(c) = cutoff {
+                if e.ts < c {
+                    continue;
+                }
+            }
+            cnt_all += 1;
+            if alert_is_log(e) {
+                cnt_logs += 1;
+            } else {
+                cnt_important += 1;
+            }
+            match e.kind {
+                1 => cnt_first += 1,
+                2 | 3 | 4 => cnt_quota += 1,
+                5 | 6 | 7 => cnt_appinfo += 1,
+                _ => {}
+            }
+        }
+
+        let mut filter_btn_rect = egui::Rect::NOTHING;
+        let mut range_btn_rect = egui::Rect::NOTHING;
+        let mut just_opened_filter = false;
+        let mut just_opened_range = false;
+
         egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(t.bg).inner_margin(egui::Margin::symmetric(16.0, 4.0)))
+            .frame(
+                egui::Frame::none()
+                    .fill(t.bg)
+                    .inner_margin(egui::Margin::symmetric(20.0, 12.0)),
+            )
             .show(ctx, |ui| {
-                let snap = self.snap.lock().unwrap().clone();
+                // ---- Top filter toolbar (matches reference: Important ▾ | All Time ▾ ... Mark all as read | Search) ----
                 ui.horizontal(|ui| {
-                    ui.strong("Alerts");
+                    ui.spacing_mut().item_spacing.x = 10.0;
+
+                    // Severity / Alert Type dropdown pill
+                    let flabel = self.alert_filter.label();
+                    let fl_w = (ui
+                        .painter()
+                        .layout_no_wrap(
+                            flabel.to_string(),
+                            egui::FontId::proportional(12.5),
+                            t.text,
+                        )
+                        .size()
+                        .x
+                        + 42.0)
+                        .max(106.0);
+                    let (frect, fresp) = ui.allocate_exact_size(
+                        egui::vec2(fl_w, 30.0),
+                        egui::Sense::click(),
+                    );
+                    filter_btn_rect = frect;
+                    let ffill = if self.alert_filter_open || fresp.hovered() {
+                        pill_hover
+                    } else {
+                        pill_bg
+                    };
+                    let fp = ui.painter();
+                    fp.rect_filled(frect, 15.0, ffill);
+                    fp.rect_stroke(
+                        frect,
+                        15.0,
+                        egui::Stroke::new(
+                            1.0,
+                            if self.alert_filter_open { t.accent } else { t.border },
+                        ),
+                    );
+                    let fg = fp.layout_no_wrap(
+                        flabel.to_string(),
+                        egui::FontId::proportional(12.5),
+                        strong_col,
+                    );
+                    fp.galley(
+                        egui::Pos2::new(frect.left() + 14.0, frect.center().y - fg.size().y * 0.5),
+                        fg,
+                        strong_col,
+                    );
+                    draw_chevron_down(
+                        fp,
+                        egui::Pos2::new(frect.right() - 15.0, frect.center().y + 0.5),
+                        t.dim,
+                    );
+                    if fresp.clicked() {
+                        self.alert_filter_open = !self.alert_filter_open;
+                        self.alert_range_open = false;
+                        just_opened_filter = true;
+                    }
+
+                    // Time Range dropdown pill
+                    let rlabel = self.alert_range.label();
+                    let rl_w = (ui
+                        .painter()
+                        .layout_no_wrap(
+                            rlabel.to_string(),
+                            egui::FontId::proportional(12.5),
+                            t.text,
+                        )
+                        .size()
+                        .x
+                        + 42.0)
+                        .max(94.0);
+                    let (rrect, rresp) = ui.allocate_exact_size(
+                        egui::vec2(rl_w, 30.0),
+                        egui::Sense::click(),
+                    );
+                    range_btn_rect = rrect;
+                    let rfill = if self.alert_range_open || rresp.hovered() {
+                        pill_hover
+                    } else {
+                        pill_bg
+                    };
+                    let rp = ui.painter();
+                    rp.rect_filled(rrect, 15.0, rfill);
+                    rp.rect_stroke(
+                        rrect,
+                        15.0,
+                        egui::Stroke::new(
+                            1.0,
+                            if self.alert_range_open { t.accent } else { t.border },
+                        ),
+                    );
+                    let rg = rp.layout_no_wrap(
+                        rlabel.to_string(),
+                        egui::FontId::proportional(12.5),
+                        strong_col,
+                    );
+                    rp.galley(
+                        egui::Pos2::new(rrect.left() + 14.0, rrect.center().y - rg.size().y * 0.5),
+                        rg,
+                        strong_col,
+                    );
+                    draw_chevron_down(
+                        rp,
+                        egui::Pos2::new(rrect.right() - 15.0, rrect.center().y + 0.5),
+                        t.dim,
+                    );
+                    if rresp.clicked() {
+                        self.alert_range_open = !self.alert_range_open;
+                        self.alert_filter_open = false;
+                        just_opened_range = true;
+                    }
+
+                    // Right-aligned controls: Search pill + Mark all as read pill
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Mark all seen").clicked() {
+                        ui.spacing_mut().item_spacing.x = 10.0;
+
+                        // Search box wrapped in a sleek pill frame
+                        egui::Frame::none()
+                            .fill(pill_bg)
+                            .rounding(15.0)
+                            .stroke(egui::Stroke::new(1.0, t.border))
+                            .inner_margin(egui::Margin {
+                                left: 10.0,
+                                right: 8.0,
+                                top: 3.0,
+                                bottom: 3.0,
+                            })
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 6.0;
+                                    let (s_rect, _) = ui.allocate_exact_size(
+                                        egui::vec2(14.0, 22.0),
+                                        egui::Sense::hover(),
+                                    );
+                                    draw_search_icon(ui.painter(), s_rect.center(), t.dim);
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut self.alert_search)
+                                            .hint_text("Search")
+                                            .frame(false)
+                                            .desired_width(175.0),
+                                    );
+                                    if !self.alert_search.is_empty()
+                                        && ui
+                                            .add(
+                                                egui::Button::new(
+                                                    egui::RichText::new("✕")
+                                                        .size(11.0)
+                                                        .color(t.dim),
+                                                )
+                                                .frame(false),
+                                            )
+                                            .clicked()
+                                    {
+                                        self.alert_search.clear();
+                                    }
+                                });
+                            });
+
+                        // Mark all as read pill button
+                        let has_unread = snap.unseen > 0
+                            || snap.events.iter().any(|e| e.id > snap.events_seen_id);
+                        let (mrect, mresp) = ui.allocate_exact_size(
+                            egui::vec2(132.0, 30.0),
+                            if has_unread {
+                                egui::Sense::click()
+                            } else {
+                                egui::Sense::hover()
+                            },
+                        );
+                        let mfill = if has_unread && mresp.hovered() {
+                            pill_hover
+                        } else {
+                            pill_bg
+                        };
+                        let mtext_col = if has_unread { strong_col } else { t.dim };
+                        let mp = ui.painter();
+                        mp.rect_filled(mrect, 15.0, mfill);
+                        mp.rect_stroke(mrect, 15.0, egui::Stroke::new(1.0, t.border));
+                        let mg = mp.layout_no_wrap(
+                            "Mark all as read".to_string(),
+                            egui::FontId::proportional(12.2),
+                            mtext_col,
+                        );
+                        mp.galley(
+                            egui::Pos2::new(
+                                mrect.center().x - mg.size().x * 0.5,
+                                mrect.center().y - mg.size().y * 0.5,
+                            ),
+                            mg,
+                            mtext_col,
+                        );
+                        if has_unread && mresp.clicked() {
                             let _ = ureq::post(&format!("{}/api/events/seen", API)).call();
-                            let _ = self.tx.send(UiMsg::Refresh(self.tab, self.sel.clone(), self.period));
+                            let _ = self.tx.send(UiMsg::Refresh(
+                                self.tab,
+                                self.sel.clone(),
+                                self.period,
+                            ));
                         }
                     });
                 });
-                ui.add_space(6.0);
+
+                ui.add_space(12.0);
+
+                // ---- Filter & group alerts by local calendar date ----
+                let search_q = self.alert_search.trim().to_lowercase();
+                let active_filter = self.alert_filter;
+                let seen_id = snap.events_seen_id;
+                let today = chrono::Local::now().date_naive();
+
+                let mut groups: Vec<(String, Vec<(&EventRow, ParsedAlert)>)> = Vec::new();
+                for e in &snap.events {
+                    if let Some(c) = cutoff {
+                        if e.ts < c {
+                            continue;
+                        }
+                    }
+                    if !alert_matches_filter(e, active_filter) {
+                        continue;
+                    }
+                    let parsed = parse_alert(e);
+                    if !search_q.is_empty() {
+                        let cat = alert_category(e.kind).to_lowercase();
+                        let hay_plain = parsed.plain.to_lowercase();
+                        let hay_path = parsed.path.as_deref().unwrap_or("").to_lowercase();
+                        let hay_pub = parsed.publisher.as_deref().unwrap_or("").to_lowercase();
+                        let hay_ver = parsed.version.as_deref().unwrap_or("").to_lowercase();
+                        if !hay_plain.contains(&search_q)
+                            && !cat.contains(&search_q)
+                            && !hay_path.contains(&search_q)
+                            && !hay_pub.contains(&search_q)
+                            && !hay_ver.contains(&search_q)
+                        {
+                            continue;
+                        }
+                    }
+                    let (_date, heading) = alert_date_heading(e.ts, today);
+                    if let Some(last) = groups.last_mut() {
+                        if last.0 == heading {
+                            last.1.push((e, parsed));
+                            continue;
+                        }
+                    }
+                    groups.push((heading, vec![(e, parsed)]));
+                }
+
+                // ---- Main grouped timeline feed ----
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        if snap.events.is_empty() {
-                            ui.weak("no alerts yet");
+                        if groups.is_empty() {
+                            ui.add_space(36.0);
+                            egui::Frame::none()
+                                .fill(card_bg)
+                                .rounding(8.0)
+                                .stroke(egui::Stroke::new(1.0, t.border))
+                                .inner_margin(egui::Margin::symmetric(28.0, 32.0))
+                                .show(ui, |ui| {
+                                    ui.set_min_width((ui.available_width() - 4.0).max(260.0));
+                                    ui.vertical_centered(|ui| {
+                                        let msg = if snap.events.is_empty() {
+                                            "No alerts recorded yet".to_string()
+                                        } else if !search_q.is_empty() {
+                                            format!("No alerts matching \"{}\"", self.alert_search.trim())
+                                        } else if active_filter == AlertFilter::Important && cnt_logs > 0 {
+                                            format!(
+                                                "No important alerts in this range ({} background log entries hidden)",
+                                                cnt_logs
+                                            )
+                                        } else {
+                                            "No alerts match the current filter".to_string()
+                                        };
+                                        ui.label(
+                                            egui::RichText::new(msg)
+                                                .size(13.5)
+                                                .color(body_col),
+                                        );
+                                        if active_filter != AlertFilter::All
+                                            || self.alert_range != AlertRange::AllTime
+                                            || !self.alert_search.is_empty()
+                                        {
+                                            ui.add_space(10.0);
+                                            if ui.button("Show All Alerts").clicked() {
+                                                self.alert_filter = AlertFilter::All;
+                                                self.alert_range = AlertRange::AllTime;
+                                                self.alert_search.clear();
+                                            }
+                                        }
+                                    });
+                                });
                             return;
                         }
-                        for e in &snap.events {
-                            let (badge, badge_color, text) = match e.kind {
-                                1 => {
-                                    let name = e.app_name.clone().unwrap_or_else(|| {
-                                        serde_json::from_str::<serde_json::Value>(&e.data)
-                                            .ok()
-                                            .and_then(|d| d["name"].as_str().map(|s| s.to_string()))
-                                            .unwrap_or_else(|| "unknown".into())
-                                    });
-                                    (
-                                        "NEW".to_string(),
-                                        t.accent,
-                                        format!("New app on the network: {}", name),
-                                    )
-                                }
-                                2 | 3 | 4 => {
-                                    let pct = match e.kind {
-                                        2 => 75,
-                                        3 => 90,
-                                        _ => 100,
-                                    };
-                                    let who =
-                                        e.app_name.clone().unwrap_or_else(|| "All apps".into());
-                                    let d = serde_json::from_str::<serde_json::Value>(&e.data)
-                                        .unwrap_or(serde_json::Value::Null);
-                                    let used = d["used"].as_f64().unwrap_or(0.0);
-                                    let limit = d["limit"].as_f64().unwrap_or(0.0);
-                                    let period =
-                                        d["period"].as_str().unwrap_or("daily").to_string();
-                                    (
-                                        format!("{}%", pct),
-                                        if e.kind == 4 { t.danger } else { t.out_c },
-                                        format!(
-                                            "{} reached {}% of its {} quota ({}, {})",
-                                            who,
-                                            pct,
-                                            period,
-                                            fmt_b(used),
-                                            fmt_b(limit)
-                                        ),
-                                    )
-                                }
-                                _ => ("·".to_string(), t.dim, "alert".to_string()),
-                            };
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    egui::RichText::new(format!("{:>4}", badge))
-                                        .color(badge_color)
-                                        .strong()
-                                        .size(11.0),
-                                );
-                                ui.vertical(|ui| {
-                                    ui.label(egui::RichText::new(text).color(t.text));
-                                    ui.weak(
-                                        egui::RichText::new(rel_time(e.ts)).size(11.0).color(t.dim),
-                                    );
+
+                        let mut open_detail_req: Option<(i64, i64, i64)> = None;
+                        let mut toggle_expand_id: Option<i64> = None;
+
+                        for (g_idx, (heading, rows)) in groups.iter().enumerate() {
+                            if g_idx > 0 {
+                                ui.add_space(16.0);
+                            }
+                            ui.label(
+                                egui::RichText::new(heading)
+                                    .size(12.5)
+                                    .strong()
+                                    .color(strong_col),
+                            );
+                            ui.add_space(8.0);
+
+                            egui::Frame::none()
+                                .fill(card_bg)
+                                .rounding(8.0)
+                                .stroke(egui::Stroke::new(1.0, t.border))
+                                .inner_margin(egui::Margin::same(0.0))
+                                .show(ui, |ui| {
+                                    ui.spacing_mut().item_spacing.y = 0.0;
+                                    let card_w = ui.available_width();
+
+                                    for (idx, (e, parsed)) in rows.iter().enumerate() {
+                                        let is_expanded = self.alert_expanded == Some(e.id);
+                                        let is_log = alert_is_log(e);
+                                        let is_unread = e.id > seen_id;
+
+                                        // Hairline row separator
+                                        if idx > 0 {
+                                            let (sep_rect, _) = ui.allocate_exact_size(
+                                                egui::vec2(card_w, 1.0),
+                                                egui::Sense::hover(),
+                                            );
+                                            ui.painter().rect_filled(sep_rect, 0.0, divider_col);
+                                        }
+
+                                        let row_h = 56.0;
+                                        let (rect, resp) = ui.allocate_exact_size(
+                                            egui::vec2(card_w, row_h),
+                                            egui::Sense::click(),
+                                        );
+
+                                        if resp.hovered() || is_expanded {
+                                            let r_round = if rows.len() == 1 && !is_expanded {
+                                                8.0
+                                            } else {
+                                                0.0
+                                            };
+                                            ui.painter().rect_filled(
+                                                rect,
+                                                r_round,
+                                                if resp.hovered() {
+                                                    row_hover
+                                                } else {
+                                                    row_expanded_bg
+                                                },
+                                            );
+                                        }
+
+                                        // Fetch app icon texture before taking painter reference
+                                        let app_tex = e.app_id.and_then(|aid| {
+                                            self.app_icon_opt(ctx, aid, &parsed.app_display)
+                                        });
+
+                                        let painter = ui.painter_at(rect);
+                                        let cy = rect.center().y;
+
+                                        // 1. Left circular severity/type badge + unread red dot
+                                        let badge_cx = rect.left() + 34.0;
+                                        draw_alert_badge(
+                                            &painter,
+                                            egui::Pos2::new(badge_cx, cy),
+                                            13.0,
+                                            e.kind,
+                                            is_log,
+                                            is_unread,
+                                            &t,
+                                        );
+
+                                        // 2. Inline app icon (18×18)
+                                        let icon_x = badge_cx + 26.0;
+                                        let icon_slot = egui::Rect::from_center_size(
+                                            egui::Pos2::new(icon_x + 9.0, cy),
+                                            egui::vec2(18.0, 18.0),
+                                        );
+                                        if let Some(ref tex) = app_tex {
+                                            paint_icon_fit(&painter, tex, icon_slot);
+                                        } else if matches!(e.kind, 2 | 3 | 4) && e.app_id.is_none() {
+                                            draw_globe_icon(&painter, &icon_slot, t.accent);
+                                        } else {
+                                            draw_default_app_window_icon(&painter, icon_slot, dark);
+                                        }
+
+                                        // 3. Right-aligned two-line metadata (category + exact clock time)
+                                        let right_pad = 20.0;
+                                        let meta_right = rect.right() - right_pad;
+                                        let cat_str = alert_category(e.kind);
+                                        let time_str = alert_clock_str(e.ts);
+
+                                        let cat_galley = painter.layout_no_wrap(
+                                            cat_str.to_string(),
+                                            egui::FontId::proportional(11.5),
+                                            t.dim,
+                                        );
+                                        let time_galley = painter.layout_no_wrap(
+                                            time_str,
+                                            egui::FontId::proportional(11.0),
+                                            if dark {
+                                                egui::Color32::from_rgb(122, 134, 158)
+                                            } else {
+                                                t.dim
+                                            },
+                                        );
+                                        let meta_w = cat_galley
+                                            .size()
+                                            .x
+                                            .max(time_galley.size().x)
+                                            .max(120.0);
+
+                                        painter.galley(
+                                            egui::Pos2::new(
+                                                meta_right - cat_galley.size().x,
+                                                cy - cat_galley.size().y - 1.5,
+                                            ),
+                                            cat_galley,
+                                            t.dim,
+                                        );
+                                        painter.galley(
+                                            egui::Pos2::new(
+                                                meta_right - time_galley.size().x,
+                                                cy + 2.0,
+                                            ),
+                                            time_galley,
+                                            t.dim,
+                                        );
+
+                                        // 4. Rich formatted message with bold spans
+                                        let text_left = icon_slot.right() + 10.0;
+                                        let text_max_w =
+                                            (meta_right - meta_w - 20.0 - text_left).max(80.0);
+                                        let mut job = egui::text::LayoutJob::default();
+                                        for (seg, bold) in &parsed.segments {
+                                            let fmt = if *bold {
+                                                egui::TextFormat {
+                                                    font_id: egui::FontId::new(
+                                                        13.0,
+                                                        egui::FontFamily::Name("bold".into()),
+                                                    ),
+                                                    color: strong_col,
+                                                    ..Default::default()
+                                                }
+                                            } else {
+                                                egui::TextFormat {
+                                                    font_id: egui::FontId::proportional(13.0),
+                                                    color: body_col,
+                                                    ..Default::default()
+                                                }
+                                            };
+                                            job.append(seg, 0.0, fmt);
+                                        }
+                                        job.wrap.max_width = text_max_w;
+                                        job.wrap.max_rows = 1;
+                                        job.wrap.break_anywhere = true;
+                                        job.wrap.overflow_character = Some('…');
+                                        let msg_galley = painter.layout_job(job);
+                                        let msg_h = msg_galley.size().y;
+                                        painter.galley(
+                                            egui::Pos2::new(text_left, cy - msg_h * 0.5),
+                                            msg_galley,
+                                            body_col,
+                                        );
+
+                                        if resp.double_clicked() {
+                                            if let Some(aid) = e.app_id {
+                                                let now_i = now_sec as i64;
+                                                open_detail_req =
+                                                    Some((aid, now_i - 86_400, now_i));
+                                            }
+                                        } else if resp.clicked() {
+                                            toggle_expand_id = Some(e.id);
+                                        }
+
+                                        // 5. Expandable inline detail drawer
+                                        if is_expanded {
+                                            egui::Frame::none()
+                                                .fill(row_expanded_bg)
+                                                .inner_margin(egui::Margin {
+                                                    left: 72.0,
+                                                    right: 20.0,
+                                                    top: 6.0,
+                                                    bottom: 12.0,
+                                                })
+                                                .show(ui, |ui| {
+                                                    ui.set_min_width((card_w - 92.0).max(160.0));
+                                                    ui.horizontal(|ui| {
+                                                        ui.vertical(|ui| {
+                                                            ui.spacing_mut().item_spacing.y = 3.0;
+                                                            if let Some(ref p) = parsed.path {
+                                                                ui.horizontal(|ui| {
+                                                                    ui.label(
+                                                                        egui::RichText::new("Path:")
+                                                                            .size(11.5)
+                                                                            .color(t.dim),
+                                                                    );
+                                                                    ui.add(
+                                                                        egui::Label::new(
+                                                                            egui::RichText::new(p)
+                                                                                .size(11.5)
+                                                                                .color(strong_col),
+                                                                        )
+                                                                        .truncate(),
+                                                                    );
+                                                                });
+                                                            }
+                                                            ui.horizontal(|ui| {
+                                                                if let Some(ref v) = parsed.version {
+                                                                    ui.label(
+                                                                        egui::RichText::new(format!(
+                                                                            "Version: {}",
+                                                                            v
+                                                                        ))
+                                                                        .size(11.5)
+                                                                        .color(body_col),
+                                                                    );
+                                                                    ui.add_space(12.0);
+                                                                }
+                                                                if let Some(ref pub_s) = parsed.publisher {
+                                                                    ui.label(
+                                                                        egui::RichText::new(format!(
+                                                                            "Publisher: {}",
+                                                                            pub_s
+                                                                        ))
+                                                                        .size(11.5)
+                                                                        .color(body_col),
+                                                                    );
+                                                                    ui.add_space(12.0);
+                                                                }
+                                                                if let Some(ref ex) = parsed.extra {
+                                                                    ui.label(
+                                                                        egui::RichText::new(ex)
+                                                                            .size(11.5)
+                                                                            .color(body_col),
+                                                                    );
+                                                                    ui.add_space(12.0);
+                                                                }
+                                                                ui.label(
+                                                                    egui::RichText::new(
+                                                                        alert_full_time_str(e.ts),
+                                                                    )
+                                                                    .size(11.0)
+                                                                    .color(t.dim),
+                                                                );
+                                                            });
+                                                        });
+                                                        if let Some(aid) = e.app_id {
+                                                            ui.with_layout(
+                                                                egui::Layout::right_to_left(
+                                                                    egui::Align::Center,
+                                                                ),
+                                                                |ui| {
+                                                                    if ui
+                                                                        .button("App Details")
+                                                                        .clicked()
+                                                                    {
+                                                                        let now_i = now_sec as i64;
+                                                                        open_detail_req = Some((
+                                                                            aid,
+                                                                            now_i - 86_400,
+                                                                            now_i,
+                                                                        ));
+                                                                    }
+                                                                },
+                                                            );
+                                                        }
+                                                    });
+                                                });
+                                        }
+                                    }
                                 });
-                            });
-                            ui.add_space(2.0);
                         }
+
+                        if let Some(eid) = toggle_expand_id {
+                            if self.alert_expanded == Some(eid) {
+                                self.alert_expanded = None;
+                            } else {
+                                self.alert_expanded = Some(eid);
+                            }
+                        }
+                        if let Some((aid, f, tt)) = open_detail_req {
+                            self.detail_tab = 0;
+                            let _ = self.tx.send(UiMsg::AppDetail(Some((aid, f, tt))));
+                        }
+
+                        ui.add_space(18.0);
                     });
             });
+
+        // ---- Floating Filter Dropdown Menu (Severity & Alert Type with counts) ----
+        if self.alert_filter_open {
+            let menu_bg = if dark {
+                egui::Color32::from_rgb(36, 44, 68)
+            } else {
+                t.card
+            };
+            let menu_hover = if dark {
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 16)
+            } else {
+                egui::Color32::from_rgba_unmultiplied(15, 23, 42, 12)
+            };
+            let area_resp = egui::Area::new(egui::Id::new("alerts-filter-menu"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(egui::Pos2::new(
+                    filter_btn_rect.left(),
+                    filter_btn_rect.bottom() + 6.0,
+                ))
+                .show(ctx, |ui| {
+                    egui::Frame::none()
+                        .fill(menu_bg)
+                        .rounding(8.0)
+                        .stroke(egui::Stroke::new(1.0, t.border))
+                        .inner_margin(egui::Margin::symmetric(0.0, 6.0))
+                        .show(ui, |ui| {
+                            ui.set_min_width(236.0);
+                            ui.set_max_width(236.0);
+                            ui.spacing_mut().item_spacing.y = 0.0;
+
+                            let mut draw_item =
+                                |ui: &mut egui::Ui,
+                                 filter: AlertFilter,
+                                 count: usize,
+                                 cur: &mut AlertFilter,
+                                 open: &mut bool| {
+                                    let selected = *cur == filter;
+                                    let (rect, resp) = ui.allocate_exact_size(
+                                        egui::vec2(236.0, 30.0),
+                                        egui::Sense::click(),
+                                    );
+                                    if resp.hovered() {
+                                        ui.painter().rect_filled(rect, 0.0, menu_hover);
+                                    }
+                                    let p = ui.painter();
+                                    let cy = rect.center().y;
+                                    if selected {
+                                        draw_checkmark(
+                                            p,
+                                            egui::Pos2::new(rect.left() + 14.0, cy),
+                                            t.dim,
+                                        );
+                                    }
+                                    let lbl = p.layout_no_wrap(
+                                        filter.label().to_string(),
+                                        egui::FontId::proportional(12.2),
+                                        if selected { strong_col } else { body_col },
+                                    );
+                                    p.galley(
+                                        egui::Pos2::new(rect.left() + 30.0, cy - lbl.size().y * 0.5),
+                                        lbl,
+                                        strong_col,
+                                    );
+                                    let cnt = p.layout_no_wrap(
+                                        count.to_string(),
+                                        egui::FontId::proportional(11.5),
+                                        t.dim,
+                                    );
+                                    p.galley(
+                                        egui::Pos2::new(
+                                            rect.right() - 14.0 - cnt.size().x,
+                                            cy - cnt.size().y * 0.5,
+                                        ),
+                                        cnt,
+                                        t.dim,
+                                    );
+                                    if resp.clicked() {
+                                        *cur = filter;
+                                        *open = false;
+                                    }
+                                };
+
+                            let draw_sep = |ui: &mut egui::Ui| {
+                                ui.add_space(4.0);
+                                let (r, _) = ui.allocate_exact_size(
+                                    egui::vec2(236.0, 1.0),
+                                    egui::Sense::hover(),
+                                );
+                                ui.painter().rect_filled(r, 0.0, divider_col);
+                                ui.add_space(6.0);
+                            };
+
+                            let draw_hdr = |ui: &mut egui::Ui, title: &str| {
+                                let (r, _) = ui.allocate_exact_size(
+                                    egui::vec2(236.0, 22.0),
+                                    egui::Sense::hover(),
+                                );
+                                let g = ui.painter().layout_no_wrap(
+                                    title.to_string(),
+                                    egui::FontId::proportional(11.0),
+                                    t.dim,
+                                );
+                                ui.painter().galley(
+                                    egui::Pos2::new(r.left() + 30.0, r.center().y - g.size().y * 0.5),
+                                    g,
+                                    t.dim,
+                                );
+                            };
+
+                            draw_item(
+                                ui,
+                                AlertFilter::All,
+                                cnt_all,
+                                &mut self.alert_filter,
+                                &mut self.alert_filter_open,
+                            );
+                            draw_sep(ui);
+                            draw_hdr(ui, "Filter by severity");
+                            draw_item(
+                                ui,
+                                AlertFilter::Important,
+                                cnt_important,
+                                &mut self.alert_filter,
+                                &mut self.alert_filter_open,
+                            );
+                            draw_item(
+                                ui,
+                                AlertFilter::Logs,
+                                cnt_logs,
+                                &mut self.alert_filter,
+                                &mut self.alert_filter_open,
+                            );
+                            draw_sep(ui);
+                            draw_hdr(ui, "Filter by alert type");
+                            draw_item(
+                                ui,
+                                AlertFilter::FirstActivity,
+                                cnt_first,
+                                &mut self.alert_filter,
+                                &mut self.alert_filter_open,
+                            );
+                            draw_item(
+                                ui,
+                                AlertFilter::AppInfo,
+                                cnt_appinfo,
+                                &mut self.alert_filter,
+                                &mut self.alert_filter_open,
+                            );
+                            draw_item(
+                                ui,
+                                AlertFilter::Quota,
+                                cnt_quota,
+                                &mut self.alert_filter,
+                                &mut self.alert_filter_open,
+                            );
+                        });
+                });
+
+            if !just_opened_filter {
+                let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+                let clicked_out = ctx.input(|i| i.pointer.primary_pressed())
+                    && ctx
+                        .input(|i| i.pointer.interact_pos())
+                        .map(|p| {
+                            !area_resp.response.rect.contains(p) && !filter_btn_rect.contains(p)
+                        })
+                        .unwrap_or(false);
+                if esc || clicked_out {
+                    self.alert_filter_open = false;
+                }
+            }
+        }
+
+        // ---- Floating Time Range Dropdown Menu (All Time / Day / Week / Month) ----
+        if self.alert_range_open {
+            let menu_bg = if dark {
+                egui::Color32::from_rgb(36, 44, 68)
+            } else {
+                t.card
+            };
+            let menu_hover = if dark {
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 16)
+            } else {
+                egui::Color32::from_rgba_unmultiplied(15, 23, 42, 12)
+            };
+            let area_resp = egui::Area::new(egui::Id::new("alerts-range-menu"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(egui::Pos2::new(
+                    range_btn_rect.left(),
+                    range_btn_rect.bottom() + 6.0,
+                ))
+                .show(ctx, |ui| {
+                    egui::Frame::none()
+                        .fill(menu_bg)
+                        .rounding(8.0)
+                        .stroke(egui::Stroke::new(1.0, t.border))
+                        .inner_margin(egui::Margin::symmetric(0.0, 6.0))
+                        .show(ui, |ui| {
+                            ui.set_min_width(172.0);
+                            ui.set_max_width(172.0);
+                            ui.spacing_mut().item_spacing.y = 0.0;
+
+                            let mut draw_rng =
+                                |ui: &mut egui::Ui,
+                                 rng: AlertRange,
+                                 show_cal: bool,
+                                 cur: &mut AlertRange,
+                                 open: &mut bool| {
+                                    let selected = *cur == rng;
+                                    let (rect, resp) = ui.allocate_exact_size(
+                                        egui::vec2(172.0, 32.0),
+                                        egui::Sense::click(),
+                                    );
+                                    if resp.hovered() {
+                                        ui.painter().rect_filled(rect, 0.0, menu_hover);
+                                    }
+                                    let p = ui.painter();
+                                    let cy = rect.center().y;
+                                    if selected {
+                                        draw_checkmark(
+                                            p,
+                                            egui::Pos2::new(rect.left() + 14.0, cy),
+                                            t.dim,
+                                        );
+                                    }
+                                    let lbl = p.layout_no_wrap(
+                                        rng.label().to_string(),
+                                        egui::FontId::proportional(12.2),
+                                        if selected { strong_col } else { body_col },
+                                    );
+                                    p.galley(
+                                        egui::Pos2::new(rect.left() + 32.0, cy - lbl.size().y * 0.5),
+                                        lbl,
+                                        strong_col,
+                                    );
+                                    if show_cal {
+                                        let cal_rect = egui::Rect::from_center_size(
+                                            egui::Pos2::new(rect.right() - 18.0, cy),
+                                            egui::vec2(12.0, 12.0),
+                                        );
+                                        draw_calendar_mini_icon(p, cal_rect, t.dim);
+                                    }
+                                    if resp.clicked() {
+                                        *cur = rng;
+                                        *open = false;
+                                    }
+                                };
+
+                            draw_rng(
+                                ui,
+                                AlertRange::AllTime,
+                                false,
+                                &mut self.alert_range,
+                                &mut self.alert_range_open,
+                            );
+                            ui.add_space(4.0);
+                            let (sr, _) = ui.allocate_exact_size(
+                                egui::vec2(172.0, 1.0),
+                                egui::Sense::hover(),
+                            );
+                            ui.painter().rect_filled(sr, 0.0, divider_col);
+                            ui.add_space(4.0);
+                            draw_rng(
+                                ui,
+                                AlertRange::Day,
+                                true,
+                                &mut self.alert_range,
+                                &mut self.alert_range_open,
+                            );
+                            draw_rng(
+                                ui,
+                                AlertRange::Week,
+                                true,
+                                &mut self.alert_range,
+                                &mut self.alert_range_open,
+                            );
+                            draw_rng(
+                                ui,
+                                AlertRange::Month,
+                                true,
+                                &mut self.alert_range,
+                                &mut self.alert_range_open,
+                            );
+                        });
+                });
+
+            if !just_opened_range {
+                let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+                let clicked_out = ctx.input(|i| i.pointer.primary_pressed())
+                    && ctx
+                        .input(|i| i.pointer.interact_pos())
+                        .map(|p| {
+                            !area_resp.response.rect.contains(p) && !range_btn_rect.contains(p)
+                        })
+                        .unwrap_or(false);
+                if esc || clicked_out {
+                    self.alert_range_open = false;
+                }
+            }
+        }
+    }
 }
+
+struct ParsedAlert {
+    app_display: String,
+    segments: Vec<(String, bool)>,
+    plain: String,
+    path: Option<String>,
+    version: Option<String>,
+    publisher: Option<String>,
+    extra: Option<String>,
+}
+
+fn alert_is_log(e: &EventRow) -> bool {
+    if e.kind != 1 {
+        return false;
+    }
+    if let Some(ref name) = e.app_name {
+        if PacketlyApp::is_pseudo_app(name) {
+            return true;
+        }
+    }
+    if let Ok(d) = serde_json::from_str::<serde_json::Value>(&e.data) {
+        if let Some(p) = d["path"].as_str() {
+            if PacketlyApp::is_pseudo_app(p) {
+                return true;
+            }
+        }
+        if let Some(n) = d["name"].as_str() {
+            if PacketlyApp::is_pseudo_app(n) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn alert_category(kind: i64) -> &'static str {
+    match kind {
+        1 => "First network activity",
+        2 | 3 | 4 => "Quota monitor",
+        5 | 6 | 7 => "Application info monitor",
+        _ => "System monitor",
+    }
+}
+
+fn alert_matches_filter(e: &EventRow, filter: AlertFilter) -> bool {
+    match filter {
+        AlertFilter::All => true,
+        AlertFilter::Important => !alert_is_log(e),
+        AlertFilter::Logs => alert_is_log(e),
+        AlertFilter::FirstActivity => e.kind == 1,
+        AlertFilter::AppInfo => matches!(e.kind, 5 | 6 | 7),
+        AlertFilter::Quota => matches!(e.kind, 2 | 3 | 4),
+    }
+}
+
+fn parse_alert(e: &EventRow) -> ParsedAlert {
+    let d = serde_json::from_str::<serde_json::Value>(&e.data).unwrap_or(serde_json::Value::Null);
+    let path = d["path"].as_str().map(|s| s.to_string());
+    let publisher = d["publisher"]
+        .as_str()
+        .or_else(|| d["newPublisher"].as_str())
+        .map(|s| s.to_string());
+    let version = d["newVersion"]
+        .as_str()
+        .or_else(|| d["version"].as_str())
+        .map(|s| s.to_string());
+    let app_display = e
+        .app_name
+        .clone()
+        .or_else(|| d["name"].as_str().map(|s| s.to_string()))
+        .unwrap_or_else(|| {
+            if matches!(e.kind, 2 | 3 | 4) {
+                "All apps".to_string()
+            } else {
+                "Unknown application".to_string()
+            }
+        });
+
+    let mut extra: Option<String> = None;
+    let segments: Vec<(String, bool)> = match e.kind {
+        1 => vec![
+            (app_display.clone(), true),
+            (" accessed the network for the first time.".to_string(), false),
+        ],
+        2 | 3 | 4 => {
+            let pct = match e.kind {
+                2 => 75,
+                3 => 90,
+                _ => 100,
+            };
+            let used = d["used"].as_f64().unwrap_or(0.0);
+            let limit = d["limit"].as_f64().unwrap_or(0.0);
+            let period = d["period"].as_str().unwrap_or("daily").to_string();
+            extra = Some(format!("Usage: {} / {}", fmt_b(used), fmt_b(limit)));
+            vec![
+                (app_display.clone(), true),
+                (" reached ".to_string(), false),
+                (format!("{}%", pct), true),
+                (" of its ".to_string(), false),
+                (period, true),
+                (" quota (".to_string(), false),
+                (fmt_b(used), true),
+                (" / ".to_string(), false),
+                (fmt_b(limit), true),
+                (").".to_string(), false),
+            ]
+        }
+        5 => {
+            let old_v = d["oldVersion"].as_str().unwrap_or("unknown").to_string();
+            let new_v = d["newVersion"].as_str().unwrap_or("unknown").to_string();
+            vec![
+                (app_display.clone(), true),
+                (" version changed from ".to_string(), false),
+                (old_v, true),
+                (" to ".to_string(), false),
+                (new_v, true),
+                (".".to_string(), false),
+            ]
+        }
+        6 => {
+            if let (Some(os), Some(ns)) = (d["oldSize"].as_f64(), d["newSize"].as_f64()) {
+                extra = Some(format!("Binary size: {} -> {}", fmt_b(os), fmt_b(ns)));
+            }
+            vec![
+                (app_display.clone(), true),
+                (" executable changed.".to_string(), false),
+            ]
+        }
+        7 => {
+            let old_p = d["oldPublisher"].as_str().unwrap_or("unknown").to_string();
+            let new_p = d["newPublisher"].as_str().unwrap_or("unknown").to_string();
+            vec![
+                (app_display.clone(), true),
+                (" publisher changed from ".to_string(), false),
+                (old_p, true),
+                (" to ".to_string(), false),
+                (new_p, true),
+                (".".to_string(), false),
+            ]
+        }
+        _ => vec![(app_display.clone(), true), (" alert.".to_string(), false)],
+    };
+
+    let plain: String = segments.iter().map(|(s, _)| s.as_str()).collect();
+    ParsedAlert {
+        app_display,
+        segments,
+        plain,
+        path,
+        version,
+        publisher,
+        extra,
+    }
+}
+
+fn alert_date_heading(ts: f64, today: chrono::NaiveDate) -> (chrono::NaiveDate, String) {
+    use chrono::{Datelike, TimeZone};
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let dt = chrono::Local
+        .timestamp_opt(ts as i64, 0)
+        .single()
+        .unwrap_or_else(chrono::Local::now);
+    let d = dt.date_naive();
+    let label = if d == today {
+        "Today".to_string()
+    } else if today.signed_duration_since(d).num_days() == 1 {
+        "Yesterday".to_string()
+    } else {
+        let m = MONTHS[(d.month().saturating_sub(1) as usize).min(11)];
+        format!("{} {}, {}", m, d.day(), d.year())
+    };
+    (d, label)
+}
+
+fn alert_clock_str(ts: f64) -> String {
+    use chrono::{TimeZone, Timelike};
+    let dt = chrono::Local
+        .timestamp_opt(ts as i64, 0)
+        .single()
+        .unwrap_or_else(chrono::Local::now);
+    let (pm, h12) = dt.hour12();
+    format!("{}:{:02} {}", h12, dt.minute(), if pm { "pm" } else { "am" })
+}
+
+fn alert_full_time_str(ts: f64) -> String {
+    use chrono::{Datelike, TimeZone};
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let dt = chrono::Local
+        .timestamp_opt(ts as i64, 0)
+        .single()
+        .unwrap_or_else(chrono::Local::now);
+    let m = MONTHS[(dt.month().saturating_sub(1) as usize).min(11)];
+    format!("{} {}, {} · {}", m, dt.day(), dt.year(), alert_clock_str(ts))
+}
+
+fn draw_alert_badge(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    radius: f32,
+    kind: i64,
+    is_log: bool,
+    unread: bool,
+    t: &Theme,
+) {
+    // Unread coral-red dot at top-left outside the badge (matches reference)
+    if unread {
+        painter.circle_filled(
+            egui::Pos2::new(center.x - radius - 4.0, center.y - radius - 2.0),
+            3.0,
+            egui::Color32::from_rgb(239, 68, 68),
+        );
+    }
+
+    let bg = match kind {
+        5 | 6 | 7 => egui::Color32::from_rgb(245, 166, 35), // golden amber info
+        1 if !is_log => egui::Color32::from_rgb(56, 178, 240), // bright cyan-blue first activity
+        1 => egui::Color32::from_rgb(78, 92, 118),          // muted slate for logs
+        2 | 3 => egui::Color32::from_rgb(245, 158, 11),     // amber quota warning
+        4 => t.danger,                                       // red quota limit hit
+        _ => t.accent,
+    };
+    painter.circle_filled(center, radius, bg);
+
+    let fg = egui::Color32::WHITE;
+    match kind {
+        5 | 6 | 7 => {
+            // Crisp vector "i"
+            painter.circle_filled(egui::Pos2::new(center.x, center.y - 4.8), 1.65, fg);
+            painter.rect_filled(
+                egui::Rect::from_min_max(
+                    egui::Pos2::new(center.x - 1.45, center.y - 1.5),
+                    egui::Pos2::new(center.x + 1.45, center.y + 6.2),
+                ),
+                1.2,
+                fg,
+            );
+        }
+        1 => {
+            // Crisp vector network-pulse / globe icon
+            painter.circle_stroke(center, 5.8, egui::Stroke::new(1.4, fg));
+            painter.line_segment(
+                [
+                    egui::Pos2::new(center.x - 5.6, center.y),
+                    egui::Pos2::new(center.x + 5.6, center.y),
+                ],
+                egui::Stroke::new(1.2, fg),
+            );
+            painter.line_segment(
+                [
+                    egui::Pos2::new(center.x, center.y - 5.6),
+                    egui::Pos2::new(center.x, center.y + 5.6),
+                ],
+                egui::Stroke::new(1.2, fg),
+            );
+        }
+        2 | 3 | 4 => {
+            // Crisp vector "!"
+            painter.rect_filled(
+                egui::Rect::from_min_max(
+                    egui::Pos2::new(center.x - 1.45, center.y - 6.2),
+                    egui::Pos2::new(center.x + 1.45, center.y + 1.8),
+                ),
+                1.2,
+                fg,
+            );
+            painter.circle_filled(egui::Pos2::new(center.x, center.y + 5.0), 1.65, fg);
+        }
+        _ => {
+            painter.circle_filled(center, 2.5, fg);
+        }
+    }
+}
+
+fn draw_default_app_window_icon(painter: &egui::Painter, slot: egui::Rect, dark: bool) {
+    let r = egui::Rect::from_center_size(slot.center(), egui::vec2(15.0, 13.0));
+    let body = if dark {
+        egui::Color32::from_rgb(232, 238, 248)
+    } else {
+        egui::Color32::from_rgb(245, 248, 252)
+    };
+    let title = egui::Color32::from_rgb(76, 142, 232);
+    let border = if dark {
+        egui::Color32::from_rgb(120, 140, 175)
+    } else {
+        egui::Color32::from_rgb(148, 163, 184)
+    };
+    painter.rect_filled(r, 2.0, body);
+    painter.rect_filled(
+        egui::Rect::from_min_max(r.min, egui::Pos2::new(r.max.x, r.min.y + 3.5)),
+        1.5,
+        title,
+    );
+    painter.rect_stroke(r, 2.0, egui::Stroke::new(0.8, border));
+}
+
+fn draw_calendar_mini_icon(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let r = egui::Rect::from_min_max(
+        egui::Pos2::new(rect.left(), rect.top() + 1.5),
+        rect.max,
+    );
+    painter.rect_stroke(r, 1.5, egui::Stroke::new(1.0, color));
+    painter.line_segment(
+        [
+            egui::Pos2::new(r.left(), r.top() + 3.2),
+            egui::Pos2::new(r.right(), r.top() + 3.2),
+        ],
+        egui::Stroke::new(1.0, color),
+    );
+    for dx in [3.2_f32, r.width() - 3.2] {
+        painter.line_segment(
+            [
+                egui::Pos2::new(r.left() + dx, rect.top()),
+                egui::Pos2::new(r.left() + dx, r.top() + 2.0),
+            ],
+            egui::Stroke::new(1.1, color),
+        );
+    }
+}
+
+fn draw_search_icon(painter: &egui::Painter, center: egui::Pos2, color: egui::Color32) {
+    let c = egui::Pos2::new(center.x - 1.5, center.y - 1.5);
+    painter.circle_stroke(c, 4.2, egui::Stroke::new(1.3, color));
+    painter.line_segment(
+        [
+            egui::Pos2::new(c.x + 3.0, c.y + 3.0),
+            egui::Pos2::new(c.x + 6.2, c.y + 6.2),
+        ],
+        egui::Stroke::new(1.4, color),
+    );
+}
+
+fn draw_chevron_down(painter: &egui::Painter, center: egui::Pos2, color: egui::Color32) {
+    let s = egui::Stroke::new(1.3, color);
+    painter.line_segment(
+        [
+            egui::Pos2::new(center.x - 3.5, center.y - 1.5),
+            egui::Pos2::new(center.x, center.y + 2.0),
+        ],
+        s,
+    );
+    painter.line_segment(
+        [
+            egui::Pos2::new(center.x, center.y + 2.0),
+            egui::Pos2::new(center.x + 3.5, center.y - 1.5),
+        ],
+        s,
+    );
+}
+
+fn draw_checkmark(painter: &egui::Painter, center: egui::Pos2, color: egui::Color32) {
+    let s = egui::Stroke::new(1.5, color);
+    painter.line_segment(
+        [
+            egui::Pos2::new(center.x - 4.0, center.y),
+            egui::Pos2::new(center.x - 1.0, center.y + 3.2),
+        ],
+        s,
+    );
+    painter.line_segment(
+        [
+            egui::Pos2::new(center.x - 1.0, center.y + 3.2),
+            egui::Pos2::new(center.x + 4.5, center.y - 3.2),
+        ],
+        s,
+    );
 }
 
 fn prefs_file() -> std::path::PathBuf {
@@ -5975,7 +7308,9 @@ fn main() -> eframe::Result {
             let mut sel = RangeSel::Preset(Range::M5);
             let mut period = UsagePeriod::Today;
             let mut sel_data: Option<SelData> = None;
-            let mut app_detail_req: Option<(i64, i64, i64)> = None;
+            let mut active_detail: Option<(i64, i64, i64)> = None;
+            let mut detail_dirty = false;
+            let mut detail_only_wake = false;
             let mut paused_dirty = false;
             let mut tick: u64 = 0;
             let mut last_fetch_dur = Duration::ZERO;
@@ -5988,19 +7323,25 @@ fn main() -> eframe::Result {
                 } else {
                     sel.refresh().saturating_sub(last_fetch_dur)
                 };
+                detail_only_wake = false;
                 match rx.recv_timeout(timeout) {
                     Ok(msg) => match msg {
                         UiMsg::Refresh(t, s, p) => {
+                            if t != tab {
+                                active_detail = None;
+                                detail_dirty = false;
+                            }
                             tab = t;
                             sel = s;
                             period = p;
                             sel_data = None;
-                            app_detail_req = None;
                             icon_retry.clear();
                             tick = 0;
                         }
                         UiMsg::AppDetail(s) => {
-                            app_detail_req = s;
+                            active_detail = s;
+                            detail_dirty = true;
+                            detail_only_wake = true;
                         }
                         UiMsg::Selection(s) => match s {
                             None => {
@@ -6064,20 +7405,25 @@ fn main() -> eframe::Result {
                 // freezes so the selected range stays in focus; a plain click
                 // on the plot clears the selection and unpauses)
                 if sel_data.is_some() {
-                    // paused: republish the frozen snapshot only when the
-                    // selection changed or a detail fetch is pending
-                    if paused_dirty || app_detail_req.is_some() {
+                    // paused: republish the frozen snapshot when selection or
+                    // app detail state changed (including closing the popup)
+                    if paused_dirty || detail_dirty {
                         let prev = snap.lock().unwrap().clone();
                         let mut p2 = (*prev).clone();
                         p2.sel = sel_data.clone();
-                        if let Some((aid, f, t)) = app_detail_req {
-                            p2.app_detail = fetch_json(&format!(
-                                "{}/api/appinfo?app_id={}&from={}&to={}",
-                                API, aid, f, t
-                            ))
-                            .ok()
-                            .map(|d| parse_appinfo(&d, aid, f, t));
-                            app_detail_req = None;
+                        if detail_dirty {
+                            p2.app_detail = if let Some((aid, f, t)) = active_detail {
+                                fetch_json(&format!(
+                                    "{}/api/appinfo?app_id={}&from={}&to={}",
+                                    API, aid, f, t
+                                ))
+                                .ok()
+                                .map(|d| parse_appinfo(&d, aid, f, t))
+                                .or_else(|| p2.app_detail.clone())
+                            } else {
+                                None
+                            };
+                            detail_dirty = false;
                         }
                         *snap.lock().unwrap() = Arc::new(p2);
                         paused_dirty = false;
@@ -6087,6 +7433,53 @@ fn main() -> eframe::Result {
                     }
                     continue;
                 }
+
+                // Fast-path for opening or closing the App Detail popup so it responds
+                // instantly without waiting for a full traffic/hosts snapshot fetch.
+                if detail_only_wake && tick > 0 {
+                    let prev = snap.lock().unwrap().clone();
+                    let mut p2 = (*prev).clone();
+                    p2.app_detail = if let Some((aid, f, t)) = active_detail {
+                        let fetched = fetch_json(&format!(
+                            "{}/api/appinfo?app_id={}&from={}&to={}",
+                            API, aid, f, t
+                        ))
+                        .ok()
+                        .map(|d| parse_appinfo(&d, aid, f, t));
+                        if aid > 0 && !icon_cache.contains_key(&aid) {
+                            if let Ok(resp) = ureq::get(&format!("{}/api/icon?app_id={}", API, aid))
+                                .timeout(Duration::from_secs(2))
+                                .call()
+                            {
+                                if resp.status() == 200 {
+                                    let mut bytes = Vec::new();
+                                    use std::io::Read;
+                                    if resp
+                                        .into_reader()
+                                        .take(200_000)
+                                        .read_to_end(&mut bytes)
+                                        .is_ok()
+                                        && !bytes.is_empty()
+                                    {
+                                        icon_cache.insert(aid, bytes);
+                                        icon_retry.remove(&aid);
+                                        p2.icons = icon_cache.clone();
+                                    }
+                                }
+                            }
+                        }
+                        fetched.or_else(|| p2.app_detail.clone())
+                    } else {
+                        None
+                    };
+                    detail_dirty = false;
+                    *snap.lock().unwrap() = Arc::new(p2);
+                    if let Some(ctx) = ui_ctx.lock().unwrap().as_ref() {
+                        ctx.request_repaint();
+                    }
+                    continue;
+                }
+
                 let fetch_t0 = std::time::Instant::now();
                 let prev_snap = snap.lock().unwrap().clone();
                 let mut fresh = Some(fetch_snapshot(
@@ -6102,17 +7495,23 @@ fn main() -> eframe::Result {
                 ));
                 last_fetch_dur = fetch_t0.elapsed();
                 tick = tick.wrapping_add(1);
-                if let Some((aid, f, t)) = app_detail_req {
-                    let detail = fetch_json(&format!(
-                        "{}/api/appinfo?app_id={}&from={}&to={}",
-                        API, aid, f, t
-                    ))
-                    .ok()
-                    .map(|d| parse_appinfo(&d, aid, f, t));
-                    if let Some(fr) = fresh.as_mut() {
-                        fr.app_detail = detail;
+                if let Some(fr) = fresh.as_mut() {
+                    if let Some((aid, f, t)) = active_detail {
+                        if detail_dirty || tick % 5 == 0 || prev_snap.app_detail.is_none() {
+                            let detail = fetch_json(&format!(
+                                "{}/api/appinfo?app_id={}&from={}&to={}",
+                                API, aid, f, t
+                            ))
+                            .ok()
+                            .map(|d| parse_appinfo(&d, aid, f, t));
+                            fr.app_detail = detail.or_else(|| prev_snap.app_detail.clone());
+                        } else {
+                            fr.app_detail = prev_snap.app_detail.clone();
+                        }
+                    } else {
+                        fr.app_detail = None;
                     }
-                    app_detail_req = None;
+                    detail_dirty = false;
                 }
                 icons_pending = false;
                 if let Some(fr) = fresh.as_mut() {
@@ -6133,6 +7532,11 @@ fn main() -> eframe::Result {
                     }
                     for q in &fr.quotas {
                         if let Some(id) = q.app_id {
+                            push_id(id);
+                        }
+                    }
+                    for e in &fr.events {
+                        if let Some(id) = e.app_id {
                             push_id(id);
                         }
                     }
@@ -6283,6 +7687,12 @@ fn main() -> eframe::Result {
                 traffic_filter: String::new(),
                 usage_sort: SortKey::Total,
                 usage_filter: String::new(),
+                alert_filter: AlertFilter::Important,
+                alert_range: AlertRange::AllTime,
+                alert_search: String::new(),
+                alert_filter_open: false,
+                alert_range_open: false,
+                alert_expanded: None,
                 sel_sort: SortKey::Total,
                 detail_tab: 0,
                 detail_sort: SortKey::Down,
@@ -6308,6 +7718,7 @@ fn install_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
     for (key, file) in [
         ("segoe_ui", "C:/Windows/Fonts/segoeui.ttf"),
+        ("segoe_ui_bold", "C:/Windows/Fonts/segoeuib.ttf"),
         ("segoe_sym", "C:/Windows/Fonts/seguisym.ttf"),
     ] {
         match std::fs::read(file) {
@@ -6333,6 +7744,19 @@ fn install_fonts(ctx: &egui::Context) {
             .or_default()
             .push("segoe_sym".into());
     }
+    // Named bold font family for high-contrast alert spans; falls back gracefully
+    // to Proportional if segoeuib.ttf is not present.
+    let mut bold_chain = fonts
+        .families
+        .get(&egui::FontFamily::Proportional)
+        .cloned()
+        .unwrap_or_default();
+    if fonts.font_data.contains_key("segoe_ui_bold") {
+        bold_chain.insert(0, "segoe_ui_bold".into());
+    }
+    fonts
+        .families
+        .insert(egui::FontFamily::Name("bold".into()), bold_chain);
     ctx.set_fonts(fonts);
 }
 
@@ -6346,13 +7770,22 @@ impl PacketlyApp {
             snap.app_detail.clone()
         };
         let Some(d) = detail else { return };
+        if !self.alert_filter_open
+            && !self.alert_range_open
+            && ctx.input(|i| i.key_pressed(egui::Key::Escape))
+        {
+            let _ = self.tx.send(UiMsg::AppDetail(None));
+            return;
+        }
         let t = self.theme();
+        let dark = t.text.r() > 128;
         egui::Area::new(egui::Id::new("app-detail"))
             .order(egui::Order::Foreground)
             .anchor(egui::Align2::LEFT_BOTTOM, [14.0, -14.0])
             .show(ctx, |ui| {
                 egui::Frame::popup(ui.style())
                     .fill(t.card)
+                    .rounding(8.0)
                     .stroke(egui::Stroke::new(1.0, t.border))
                     .show(ui, |ui| {
                         ui.set_min_width(470.0);
@@ -6360,13 +7793,16 @@ impl PacketlyApp {
 
                         // header
                         ui.horizontal(|ui| {
+                            let (icon_rect, _) = ui.allocate_exact_size(
+                                egui::vec2(24.0, 24.0),
+                                egui::Sense::hover(),
+                            );
                             if let Some(tex) =
                                 self.app_icon_opt(ctx, d.app_id, &d.name)
                             {
-                                ui.add(
-                                    egui::Image::from_texture(&tex)
-                                        .max_size(egui::vec2(24.0, 24.0)),
-                                );
+                                paint_icon_fit(ui.painter(), &tex, icon_rect);
+                            } else {
+                                draw_default_app_window_icon(ui.painter(), icon_rect, dark);
                             }
                             ui.strong(egui::RichText::new(&d.name).size(14.0).color(t.text));
                             ui.with_layout(
@@ -6462,25 +7898,31 @@ impl PacketlyApp {
                             1 => {
                                 // Hosts
                                 let mut hosts = d.hosts.clone();
+                                let tie = |a: &AppHostRow, b: &AppHostRow| {
+                                    a.label
+                                        .to_lowercase()
+                                        .cmp(&b.label.to_lowercase())
+                                        .then_with(|| a.label.cmp(&b.label))
+                                };
                                 match self.detail_sort {
-                                    SortKey::Name => hosts.sort_by(|a, b| {
-                                        a.label.to_lowercase()
-                                            .cmp(&b.label.to_lowercase())
-                                    }),
+                                    SortKey::Name => hosts.sort_by(tie),
                                     SortKey::Up => hosts.sort_by(|a, b| {
                                         b.out_bytes
                                             .partial_cmp(&a.out_bytes)
                                             .unwrap_or(std::cmp::Ordering::Equal)
+                                            .then_with(|| tie(a, b))
                                     }),
                                     SortKey::Down => hosts.sort_by(|a, b| {
                                         b.in_bytes
                                             .partial_cmp(&a.in_bytes)
                                             .unwrap_or(std::cmp::Ordering::Equal)
+                                            .then_with(|| tie(a, b))
                                     }),
                                     _ => hosts.sort_by(|a, b| {
                                         (b.in_bytes + b.out_bytes)
                                             .partial_cmp(&(a.in_bytes + a.out_bytes))
                                             .unwrap_or(std::cmp::Ordering::Equal)
+                                            .then_with(|| tie(a, b))
                                     }),
                                 }
                                 ui.horizontal(|ui| {
@@ -6549,15 +7991,19 @@ impl PacketlyApp {
                                 ui.add_space(2.0);
                             }
                             _ => {
-                                // Alerts for this app
+                                // Alerts for this app (prefer direct /api/appinfo alerts; fall back to snapshot events)
                                 let snap = self.snap.lock().unwrap().clone();
-                                let mine: Vec<&EventRow> = snap
-                                    .events
-                                    .iter()
-                                    .filter(|e| {
-                                        e.app_name.as_deref() == Some(d.name.as_str())
-                                    })
-                                    .collect();
+                                let mine: Vec<&EventRow> = if !d.alerts.is_empty() {
+                                    d.alerts.iter().collect()
+                                } else {
+                                    snap.events
+                                        .iter()
+                                        .filter(|e| {
+                                            e.app_id == Some(d.app_id)
+                                                || e.app_name.as_deref() == Some(d.name.as_str())
+                                        })
+                                        .collect()
+                                };
                                 egui::ScrollArea::vertical()
                                     .max_height(210.0)
                                     .show(ui, |ui| {
@@ -6565,22 +8011,33 @@ impl PacketlyApp {
                                             ui.weak("no alerts for this app");
                                         }
                                         for e in mine {
-                                            ui.horizontal(|ui| {
-                                                ui.set_min_width(430.0);
-                                                ui.weak(
-                                                    egui::RichText::new(rel_time(e.ts))
+                                            let parsed = parse_alert(e);
+                                            ui.vertical(|ui| {
+                                                ui.spacing_mut().item_spacing.y = 1.0;
+                                                ui.horizontal(|ui| {
+                                                    ui.set_min_width(430.0);
+                                                    ui.add(
+                                                        egui::Label::new(
+                                                            egui::RichText::new(&parsed.plain)
+                                                                .size(11.5)
+                                                                .color(t.text),
+                                                        )
+                                                        .truncate(),
+                                                    );
+                                                });
+                                                ui.horizontal(|ui| {
+                                                    ui.weak(
+                                                        egui::RichText::new(format!(
+                                                            "{} · {}",
+                                                            alert_category(e.kind),
+                                                            alert_full_time_str(e.ts)
+                                                        ))
                                                         .size(10.5)
                                                         .color(t.dim),
-                                                );
-                                                ui.add(
-                                                    egui::Label::new(
-                                                        egui::RichText::new(&e.data)
-                                                            .size(11.0)
-                                                            .color(t.text),
-                                                    )
-                                                    .truncate(),
-                                                );
+                                                    );
+                                                });
                                             });
+                                            ui.add_space(4.0);
                                         }
                                     });
                                 ui.add_space(2.0);

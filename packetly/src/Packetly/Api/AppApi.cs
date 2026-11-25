@@ -54,7 +54,7 @@ internal static class AppApi
             return new
             {
                 app = "packetly",
-                version = "1.7.4",
+                version = "1.8.0",
                 now,
                 startedAt = svc.StartedAt,
                 uptimeSeconds = now - svc.StartedAt,
@@ -259,6 +259,8 @@ internal static class AppApi
             var (inB, outB) = svc.Db.AppBytesBetween(tier, app_id, from, to);
             var hosts = svc.Db.AppHostsBetween(tier, app_id, from, to, 100)
                 .Select(h => new { ip = HexToIp(h.Ip), hostname = h.Hostname, region = h.Region, inBytes = h.In, outBytes = h.Out });
+            var appAlerts = svc.Db.GetEventsForApp(app_id, 30)
+                .Select(e => new { id = e.Id, ts = e.Ts, type = e.Type, appId = e.AppId, appName = e.AppName, data = e.Data });
             return Results.Json(new
             {
                 app_id,
@@ -272,6 +274,7 @@ internal static class AppApi
                 outBytes = outB,
                 alertCount = svc.Db.AppAlertCount(app_id),
                 hosts,
+                alerts = appAlerts,
             });
         });
 
@@ -380,11 +383,12 @@ internal static class AppApi
 
         app.MapGet("/api/events", (int? limit) =>
         {
-            var rows = svc.Db.GetEvents(Math.Clamp(limit ?? 100, 1, 500));
+            var rows = svc.Db.GetEvents(Math.Clamp(limit ?? 500, 1, 1000));
             return Results.Json(new
             {
                 now = Now(),
                 unseen = svc.Db.UnseenEventCount(),
+                seenId = svc.Db.GetMetaLong("events_seen_id", 0),
                 events = rows.Select(e => new { id = e.Id, ts = e.Ts, type = e.Type, appId = e.AppId, appName = e.AppName, data = e.Data }),
             });
         });
