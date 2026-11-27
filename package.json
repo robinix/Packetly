@@ -1,6 +1,6 @@
 {
   "name": "packetly",
-  "version": "1.8.2",
+  "version": "1.8.3",
   "private": true,
   "description": "Packetly — Windows network monitor. This root manifest only drives web preview/dev servers (Google AI Studio, static hosting); the desktop app itself is packetly/ (.NET 8 ETW collector) plus packetly-ui/ (Rust egui) and does not use Node.",
   "scripts": {

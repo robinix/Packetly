@@ -694,7 +694,9 @@ struct AppDetail {
 struct UiFlags {
     startup_state: Option<bool>,
     startup_pending: bool,
+    startup_loading: bool,
     geoip_state: Option<bool>,
+    geoip_loading: bool,
 }
 
 #[derive(Clone, Default)]
@@ -1459,11 +1461,14 @@ fn parse_appinfo(d: &serde_json::Value, app_id: i64, f: i64, t: i64) -> AppDetai
 }
 
 fn query_startup() -> bool {
-    std::process::Command::new("schtasks")
-        .args(["/query", "/tn", "Packetly"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    let mut cmd = std::process::Command::new("schtasks");
+    cmd.args(["/query", "/tn", "Packetly"]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    cmd.output().map(|o| o.status.success()).unwrap_or(false)
 }
 
 /// Enable/disable the logon task. Spawns an elevated process (UAC prompt)
@@ -1484,19 +1489,24 @@ fn set_startup(enable: bool) -> bool {
         return false;
     }
     let arg = if enable { "--install-autostart" } else { "--uninstall-autostart" };
-    std::process::Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-Command",
-            &format!(
-                "Start-Process -FilePath '{}' -ArgumentList '{}' -Verb RunAs -Wait | Out-Null",
-                exe.display(),
-                arg
-            ),
-        ])
-        .status()
-        .map(|st| st.success())
-        .unwrap_or(false)
+    let mut cmd = std::process::Command::new("powershell");
+    cmd.args([
+        "-NoProfile",
+        "-WindowStyle",
+        "Hidden",
+        "-Command",
+        &format!(
+            "Start-Process -FilePath '{}' -ArgumentList '{}' -Verb RunAs -Wait | Out-Null",
+            exe.display(),
+            arg
+        ),
+    ]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    cmd.status().map(|st| st.success()).unwrap_or(false)
 }
 
 fn fetch_geoip_state() -> Option<bool> {
@@ -2910,21 +2920,21 @@ impl PacketlyApp {
                                     cache.mini.as_ref().map_or(true, |(v, _)| *v != ver);
                                 if stale {
                                     let p = pivot(traffic, t.in_c, t.out_c);
-                                    let mr = ((p.n as f64) / 200.0)
+                                    let mr = ((p.n as f64) / 90.0)
                                         .round()
-                                        .clamp(1.0, 48.0) as usize;
+                                        .clamp(2.0, 120.0) as usize;
+                                    let mr_dil = ((mr as f64) * 1.25).round().max(2.0) as usize;
+                                    let mr2 = ((mr as f64) * 0.90).round().max(1.0) as usize;
+                                    let mr3 = ((mr as f64) * 0.75).round().max(1.0) as usize;
                                     let mut curves: Vec<Vec<[f64; 2]>> = p
                                         .series
                                         .iter()
                                         .map(|s| {
-                                            let dil = rolling_max(&s.points, mr);
+                                            let dil = rolling_max(&s.points, mr_dil);
                                             let pass1 = moving_avg(&dil, mr);
-                                            let pass2 = if mr >= 2 {
-                                                moving_avg(&pass1, (mr / 2).max(1))
-                                            } else {
-                                                pass1
-                                            };
-                                            smooth(&pass2, 420)
+                                            let pass2 = moving_avg(&pass1, mr2);
+                                            let pass3 = moving_avg(&pass2, mr3);
+                                            smooth(&pass3, 420)
                                         })
                                         .collect();
                                     let mut m_max = 0.0_f64;
@@ -2934,7 +2944,7 @@ impl PacketlyApp {
                                         }
                                     }
                                     if m_max > 0.0 && p.y_max > 0.0 {
-                                        let mk = (p.y_max / m_max).clamp(1.0, 1.15);
+                                        let mk = (p.y_max / m_max).clamp(1.0, 1.20);
                                         for pts in &mut curves {
                                             for pt in pts.iter_mut() {
                                                 pt[1] *= mk;
@@ -3125,11 +3135,15 @@ impl PacketlyApp {
                                 } else {
                                     self.scale_cap
                                 };
-                                // Peak-faithful smoothing: centered rolling-max preserves true
-                                // burst height before box smoothing so narrow heavy spikes
-                                // reach their exact byte value on the Y-axis without inflating
+                                // Peak-preserving rolling-max dilation followed by 3-pass
+                                // box smoothing (cubic B-spline) + Catmull-Rom: produces
+                                // smooth, rounded hills while keeping narrow bursts faithful
+                                // to their real byte height on the Y-axis without inflating
                                 // lower sustained plateaus.
-                                let r = ((p.n as f64) / 200.0).round().clamp(1.0, 48.0) as usize;
+                                let r = ((p.n as f64) / 100.0).round().clamp(2.0, 120.0) as usize;
+                                let r_dil = ((r as f64) * 1.25).round().max(2.0) as usize;
+                                let r2 = ((r as f64) * 0.90).round().max(1.0) as usize;
+                                let r3 = ((r as f64) * 0.75).round().max(1.0) as usize;
                                 let (rendered, target_k) = {
                                     let mut cache = self.cache.lock().unwrap();
                                     let stale = cache.rendered.as_ref().map_or(true, |rd| {
@@ -3140,14 +3154,11 @@ impl PacketlyApp {
                                             .series
                                             .iter()
                                             .map(|s| {
-                                                let dilated = rolling_max(&s.points, r);
+                                                let dilated = rolling_max(&s.points, r_dil);
                                                 let pass1 = moving_avg(&dilated, r);
-                                                let pass2 = if r >= 2 {
-                                                    moving_avg(&pass1, (r / 2).max(1))
-                                                } else {
-                                                    pass1
-                                                };
-                                                smooth(&pass2, 1400)
+                                                let pass2 = moving_avg(&pass1, r2);
+                                                let pass3 = moving_avg(&pass2, r3);
+                                                smooth(&pass3, 1400)
                                             })
                                             .collect();
                                         let tail_cut = if p.bucket == 1.0 && p.n > 6 {
@@ -3164,7 +3175,7 @@ impl PacketlyApp {
                                             }
                                         }
                                         let tk = if rendered_max > 0.0 && p.y_max > 0.0 {
-                                            (p.y_max / rendered_max).clamp(1.0, 1.15)
+                                            (p.y_max / rendered_max).clamp(1.0, 1.20)
                                         } else {
                                             1.0
                                         };
@@ -3441,24 +3452,6 @@ impl PacketlyApp {
                                                 t.axis,
                                             );
                                         }
-                                    }
-                                }
-
-                                {
-                                    let rect = presp.transform.frame();
-                                    let painter = ui.painter_at(*rect);
-                                    for e in &snap.events {
-                                        if e.kind < 2 || e.ts < view_x0 || e.ts > view_x1 {
-                                            continue;
-                                        }
-                                        let px = presp.transform.position_from_point_x(e.ts);
-                                        let py = rect.top() + 12.0;
-                                        painter.circle_filled(egui::Pos2::new(px, py), 6.0, t.danger);
-                                        painter.circle_stroke(
-                                            egui::Pos2::new(px, py),
-                                            6.0,
-                                            egui::Stroke::new(1.5, t.card),
-                                        );
                                     }
                                 }
 
@@ -7185,40 +7178,78 @@ impl PacketlyApp {
         if !self.settings_open {
             return;
         }
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.settings_open = false;
+            return;
+        }
         let t = self.theme();
         let snap = self.snap.lock().unwrap().clone();
-        let flags = self.flags.lock().unwrap().clone();
 
-        // one-shot background queries when the dialog opens
-        if flags.startup_state.is_none() && !flags.startup_pending {
+        // Guarded one-shot background queries if pre-warm has not completed yet.
+        // Never spawn duplicate threads per frame.
+        let (need_startup, need_geoip, flags) = {
+            let mut f = self.flags.lock().unwrap();
+            let ns = f.startup_state.is_none() && !f.startup_pending && !f.startup_loading;
+            if ns {
+                f.startup_loading = true;
+            }
+            let ng = f.geoip_state.is_none() && !f.geoip_loading;
+            if ng {
+                f.geoip_loading = true;
+            }
+            (ns, ng, f.clone())
+        };
+        if need_startup {
             let flags2 = self.flags.clone();
             let ctx2 = ctx.clone();
             std::thread::spawn(move || {
                 let ok = query_startup();
-                flags2.lock().unwrap().startup_state = Some(ok);
+                let mut f = flags2.lock().unwrap();
+                f.startup_state = Some(ok);
+                f.startup_loading = false;
                 ctx2.request_repaint();
             });
         }
-        if flags.geoip_state.is_none() {
+        if need_geoip {
             let flags2 = self.flags.clone();
             let ctx2 = ctx.clone();
             std::thread::spawn(move || {
                 let st = fetch_geoip_state();
-                flags2.lock().unwrap().geoip_state = st;
+                let mut f = flags2.lock().unwrap();
+                f.geoip_state = st;
+                f.geoip_loading = false;
                 ctx2.request_repaint();
             });
         }
 
+        // Fixed centered position & constant dialog size prevent egui's
+        // first-frame Align2::CENTER_CENTER layout jump and async-load resize flicker.
+        const DLG_W: f32 = 476.0;
+        const DLG_H: f32 = 382.0;
+        let screen = ctx.screen_rect();
+        let pos = egui::pos2(
+            (screen.center().x - DLG_W * 0.5)
+                .max(screen.left() + 8.0)
+                .round(),
+            (screen.center().y - DLG_H * 0.5)
+                .max(screen.top() + 8.0)
+                .round(),
+        );
+
         egui::Area::new(egui::Id::new("settings-dialog"))
             .order(egui::Order::Foreground)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .fixed_pos(pos)
             .show(ctx, |ui| {
                 egui::Frame::popup(ui.style())
                     .fill(t.card)
+                    .rounding(8.0)
+                    .inner_margin(egui::Margin::symmetric(14.0, 12.0))
                     .stroke(egui::Stroke::new(1.0, t.border))
                     .show(ui, |ui| {
-                        ui.set_min_width(460.0);
-                        ui.set_max_width(460.0);
+                        let inner_w = DLG_W - 28.0;
+                        let inner_h = DLG_H - 24.0;
+                        ui.set_min_size(egui::vec2(inner_w, inner_h));
+                        ui.set_max_size(egui::vec2(inner_w, inner_h));
 
                         ui.horizontal(|ui| {
                             ui.strong(
@@ -7283,7 +7314,7 @@ impl PacketlyApp {
                                     }
                                 });
                         });
-                        ui.add_space(4.0);
+                        ui.add_space(6.0);
 
                         // ---- startup ----
                         ui.weak(
@@ -7291,43 +7322,31 @@ impl PacketlyApp {
                                 .size(10.5)
                                 .color(t.dim),
                         );
-                        if flags.startup_pending {
-                            ui.weak(
-                                egui::RichText::new(
-                                    "applying… (confirm the UAC prompt if it appears)",
-                                )
-                                .size(11.0)
-                                .color(t.dim),
-                            );
-                        } else {
-                            match flags.startup_state {
-                                None => {
-                                    ui.weak(
-                                        egui::RichText::new("checking…")
-                                            .size(11.0)
-                                            .color(t.dim),
-                                    );
-                                }
-                                Some(on) => {
-                                    let mut v = on;
-                                    let resp = ui.add_enabled(
-                                        true,
-                                        egui::Checkbox::new(&mut v, "Run at Windows startup"),
-                                    );
-                                    if resp.clicked() {
-                                        let flags2 = self.flags.clone();
-                                        let ctx2 = ctx.clone();
-                                        let enable = !on;
-                                        flags2.lock().unwrap().startup_pending = true;
-                                        std::thread::spawn(move || {
-                                            set_startup(enable);
-                                            let ok = query_startup();
-                                            flags2.lock().unwrap().startup_state = Some(ok);
-                                            flags2.lock().unwrap().startup_pending = false;
-                                            ctx2.request_repaint();
-                                        });
-                                    }
-                                }
+                        {
+                            let ready = flags.startup_state.is_some() && !flags.startup_pending;
+                            let mut v = flags.startup_state.unwrap_or(false);
+                            let label = if flags.startup_pending {
+                                "Run at Windows startup (applying…)"
+                            } else if flags.startup_state.is_none() {
+                                "Run at Windows startup (checking…)"
+                            } else {
+                                "Run at Windows startup"
+                            };
+                            let resp = ui.add_enabled(ready, egui::Checkbox::new(&mut v, label));
+                            if ready && resp.clicked() {
+                                let flags2 = self.flags.clone();
+                                let ctx2 = ctx.clone();
+                                let enable = !flags.startup_state.unwrap_or(false);
+                                flags2.lock().unwrap().startup_pending = true;
+                                std::thread::spawn(move || {
+                                    set_startup(enable);
+                                    let ok = query_startup();
+                                    let mut f = flags2.lock().unwrap();
+                                    f.startup_state = Some(ok);
+                                    f.startup_pending = false;
+                                    f.startup_loading = false;
+                                    ctx2.request_repaint();
+                                });
                             }
                         }
                         let start_min_allowed =
@@ -7342,28 +7361,19 @@ impl PacketlyApp {
                         if resp.changed() {
                             self.save_prefs();
                         }
-                        if !start_min_allowed && flags.startup_state != Some(true) {
-                            ui.weak(
-                                egui::RichText::new(
-                                    "enable \u{201c}run at windows startup\u{201d} first",
-                                )
+                        let startup_hint = if flags.startup_pending {
+                            "Confirm the UAC prompt if it appears"
+                        } else if flags.startup_state == Some(false) {
+                            "Enable \u{201c}Run at Windows startup\u{201d} first"
+                        } else {
+                            "The collector keeps running in the tray; click its icon to open the dashboard"
+                        };
+                        ui.label(
+                            egui::RichText::new(startup_hint)
                                 .size(10.0)
                                 .color(t.dim),
-                            );
-                        }
-                        if ui
-                            .add(
-                                egui::Label::new(
-                                    egui::RichText::new(
-                                        "the collector keeps running in the tray; click its icon to open the dashboard",
-                                    )
-                                    .size(10.0)
-                                    .color(t.dim),
-                                ),
-                            )
-                            .changed()
-                        {}
-                        ui.add_space(4.0);
+                        );
+                        ui.add_space(6.0);
 
                         // ---- privacy ----
                         ui.weak(
@@ -7371,35 +7381,35 @@ impl PacketlyApp {
                                 .size(10.5)
                                 .color(t.dim),
                         );
-                        match flags.geoip_state {
-                            None => {
-                                ui.weak(
-                                    egui::RichText::new("checking…")
-                                        .size(11.0)
-                                        .color(t.dim),
-                                );
-                            }
-                            Some(on) => {
-                                let mut v = on;
-                                if ui
-                                    .checkbox(
-                                        &mut v,
-                                        "Resolve host countries (GeoIP, uses ip-api.com)",
-                                    )
-                                    .changed()
+                        {
+                            let ready = flags.geoip_state.is_some();
+                            let mut v = flags.geoip_state.unwrap_or(false);
+                            let label = if ready {
+                                "Resolve host countries (GeoIP, uses ip-api.com)"
+                            } else {
+                                "Resolve host countries (checking…)"
+                            };
+                            if ui
+                                .add_enabled(ready, egui::Checkbox::new(&mut v, label))
+                                .changed()
+                            {
+                                let flags2 = self.flags.clone();
+                                let ctx2 = ctx.clone();
                                 {
-                                    let flags2 = self.flags.clone();
-                                    let ctx2 = ctx.clone();
-                                    flags2.lock().unwrap().geoip_state = None;
-                                    std::thread::spawn(move || {
-                                        let st = set_geoip_state(!on);
-                                        flags2.lock().unwrap().geoip_state = st;
-                                        ctx2.request_repaint();
-                                    });
+                                    let mut f = flags2.lock().unwrap();
+                                    f.geoip_state = None;
+                                    f.geoip_loading = true;
                                 }
+                                std::thread::spawn(move || {
+                                    let st = set_geoip_state(v);
+                                    let mut f = flags2.lock().unwrap();
+                                    f.geoip_state = st;
+                                    f.geoip_loading = false;
+                                    ctx2.request_repaint();
+                                });
                             }
                         }
-                        ui.add_space(4.0);
+                        ui.add_space(6.0);
 
                         // ---- about ----
                         ui.weak(
@@ -7407,7 +7417,7 @@ impl PacketlyApp {
                         );
                         let row = |ui: &mut egui::Ui, k: &str, v: String| {
                             ui.horizontal(|ui| {
-                                ui.set_min_width(430.0);
+                                ui.set_min_width(inner_w - 4.0);
                                 ui.weak(egui::RichText::new(k).size(11.0).color(t.dim));
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
@@ -7464,6 +7474,32 @@ fn main() -> eframe::Result {
     let flags: Arc<Mutex<UiFlags>> = Arc::new(Mutex::new(UiFlags::default()));
     let (tx, rx) = std::sync::mpsc::channel::<UiMsg>();
     let ui_ctx: Arc<Mutex<Option<egui::Context>>> = Arc::new(Mutex::new(None));
+
+    // Pre-warm settings flags asynchronously at launch so opening Settings
+    // for the first time never spawns blocking probes or flickers.
+    {
+        let flags_bg = flags.clone();
+        let ctx_bg = ui_ctx.clone();
+        {
+            let mut f = flags_bg.lock().unwrap();
+            f.startup_loading = true;
+            f.geoip_loading = true;
+        }
+        std::thread::spawn(move || {
+            let ok = query_startup();
+            let geo = fetch_geoip_state();
+            {
+                let mut f = flags_bg.lock().unwrap();
+                f.startup_state = Some(ok);
+                f.startup_loading = false;
+                f.geoip_state = geo;
+                f.geoip_loading = false;
+            }
+            if let Some(c) = ctx_bg.lock().unwrap().as_ref() {
+                c.request_repaint();
+            }
+        });
+    }
 
     let mut theme_kind = ThemeKind::Dark;
     let mut zoom = 1.0_f32;

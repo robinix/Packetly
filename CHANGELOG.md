@@ -2,6 +2,28 @@
 
 All notable changes to Packetly are documented here, including technical handoff notes for the local Windows build/verification agent.
 
+## v1.8.3 — Cleaner Traffic Monitor Graph, Rounded Peak-Faithful Curves & Glitch-Free Settings Dialog
+
+### User-facing changes
+- **Removed stray floating red circles on the Traffic Monitor graph:** Eliminated the legacy unlabeled red event dots that floated near the top of the plot whenever an alert (such as an app version change or quota event) occurred in the visible time window. All alert history remains cleanly organized in the **Alerts** tab.
+- **Smoother, rounder graph curves while keeping honest peak heights:** Upgraded the smoothing pipeline from the sharp v1.8.2 tent envelope to a wider peak-preserving rolling-max dilation followed by 3-pass cubic B-spline smoothing (`n/100`, clamp `2..120`, `1.25×` dilation, passes `1.0r / 0.90r / 0.75r`) and Catmull-Rom interpolation. Bursts now render as lush, rounded hills across `5m`, `3h`, `24h`, `7d`, and `30d` while still accurately reaching their real byte heights on the Y-axis.
+- **Fixed Settings dialog first-open jump and console flash:**
+  - Replaced `egui::Area::anchor(CENTER_CENTER)` (which rendered shifted on Frame 0 before snapping to center on Frame 1) with an exact centered `fixed_pos` and stable dialog geometry + constant-height rows so the dialog never jumps or resizes when opening.
+  - Added `CREATE_NO_WINDOW` (`0x08000000`) to `schtasks.exe` / `powershell.exe` startup checks, added single-flight `startup_loading` / `geoip_loading` guards (fixing a bug that spawned duplicate background threads every frame while waiting), and pre-warmed both states asynchronously at launch so Settings opens instantly with zero flash. Also added `Escape` to close Settings.
+
+### Local agent handoff notes
+- **Files changed:**
+  - `packetly-ui/src/main.rs` — removed bare `t.danger` circle overlay loop on Traffic Monitor plot; upgraded main chart + mini-timeline smoothing to 3-pass rounded peak-preserving curves (`div=100` / `90`, `r_dil=1.25*r`, 3-pass `moving_avg`, `clamp(1.0, 1.20)`); added `startup_loading`/`geoip_loading` to `UiFlags`, `CREATE_NO_WINDOW` in `query_startup`/`set_startup`, launch-time pre-warm thread in `main()`, and fixed centered `fixed_pos` + constant row heights + `Esc` close in `settings_dialog()`.
+  - `web/app.js` — updated `smoothSeries` and `ingestData` in exact lockstep with `packetly-ui/src/main.rs`.
+  - `packetly/src/Packetly/Api/AppApi.cs`, `packetly-ui/Cargo.toml`, `packetly-ui/Cargo.lock`, `package.json` — version bumped to `1.8.3`.
+- **Verify locally on Windows:**
+  1. `git pull`
+  2. `dotnet build packetly/src/Packetly -c Release`
+  3. `cargo build --release --manifest-path packetly-ui/Cargo.toml`
+  4. Confirm `/api/status` reports `"version": "1.8.3"`.
+  5. Open **Traffic Monitor** across `5m`, `3h`, `24h`, and `7d`: verify zero floating red circles appear near the top of the chart, and verify peaks look smoothly rounded (no sharp spikes) while still matching the left Y-axis peak rate.
+  6. Launch `packetly-ui.exe` fresh and click **Settings** for the very first time: verify it appears immediately dead-center with zero position jump, zero resize flicker, and zero console window flash; press `Esc` to confirm clean dismissal.
+
 ## v1.8.2 — Accurate Graph Scale & Selection Counter, Domain-Grouped Unidentified Traffic & Distinct Fallback Icons
 
 ### User-facing changes

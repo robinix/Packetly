@@ -1,8 +1,9 @@
 /* Packetly Web — pixel replica of the desktop Traffic Monitor screen.
  * Chart pipeline mirrors packetly-ui/src/main.rs exactly: peak-preserving
- * rolling-max dilation (n/200, clamp 1..48) -> box smoothing -> bin-max
- * Catmull-Rom -> bounded peak normalization -> honest raw-peak scale with
- * interval-labeled Y-axis (/s, /m, /h, /d) + 60fps smooth viewport glide.
+ * rolling-max dilation (n/100, clamp 2..120, rDil=1.25r) -> 3-pass box
+ * smoothing (cubic B-spline) -> bin-max Catmull-Rom -> bounded peak
+ * normalization (1.0..1.20) -> honest raw-peak scale with interval-labeled
+ * Y-axis (/s, /m, /h, /d) + 60fps smooth viewport glide.
  * Demo mode in hosted previews; live mode when served by the collector. */
 (() => {
   'use strict';
@@ -139,14 +140,16 @@
   }
   function smoothSeries(ts, values, div, maxOut) {
     const n = values.length;
-    const r = Math.max(1, Math.min(48, Math.round(n / div)));
+    const r = Math.max(2, Math.min(120, Math.round(n / div)));
+    const rDil = Math.max(2, Math.round(r * 1.25));
+    const r2 = Math.max(1, Math.round(r * 0.90));
+    const r3 = Math.max(1, Math.round(r * 0.75));
     let pts = new Array(n);
     for (let i = 0; i < n; i++) pts[i] = [ts[i], values[i]];
-    pts = rollingMax(pts, r);
+    pts = rollingMax(pts, rDil);
     pts = movingAvg(pts, r);
-    if (r >= 2) {
-      pts = movingAvg(pts, Math.max(1, Math.floor(r / 2)));
-    }
+    pts = movingAvg(pts, r2);
+    pts = movingAvg(pts, r3);
     return catmull(pts, maxOut);
   }
   function clipAndScale(pts, vx0, vx1, k, cap) {
@@ -526,16 +529,16 @@
       if (d.up[i] > rawMax) rawMax = d.up[i];
     }
 
-    const upPts = smoothSeries(d.ts, d.up, 200, 1400);
-    const downPts = smoothSeries(d.ts, d.down, 200, 1400);
+    const upPts = smoothSeries(d.ts, d.up, 100, 1400);
+    const downPts = smoothSeries(d.ts, d.down, 100, 1400);
     const tailCut = d.bucket === 1 && n > 6 ? x1 - 2 : Infinity;
     let renderedMax = 0;
     for (const pt of upPts) if (pt[0] <= tailCut && pt[1] > renderedMax) renderedMax = pt[1];
     for (const pt of downPts) if (pt[0] <= tailCut && pt[1] > renderedMax) renderedMax = pt[1];
-    const targetK = renderedMax > 0 && rawMax > 0 ? Math.max(1.0, Math.min(1.15, rawMax / renderedMax)) : 1.0;
+    const targetK = renderedMax > 0 && rawMax > 0 ? Math.max(1.0, Math.min(1.20, rawMax / renderedMax)) : 1.0;
 
-    const miniUp = smoothSeries(d.ts, d.up, 140, 420);
-    const miniDown = smoothSeries(d.ts, d.down, 140, 420);
+    const miniUp = smoothSeries(d.ts, d.up, 90, 420);
+    const miniDown = smoothSeries(d.ts, d.down, 90, 420);
     let miniMax = 0;
     for (const pt of miniUp) if (pt[1] > miniMax) miniMax = pt[1];
     for (const pt of miniDown) if (pt[1] > miniMax) miniMax = pt[1];
