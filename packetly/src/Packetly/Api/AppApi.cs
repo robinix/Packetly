@@ -54,7 +54,7 @@ internal static class AppApi
             return new
             {
                 app = "packetly",
-                version = "1.8.3",
+                version = "1.8.4",
                 now,
                 startedAt = svc.StartedAt,
                 uptimeSeconds = now - svc.StartedAt,
@@ -414,7 +414,24 @@ internal static class AppApi
                 // get their icon immediately instead of waiting for background backfill.
                 var appRow = svc.Db.GetAppById(appId);
                 if (appRow != null)
+                {
                     png = IconExtractor.TryExtract(svc.Db, appId, appRow.Value.Path);
+                    if (png == null)
+                    {
+                        // Handle name-only rows ("name:foo.exe") and auto-updated apps whose
+                        // older versioned exe path was deleted: reuse a sibling row's icon or live path.
+                        var (sibIcon, sibPath) = svc.Db.FindSiblingAppIconOrPath(appId, appRow.Value.Name ?? appRow.Value.Path);
+                        if (sibIcon != null)
+                        {
+                            png = sibIcon;
+                            try { svc.Db.SetAppIcon(appId, png); } catch { }
+                        }
+                        else if (sibPath != null)
+                        {
+                            png = IconExtractor.TryExtract(svc.Db, appId, sibPath);
+                        }
+                    }
+                }
             }
             if (png == null)
             {

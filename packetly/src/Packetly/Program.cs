@@ -570,24 +570,34 @@ async Task<int> RunServeAsync(string dbPath, string mode, int port, bool elevate
 
     _ = Task.Run(async () =>
     {
-        // Fast startup backfill + one-time v2 icon upgrade (replaces legacy ExtractAssociatedIcon
-        // icons that could have broken alpha or wrong images with clean SHGetFileInfoW 32bpp PNGs).
+        // Fast startup backfill + one-time v3 icon upgrade (re-extracts icons with
+        // MTA-safe PrivateExtractIconsW + DrawIconEx and fills name-only / moved exe siblings).
         try { await Task.Delay(1000, ct); } catch (OperationCanceledException) { return; }
-        if (db.GetMetaLong("icon_v2_migrated", 0) == 0)
+        if (db.GetMetaLong("icon_v3_migrated", 0) == 0)
         {
-            foreach (var (appId, path) in db.AllExeApps(500))
+            foreach (var (appId, path) in db.AllExeApps(600))
             {
                 if (ct.IsCancellationRequested) return;
                 try { IconExtractor.TryExtract(db, appId, path); } catch { }
             }
-            db.SetMetaLong("icon_v2_migrated", 1);
+            db.SetMetaLong("icon_v3_migrated", 1);
         }
         while (!ct.IsCancellationRequested)
         {
             foreach (var (appId, path) in db.AppsWithoutIcon(300))
             {
                 if (ct.IsCancellationRequested) return;
-                try { IconExtractor.TryExtract(db, appId, path); } catch { }
+                try
+                {
+                    var png = IconExtractor.TryExtract(db, appId, path);
+                    if (png == null)
+                    {
+                        var (sibIcon, sibPath) = db.FindSiblingAppIconOrPath(appId, path);
+                        if (sibIcon != null) db.SetAppIcon(appId, sibIcon);
+                        else if (sibPath != null) IconExtractor.TryExtract(db, appId, sibPath);
+                    }
+                }
+                catch { }
             }
             try { await Task.Delay(300_000, ct); } catch (OperationCanceledException) { return; }
         }

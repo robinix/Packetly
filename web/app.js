@@ -1,9 +1,8 @@
 /* Packetly Web — pixel replica of the desktop Traffic Monitor screen.
- * Chart pipeline mirrors packetly-ui/src/main.rs exactly: peak-preserving
- * rolling-max dilation (n/100, clamp 2..120, rDil=1.25r) -> 3-pass box
- * smoothing (cubic B-spline) -> bin-max Catmull-Rom -> bounded peak
- * normalization (1.0..1.20) -> honest raw-peak scale with interval-labeled
- * Y-axis (/s, /m, /h, /d) + 60fps smooth viewport glide.
+ * Chart pipeline mirrors packetly-ui/src/main.rs exactly: clean display-bucket
+ * summing (<=360 bins: 24h->5m, 7d->30m, 30d->3h) -> crisp 3-pass box smoothing
+ * -> Catmull-Rom -> honest raw-bucket peak normalization with dynamic interval
+ * Y-axis (/s, /m, /5m, /30m, /h, /3h, /d) + 60fps smooth viewport glide.
  * Demo mode in hosted previews; live mode when served by the collector. */
 (() => {
   'use strict';
@@ -56,9 +55,13 @@
   }
   function bucketUnit(bucket) {
     if (bucket <= 1.5) return '/s';
-    if (bucket <= 90) return '/m';
-    if (bucket <= 5400) return '/h';
-    return '/d';
+    if (bucket < 59.5) return `/${Math.round(bucket)}s`;
+    if (bucket <= 60.5) return '/m';
+    if (bucket < 3599.5) return `/${Math.round(bucket / 60)}m`;
+    if (bucket <= 3600.5) return '/h';
+    if (bucket < 86399.5) return `/${Math.round(bucket / 3600)}h`;
+    if (bucket <= 86400.5) return '/d';
+    return `/${Math.round(bucket / 86400)}d`;
   }
   function fmtBUnit(b, bucket) {
     return fmtB(b) + bucketUnit(bucket);
@@ -73,26 +76,39 @@
   function css(c) { return `rgb(${c[0]},${c[1]},${c[2]})`; }
   function fillRgba(c, a) { return `rgba(${c[0]},${c[1]},${c[2]},${a})`; }
 
-  // ---------- smoothing (direct port of packetly-ui/src/main.rs) ----------
-  function rollingMax(pts, radius) {
-    const n = pts.length;
-    if (!radius || n === 0) return pts;
-    const dq = new Int32Array(n);
-    let head = 0, tail = 0, right = 0;
-    const out = new Array(n);
-    for (let i = 0; i < n; i++) {
-      const winHi = Math.min(n - 1, i + radius);
-      while (right <= winHi) {
-        while (tail > head && pts[dq[tail - 1]][1] <= pts[right][1]) tail--;
-        dq[tail++] = right;
-        right++;
-      }
-      const winLo = Math.max(0, i - radius);
-      while (head < tail && dq[head] < winLo) head++;
-      const best = head < tail ? dq[head] : i;
-      out[i] = [pts[i][0], pts[best][1]];
+  // ---------- display re-binning & smoothing (direct port of packetly-ui/src/main.rs) ----------
+  function rebinFactor(rawN, rawBucket) {
+    if (rawN <= 360) return 1;
+    const choices = rawBucket <= 90
+      ? [1, 2, 5, 10, 15, 30, 60]
+      : rawBucket <= 5400
+        ? [1, 2, 3, 6, 12, 24]
+        : [1, 2, 7, 14, 30];
+    for (const f of choices) {
+      if (Math.ceil(rawN / f) <= 360) return f;
     }
-    return out;
+    return Math.max(1, Math.ceil(rawN / 360));
+  }
+  function rebinData(ts, down, up, rawBucket) {
+    const rawN = ts.length;
+    const factor = rebinFactor(rawN, rawBucket);
+    if (factor <= 1) return { ts, down, up, bucket: rawBucket };
+    const bucket = rawBucket * factor;
+    const x0 = Math.floor(ts[0] / bucket) * bucket;
+    const x1 = ts[rawN - 1];
+    const n = Math.max(1, Math.floor((x1 - x0) / bucket) + 1);
+    const outTs = new Array(n);
+    const outDown = new Float64Array(n);
+    const outUp = new Float64Array(n);
+    for (let i = 0; i < n; i++) outTs[i] = x0 + i * bucket;
+    for (let i = 0; i < rawN; i++) {
+      const idx = Math.floor((ts[i] - x0) / bucket);
+      if (idx >= 0 && idx < n) {
+        outDown[idx] += down[i];
+        outUp[idx] += up[i];
+      }
+    }
+    return { ts: outTs, down: outDown, up: outUp, bucket };
   }
   function movingAvg(pts, radius) {
     if (!radius || pts.length === 0) return pts;
@@ -138,18 +154,14 @@
     out.push([ctrl[n - 1][0], ctrl[n - 1][1]]);
     return out;
   }
-  function smoothSeries(ts, values, div, maxOut) {
+  function smoothSeries(ts, values, bucket, maxOut) {
     const n = values.length;
-    const r = Math.max(2, Math.min(120, Math.round(n / div)));
-    const rDil = Math.max(2, Math.round(r * 1.25));
-    const r2 = Math.max(1, Math.round(r * 0.90));
-    const r3 = Math.max(1, Math.round(r * 0.75));
+    const r = bucket <= 1.5 ? 2 : 1;
     let pts = new Array(n);
     for (let i = 0; i < n; i++) pts[i] = [ts[i], values[i]];
-    pts = rollingMax(pts, rDil);
     pts = movingAvg(pts, r);
-    pts = movingAvg(pts, r2);
-    pts = movingAvg(pts, r3);
+    pts = movingAvg(pts, 1);
+    pts = movingAvg(pts, 1);
     return catmull(pts, maxOut);
   }
   function clipAndScale(pts, vx0, vx1, k, cap) {
@@ -520,31 +532,32 @@
   // ---------- cache + VSync animation loop ----------
   function ingestData(d, updateLists) {
     state.data = d;
-    const n = d.ts.length;
-    const x0 = d.ts[0], x1 = d.ts[n - 1];
-    const peakEnd = d.bucket === 1 && n > 6 ? n - 2 : n;
+    const rb = rebinData(d.ts, d.down, d.up, d.bucket);
+    const n = rb.ts.length;
+    const x0 = rb.ts[0], x1 = rb.ts[n - 1];
+    const peakEnd = rb.bucket <= 1.5 && n > 6 ? n - 2 : n;
     let rawMax = 0;
     for (let i = 0; i < peakEnd; i++) {
-      if (d.down[i] > rawMax) rawMax = d.down[i];
-      if (d.up[i] > rawMax) rawMax = d.up[i];
+      if (rb.down[i] > rawMax) rawMax = rb.down[i];
+      if (rb.up[i] > rawMax) rawMax = rb.up[i];
     }
 
-    const upPts = smoothSeries(d.ts, d.up, 100, 1400);
-    const downPts = smoothSeries(d.ts, d.down, 100, 1400);
-    const tailCut = d.bucket === 1 && n > 6 ? x1 - 2 : Infinity;
+    const upPts = smoothSeries(rb.ts, rb.up, rb.bucket, 1400);
+    const downPts = smoothSeries(rb.ts, rb.down, rb.bucket, 1400);
+    const tailCut = rb.bucket <= 1.5 && n > 6 ? x1 - 2 : Infinity;
     let renderedMax = 0;
     for (const pt of upPts) if (pt[0] <= tailCut && pt[1] > renderedMax) renderedMax = pt[1];
     for (const pt of downPts) if (pt[0] <= tailCut && pt[1] > renderedMax) renderedMax = pt[1];
-    const targetK = renderedMax > 0 && rawMax > 0 ? Math.max(1.0, Math.min(1.20, rawMax / renderedMax)) : 1.0;
+    const targetK = renderedMax > 0 && rawMax > 0 ? rawMax / renderedMax : 1.0;
 
-    const miniUp = smoothSeries(d.ts, d.up, 90, 420);
-    const miniDown = smoothSeries(d.ts, d.down, 90, 420);
+    const miniUp = smoothSeries(rb.ts, rb.up, rb.bucket, 420);
+    const miniDown = smoothSeries(rb.ts, rb.down, rb.bucket, 420);
     let miniMax = 0;
     for (const pt of miniUp) if (pt[1] > miniMax) miniMax = pt[1];
     for (const pt of miniDown) if (pt[1] > miniMax) miniMax = pt[1];
 
     state.cached = {
-      upPts, downPts, targetK, rawMax, x0, x1, bucket: d.bucket,
+      upPts, downPts, targetK, rawMax, x0, x1, bucket: rb.bucket,
       miniUp, miniDown, miniMax: Math.max(miniMax, 1),
     };
     buildLadder();

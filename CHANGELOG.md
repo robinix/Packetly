@@ -2,6 +2,35 @@
 
 All notable changes to Packetly are documented here, including technical handoff notes for the local Windows build/verification agent.
 
+## v1.8.4 — Crisp Sculpted GlassWire-Style Graph Curves & Reliable Real App Icons
+
+### User-facing changes
+- **Restored crisp, detailed, sculpted graph curves (matching GlassWire's Traffic Monitor):**
+  - Removed the `rolling_max` dilation added in v1.8.2/v1.8.3, which merged nearby bursts into wide, vague blobs and suppressed steady uploads relative to short download spikes.
+  - Added clean display-bucket summing (`rebin_factor`) on longer time ranges so charts always plot ~180–340 natural bins (`5m` → `1s`, `3h` → `1m`, `24h` → `5m`, `7d` → `30m`, `30d` → `3h`, `All Time` → `1d`) with crisp 3-pass box smoothing + Catmull-Rom + honest raw display-bucket peak normalization.
+  - Sustained uploads and downloads now scale proportionally (so multi-GB upload mountains appear clearly alongside download peaks on `24h` and `7d`), organic shoulders and double-peaks stay crisp with clear valleys, and Y-axis units automatically show the exact display bucket (`/s`, `/m`, `/5m`, `/30m`, `/3h`, `/d`).
+- **Fixed real app icons sometimes falling back to generic placeholders:**
+  - Upgraded Windows icon extraction (`IconExtractor.cs`) to use MTA thread-safe PE resource readers (`PrivateExtractIconsW` → `ExtractIconExW` → `SHGetFileInfoW` → `ExtractAssociatedIcon`) and `DrawIconEx` 32-bit ARGB rendering instead of COM-dependent shell queries and `Icon.ToBitmap()`, eliminating intermittent extraction failures and alpha corruption.
+  - Added sibling executable icon lookup (`/api/icon` + `Db.FindSiblingAppIconOrPath`) so `name:*.exe` rows and auto-updated apps whose older versioned `.exe` path was removed still inherit the app's real icon automatically, plus a one-time `icon_v3_migrated` re-extraction on startup.
+  - Fixed the UI's paused-selection branch so drag-selecting a time window on Traffic Monitor fetches missing app icons immediately instead of leaving generic placeholders while paused, and stopped classifying `name:*.exe` rows as unidentified system entries.
+
+### Local agent handoff notes
+- **Files changed:**
+  - `packetly/src/Packetly/Core/IconExtractor.cs` — upgraded to `PrivateExtractIconsW` + `ExtractIconExW` + `SHGetFileInfoW` + `DrawIconEx` 32bpp ARGB rendering.
+  - `packetly/src/Packetly/Storage/Db.cs` — added `FindSiblingAppIconOrPath(int excludeId, string? appName)`.
+  - `packetly/src/Packetly/Api/AppApi.cs` — version `1.8.4`; added sibling icon/path fallback on `GET /api/icon`.
+  - `packetly/src/Packetly/Program.cs` — bumped one-time icon backfill migration to `icon_v3_migrated` with sibling backfill.
+  - `packetly-ui/src/main.rs` — added `rebin_factor` + display-bucket summing in `pivot()`, updated `bucket_unit` to format dynamic intervals (`/5m`, `/30m`, `/3h`, etc.), removed `rolling_max`, restored crisp 3-pass smoothing + Catmull-Rom + raw-bucket peak normalization on main and mini charts, updated `is_pseudo_app`, and added icon fetching inside the paused-selection branch + `all_apps` tail.
+  - `web/app.js` — updated `rebinFactor`/`rebinData`, `bucketUnit`, `smoothSeries`, and `ingestData` in exact lockstep with `packetly-ui/src/main.rs`.
+  - `packetly-ui/Cargo.toml`, `packetly-ui/Cargo.lock`, `package.json` — version bumped to `1.8.4`.
+- **Verify locally on Windows:**
+  1. `git pull`
+  2. `dotnet build packetly/src/Packetly -c Release`
+  3. `cargo build --release --manifest-path packetly-ui/Cargo.toml`
+  4. Confirm `/api/status` reports `"version": "1.8.4"`.
+  5. Open **Traffic Monitor** on **7 Days**, **24 Hours**, **3 Hours**, and **5 Minutes**: verify peaks are crisp, sculpted, and detailed (no wide vague blobs), verify **blue Upload mountains** rise clearly alongside magenta Download mountains on 7 Days (`/30m` axis), and verify drag-selecting a range loads real app icons inside the selection popup immediately.
+  6. Open **Traffic**, **Usage**, and **Alerts**: verify real apps (including auto-updated Electron/browser apps) display their real icons cleanly after the automatic `icon_v3_migrated` startup pass.
+
 ## v1.8.3 — Cleaner Traffic Monitor Graph, Rounded Peak-Faithful Curves & Glitch-Free Settings Dialog
 
 ### User-facing changes

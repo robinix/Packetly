@@ -777,15 +777,23 @@ fn fmt_b(b: f64) -> String {
     }
 }
 
-fn bucket_unit(bucket: f64) -> &'static str {
-    if bucket <= 1.0 {
-        "/s"
-    } else if bucket <= 60.0 {
-        "/m"
-    } else if bucket <= 3600.0 {
-        "/h"
+fn bucket_unit(bucket: f64) -> String {
+    if bucket <= 1.5 {
+        "/s".to_string()
+    } else if bucket < 59.5 {
+        format!("/{}s", bucket.round() as i64)
+    } else if bucket <= 60.5 {
+        "/m".to_string()
+    } else if bucket < 3599.5 {
+        format!("/{}m", (bucket / 60.0).round() as i64)
+    } else if bucket <= 3600.5 {
+        "/h".to_string()
+    } else if bucket < 86399.5 {
+        format!("/{}h", (bucket / 3600.0).round() as i64)
+    } else if bucket <= 86400.5 {
+        "/d".to_string()
     } else {
-        "/d"
+        format!("/{}d", (bucket / 86400.0).round() as i64)
     }
 }
 
@@ -1161,44 +1169,6 @@ fn nice_ceil(v: f64) -> f64 {
         10.0
     };
     s * e
-}
-
-/// Exact O(n) centered sliding-window maximum over `[i - radius ..= i + radius]`.
-/// Preserves true local peak amplitude before box smoothing so narrow heavy
-/// bursts reach their real byte height on the Y-axis without inflating plateaus.
-fn rolling_max(pts: &[[f64; 2]], radius: usize) -> Vec<[f64; 2]> {
-    let n = pts.len();
-    if radius == 0 || n == 0 {
-        return pts.to_vec();
-    }
-    let mut dq: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
-    let mut out = Vec::with_capacity(n);
-    let mut right = 0usize;
-    for i in 0..n {
-        let win_hi = (i + radius).min(n - 1);
-        while right <= win_hi {
-            while let Some(&back) = dq.back() {
-                if pts[back][1] <= pts[right][1] {
-                    dq.pop_back();
-                } else {
-                    break;
-                }
-            }
-            dq.push_back(right);
-            right += 1;
-        }
-        let win_lo = i.saturating_sub(radius);
-        while let Some(&front) = dq.front() {
-            if front < win_lo {
-                dq.pop_front();
-            } else {
-                break;
-            }
-        }
-        let best = dq.front().copied().unwrap_or(i);
-        out.push([pts[i][0], pts[best][1]]);
-    }
-    out
 }
 
 fn moving_avg(pts: &[[f64; 2]], radius: usize) -> Vec<[f64; 2]> {
@@ -1746,26 +1716,57 @@ fn tier_bucket(tier: &str) -> f64 {
     }
 }
 
+/// Choose a clean human-friendly display bucket multiplier when raw buckets
+/// exceed 360 points (e.g. 24h -> 5m = 288 bins, 7d -> 30m = 336 bins,
+/// 30d -> 3h = 240 bins). Summing raw buckets into ~180–340 display bins
+/// preserves sustained upload/download volume balance and sculpted organic
+/// peak detail without over-smoothing or flattening steady transfers.
+fn rebin_factor(raw_n: usize, raw_bucket: f64) -> usize {
+    if raw_n <= 360 {
+        return 1;
+    }
+    let choices: &[usize] = if raw_bucket <= 1.5 {
+        &[1, 2, 5, 10, 15, 30, 60]
+    } else if raw_bucket <= 90.0 {
+        &[1, 2, 5, 10, 15, 30, 60]
+    } else if raw_bucket <= 5400.0 {
+        &[1, 2, 3, 6, 12, 24]
+    } else {
+        &[1, 2, 7, 14, 30]
+    };
+    for &f in choices {
+        if (raw_n + f - 1) / f <= 360 {
+            return f;
+        }
+    }
+    ((raw_n + 359) / 360).max(1)
+}
+
 fn pivot(traffic: &TrafficData, in_c: egui::Color32, out_c: egui::Color32) -> Pivot {
     let mut p = Pivot::default();
-    let bucket = tier_bucket(&traffic.tier);
-    p.bucket = bucket;
+    let raw_bucket = tier_bucket(&traffic.tier);
     // Only trim leading empty space on unbounded ("All Time") queries where from == 0;
     // bounded ranges (5m, 3h, 24h, 7d, 30d, Custom) keep a rock-steady x0..x1 grid so
     // idle periods at the left edge never shift the viewport span or stretch the curve.
-    let mut x0 = if traffic.from <= 0.0 {
+    let mut raw_x0 = if traffic.from <= 0.0 {
         let first = traffic.rows.first().map(|r| r.0).unwrap_or(traffic.from);
-        ((first - bucket).max(0.0) / bucket).ceil() * bucket
+        ((first - raw_bucket).max(0.0) / raw_bucket).ceil() * raw_bucket
     } else {
-        (traffic.from / bucket).ceil() * bucket
+        (traffic.from / raw_bucket).ceil() * raw_bucket
     };
-    if traffic.to <= x0 {
-        x0 = (traffic.from / bucket).ceil() * bucket;
+    if traffic.to <= raw_x0 {
+        raw_x0 = (traffic.from / raw_bucket).ceil() * raw_bucket;
     }
-    let n = (((traffic.to - x0) / bucket).floor() as usize + 1).min(25000);
-    if n == 0 {
+    let raw_n = (((traffic.to - raw_x0) / raw_bucket).floor() as usize + 1).min(25000);
+    if raw_n == 0 {
         return p;
     }
+
+    let factor = rebin_factor(raw_n, raw_bucket);
+    let bucket = raw_bucket * factor as f64;
+    let x0 = (raw_x0 / bucket).floor() * bucket;
+    let n = (((traffic.to - x0) / bucket).floor() as usize + 1).clamp(1, 25000);
+    p.bucket = bucket;
     p.x0 = x0;
     p.x1 = x0 + (n - 1) as f64 * bucket;
     p.n = n;
@@ -1773,19 +1774,19 @@ fn pivot(traffic: &TrafficData, in_c: egui::Color32, out_c: egui::Color32) -> Pi
     let mut down = vec![0.0_f64; n];
     let mut up = vec![0.0_f64; n];
     for (ts, _app, i, o) in &traffic.rows {
-        if *ts < x0 - bucket * 0.5 {
+        if *ts < x0 - raw_bucket * 0.5 {
             continue;
         }
-        let idx = ((ts - x0) / bucket).round() as usize;
-        if idx < n {
-            down[idx] += i;
-            up[idx] += o;
+        let idx = ((*ts - x0) / bucket).floor() as isize;
+        if idx >= 0 && (idx as usize) < n {
+            down[idx as usize] += i;
+            up[idx as usize] += o;
         }
     }
 
-    // raw bucket peak -> basis of the y-scale (on live 1s tier exclude the
-    // unflushed tail [n-2..n] so in-progress writes never jitter the Y scale)
-    let peak_end = if bucket == 1.0 && n > 6 { n - 2 } else { n };
+    // raw display-bucket peak -> basis of the y-scale (on live 1s tier exclude
+    // the unflushed tail [n-2..n] so in-progress writes never jitter the Y scale)
+    let peak_end = if bucket <= 1.5 && n > 6 { n - 2 } else { n };
     let mut y_max = 0.0_f64;
     for i in 0..peak_end {
         y_max = y_max.max(down[i]).max(up[i]);
@@ -2586,7 +2587,6 @@ impl PacketlyApp {
         let s = name.trim();
         s.starts_with("unknown:")
             || s.starts_with("unidentified:")
-            || s.starts_with("name:")
             || s.ends_with(" (System)")
             || s == "Background Traffic"
     }
@@ -2920,20 +2920,14 @@ impl PacketlyApp {
                                     cache.mini.as_ref().map_or(true, |(v, _)| *v != ver);
                                 if stale {
                                     let p = pivot(traffic, t.in_c, t.out_c);
-                                    let mr = ((p.n as f64) / 90.0)
-                                        .round()
-                                        .clamp(2.0, 120.0) as usize;
-                                    let mr_dil = ((mr as f64) * 1.25).round().max(2.0) as usize;
-                                    let mr2 = ((mr as f64) * 0.90).round().max(1.0) as usize;
-                                    let mr3 = ((mr as f64) * 0.75).round().max(1.0) as usize;
+                                    let mr = if p.bucket <= 1.5 { 2usize } else { 1usize };
                                     let mut curves: Vec<Vec<[f64; 2]>> = p
                                         .series
                                         .iter()
                                         .map(|s| {
-                                            let dil = rolling_max(&s.points, mr_dil);
-                                            let pass1 = moving_avg(&dil, mr);
-                                            let pass2 = moving_avg(&pass1, mr2);
-                                            let pass3 = moving_avg(&pass2, mr3);
+                                            let pass1 = moving_avg(&s.points, mr);
+                                            let pass2 = moving_avg(&pass1, 1);
+                                            let pass3 = moving_avg(&pass2, 1);
                                             smooth(&pass3, 420)
                                         })
                                         .collect();
@@ -2944,7 +2938,7 @@ impl PacketlyApp {
                                         }
                                     }
                                     if m_max > 0.0 && p.y_max > 0.0 {
-                                        let mk = (p.y_max / m_max).clamp(1.0, 1.20);
+                                        let mk = p.y_max / m_max;
                                         for pts in &mut curves {
                                             for pt in pts.iter_mut() {
                                                 pt[1] *= mk;
@@ -3135,15 +3129,12 @@ impl PacketlyApp {
                                 } else {
                                     self.scale_cap
                                 };
-                                // Peak-preserving rolling-max dilation followed by 3-pass
-                                // box smoothing (cubic B-spline) + Catmull-Rom: produces
-                                // smooth, rounded hills while keeping narrow bursts faithful
-                                // to their real byte height on the Y-axis without inflating
-                                // lower sustained plateaus.
-                                let r = ((p.n as f64) / 100.0).round().clamp(2.0, 120.0) as usize;
-                                let r_dil = ((r as f64) * 1.25).round().max(2.0) as usize;
-                                let r2 = ((r as f64) * 0.90).round().max(1.0) as usize;
-                                let r3 = ((r as f64) * 0.75).round().max(1.0) as usize;
+                                // Crisp 3-pass box smoothing + Catmull-Rom over ~180–340
+                                // display buckets: preserves sculpted organic shoulders,
+                                // double-peaks, deep valleys, and balanced upload/download
+                                // volume while normalizing peak height to the exact raw
+                                // display-bucket peak on the Y-axis.
+                                let r = if p.bucket <= 1.5 { 2usize } else { 1usize };
                                 let (rendered, target_k) = {
                                     let mut cache = self.cache.lock().unwrap();
                                     let stale = cache.rendered.as_ref().map_or(true, |rd| {
@@ -3154,14 +3145,13 @@ impl PacketlyApp {
                                             .series
                                             .iter()
                                             .map(|s| {
-                                                let dilated = rolling_max(&s.points, r_dil);
-                                                let pass1 = moving_avg(&dilated, r);
-                                                let pass2 = moving_avg(&pass1, r2);
-                                                let pass3 = moving_avg(&pass2, r3);
+                                                let pass1 = moving_avg(&s.points, r);
+                                                let pass2 = moving_avg(&pass1, 1);
+                                                let pass3 = moving_avg(&pass2, 1);
                                                 smooth(&pass3, 1400)
                                             })
                                             .collect();
-                                        let tail_cut = if p.bucket == 1.0 && p.n > 6 {
+                                        let tail_cut = if p.bucket <= 1.5 && p.n > 6 {
                                             p.x1 - 2.0
                                         } else {
                                             f64::INFINITY
@@ -3175,7 +3165,7 @@ impl PacketlyApp {
                                             }
                                         }
                                         let tk = if rendered_max > 0.0 && p.y_max > 0.0 {
-                                            (p.y_max / rendered_max).clamp(1.0, 1.20)
+                                            p.y_max / rendered_max
                                         } else {
                                             1.0
                                         };
@@ -7695,6 +7685,50 @@ fn main() -> eframe::Result {
                             };
                             detail_dirty = false;
                         }
+                        // Fetch any missing icons for selection-popup / detail apps even while paused
+                        // so drag-selected apps never sit on generic placeholders.
+                        let mut p_want: Vec<i64> = Vec::new();
+                        if let Some((aid, _, _)) = active_detail {
+                            if aid > 0 && !icon_cache.contains_key(&aid) {
+                                p_want.push(aid);
+                            }
+                        }
+                        if let Some(ref s) = p2.sel {
+                            for a in &s.apps {
+                                if a.app_id > 0
+                                    && !icon_cache.contains_key(&a.app_id)
+                                    && !p_want.contains(&a.app_id)
+                                {
+                                    p_want.push(a.app_id);
+                                }
+                            }
+                        }
+                        let mut icon_added = false;
+                        for aid in p_want.into_iter().take(24) {
+                            if let Ok(resp) = ureq::get(&format!("{}/api/icon?app_id={}", API, aid))
+                                .timeout(Duration::from_secs(2))
+                                .call()
+                            {
+                                if resp.status() == 200 {
+                                    let mut bytes = Vec::new();
+                                    use std::io::Read;
+                                    if resp
+                                        .into_reader()
+                                        .take(200_000)
+                                        .read_to_end(&mut bytes)
+                                        .is_ok()
+                                        && !bytes.is_empty()
+                                    {
+                                        icon_cache.insert(aid, bytes);
+                                        icon_retry.remove(&aid);
+                                        icon_added = true;
+                                    }
+                                }
+                            }
+                        }
+                        if icon_added {
+                            p2.icons = icon_cache.clone();
+                        }
                         *snap.lock().unwrap() = Arc::new(p2);
                         paused_dirty = false;
                         if let Some(ctx) = ui_ctx.lock().unwrap().as_ref() {
@@ -7817,6 +7851,9 @@ fn main() -> eframe::Result {
                         for a in &s.apps {
                             push_id(a.app_id);
                         }
+                    }
+                    for (id, _) in fr.all_apps.iter().take(60) {
+                        push_id(*id);
                     }
                     let now_inst = std::time::Instant::now();
                     let mut fetched = 0;

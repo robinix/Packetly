@@ -312,6 +312,55 @@ internal sealed class Db : IDisposable
         }
     }
 
+    /// <summary>
+    /// Looks up a sibling app row sharing the same executable name (case-insensitive)
+    /// that already has an extracted icon or a real on-disk .exe path. Handles
+    /// name-only entries ("name:foo.exe") and auto-updated apps whose old versioned
+    /// directory no longer exists on disk.
+    /// </summary>
+    public (byte[]? Icon, string? Path) FindSiblingAppIconOrPath(int excludeId, string? appName)
+    {
+        if (string.IsNullOrWhiteSpace(appName)) return (null, null);
+        var clean = HostGrouping.AppDisplayName(appName).Trim();
+        if (string.IsNullOrEmpty(clean) || HostGrouping.IsPseudoPath(clean) || !clean.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
+            return (null, null);
+
+        lock (_gate)
+        {
+            using (var cmd = _conn.CreateCommand())
+            {
+                cmd.CommandText = """
+                    SELECT icon FROM apps
+                    WHERE id != $id AND icon IS NOT NULL AND length(icon) > 0
+                      AND (LOWER(name) = LOWER($n) OR LOWER(path) LIKE '%\' || LOWER($n))
+                    ORDER BY id DESC LIMIT 1
+                    """;
+                cmd.Parameters.AddWithValue("$id", excludeId);
+                cmd.Parameters.AddWithValue("$n", clean);
+                var v = cmd.ExecuteScalar();
+                if (v is byte[] b && b.Length > 0) return (b, null);
+            }
+            using (var cmd = _conn.CreateCommand())
+            {
+                cmd.CommandText = """
+                    SELECT path FROM apps
+                    WHERE id != $id AND path LIKE '%:\%.exe'
+                      AND (LOWER(name) = LOWER($n) OR LOWER(path) LIKE '%\' || LOWER($n))
+                    ORDER BY id DESC LIMIT 5
+                    """;
+                cmd.Parameters.AddWithValue("$id", excludeId);
+                cmd.Parameters.AddWithValue("$n", clean);
+                using var r = cmd.ExecuteReader();
+                while (r.Read())
+                {
+                    var p = r.GetString(0);
+                    if (File.Exists(p)) return (null, p);
+                }
+            }
+        }
+        return (null, null);
+    }
+
     /// <summary>Exe-backed apps with persisted version/file metadata for change monitoring.</summary>
     public List<(int Id, string Path, string? Name, string? Publisher, string? Version, long? FileSize, long? FileMtime)> GetMonitoredApps(int limit)
     {
