@@ -155,15 +155,17 @@ static void OpenDashboard(int port)
 }
 
 /// <summary>Creates Start Menu + Desktop shortcuts that open the dashboard
-/// in the native window when available, else an Edge app window.</summary>
-static void CreateDashboardShortcuts(int port)
+/// in the native window. Runs ONLY from --install-autostart: recreating them
+/// on every boot resurrected desktop icons the user had deliberately moved
+/// or deleted.</summary>
+static void CreateDashboardShortcuts()
 {
     var iconPath = WriteAppIcon();
-    // Shortcuts start the SCHEDULED TASK (elevated, no UAC prompt): this guarantees a
-    // collector is running before the UI opens. A second instance while one serves
-    // simply opens the dashboard (see the port-in-use guard in Main).
-    // Without this, opening the shortcut after tray-Exit launched only the UI, which
-    // found no API and sat empty until reboot.
+    // Shortcuts open the dashboard UI directly (GUI subsystem, no console).
+    // The collector itself is the scheduled task's job; if the collector is
+    // not running, launching packetly --serve would show a console window,
+    // and schtasks /run fails non-elevated for a RunLevel-Highest task.
+    var ui = NativeUiPath();
     var script = "$ws = New-Object -ComObject WScript.Shell\n" +
         "$targets = @(\n" +
         "  (Join-Path ([Environment]::GetFolderPath('Desktop')) 'Packetly Dashboard.lnk'),\n" +
@@ -171,8 +173,8 @@ static void CreateDashboardShortcuts(int port)
         ")\n" +
         "foreach ($t in $targets) {\n" +
         "  $lnk = $ws.CreateShortcut($t)\n" +
-        "  $lnk.TargetPath = '" + Environment.SystemDirectory + "\\schtasks.exe'\n" +
-        "  $lnk.Arguments = '/run /tn Packetly'\n" +
+        "  $lnk.TargetPath = '" + ui + "'\n" +
+        "  $lnk.WorkingDirectory = '" + Path.GetDirectoryName(ui) + "'\n" +
         "  $lnk.IconLocation = '" + iconPath + ",0'\n" +
         "  $lnk.Description = 'Packetly network monitor'\n" +
         "  $lnk.Save()\n" +
@@ -235,9 +237,17 @@ static int InstallAutostart(string dbPath)
         Write-Output 'task registered'
         """;
     var rc = RunPowerShell(script);
-    Console.WriteLine(rc == 0
-        ? "Packetly will start automatically at logon. Remove with: packetly --uninstall-autostart"
-        : "failed to register the scheduled task");
+    if (rc == 0)
+    {
+        Console.WriteLine("Packetly will start automatically at logon. Remove with: packetly --uninstall-autostart");
+        // shortcuts are an install-time artifact: recreating them on every
+        // boot resurrected desktop icons the user had moved/deleted
+        CreateDashboardShortcuts();
+    }
+    else
+    {
+        Console.WriteLine("failed to register the scheduled task");
+    }
     return rc;
 }
 
@@ -606,7 +616,6 @@ async Task<int> RunServeAsync(string dbPath, string mode, int port, bool elevate
         TogglePause);
 
     Log($"API listening on http://127.0.0.1:{port}/");
-    CreateDashboardShortcuts(port);
 
     // open the dashboard window shortly after startup - unless the user chose
     // "start minimized to tray" in settings (the tray icon opens it on click)
