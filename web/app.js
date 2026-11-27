@@ -1,7 +1,8 @@
 /* Packetly Web — pixel replica of the desktop Traffic Monitor screen.
- * Chart pipeline mirrors packetly-ui/src/main.rs exactly: sharper 3-pass box
- * smoothing (n/130, clamp 1..120) -> stride-bounded Catmull-Rom -> joint peak
- * normalization -> honest raw-peak scale + 60fps smooth viewport glide.
+ * Chart pipeline mirrors packetly-ui/src/main.rs exactly: peak-preserving
+ * rolling-max dilation (n/200, clamp 1..48) -> box smoothing -> bin-max
+ * Catmull-Rom -> bounded peak normalization -> honest raw-peak scale with
+ * interval-labeled Y-axis (/s, /m, /h, /d) + 60fps smooth viewport glide.
  * Demo mode in hosted previews; live mode when served by the collector. */
 (() => {
   'use strict';
@@ -13,10 +14,10 @@
   const AXIS = 'rgba(160,172,200,0.8)';
   const RANGE_LABEL = { '5m': '5 Minutes', '3h': '3 Hours', '24h': '24 Hours', '7d': '7 Days', '30d': '30 Days', unlimited: 'All Time' };
   const LADDER = [
-    ['50 KB', 51200], ['100 KB', 102400], ['250 KB', 256000], ['500 KB', 512000],
-    ['1 MB', 1048576], ['2 MB', 2097152], ['5 MB', 5242880], ['10 MB', 10485760],
-    ['25 MB', 26214400], ['50 MB', 52428800], ['100 MB', 104857600], ['250 MB', 262144000],
-    ['500 MB', 524288000], ['1 GB', 1073741824], ['2 GB', 2147483648], ['5 GB', 5368709120],
+    ['50 KB', 50000], ['100 KB', 100000], ['250 KB', 250000], ['500 KB', 500000],
+    ['1 MB', 1000000], ['2 MB', 2000000], ['5 MB', 5000000], ['10 MB', 10000000],
+    ['25 MB', 25000000], ['50 MB', 50000000], ['100 MB', 100000000], ['250 MB', 250000000],
+    ['500 MB', 500000000], ['1 GB', 1000000000], ['2 GB', 2000000000], ['5 GB', 5000000000],
   ];
 
   const state = {
@@ -28,7 +29,7 @@
     data: null,
     cached: null, // { ver, upPts, downPts, targetK, rawMax, x0, x1, bucket, miniUp, miniDown, miniMax }
     autoScale: true,
-    scaleCap: 104857600,
+    scaleCap: 100000000,
     // VSync continuous viewport glide & scale easing (mirrors packetly-ui/src/main.rs)
     animX1: 0,
     animYTop: 0,
@@ -52,6 +53,15 @@
     if (a >= 1e3) return (b / 1e3).toFixed(2) + ' KB';
     return Math.round(b) + ' B';
   }
+  function bucketUnit(bucket) {
+    if (bucket <= 1.5) return '/s';
+    if (bucket <= 90) return '/m';
+    if (bucket <= 5400) return '/h';
+    return '/d';
+  }
+  function fmtBUnit(b, bucket) {
+    return fmtB(b) + bucketUnit(bucket);
+  }
   function niceStep(v) {
     if (!(v > 0)) return 1;
     const e = Math.pow(10, Math.floor(Math.log10(v)));
@@ -63,6 +73,26 @@
   function fillRgba(c, a) { return `rgba(${c[0]},${c[1]},${c[2]},${a})`; }
 
   // ---------- smoothing (direct port of packetly-ui/src/main.rs) ----------
+  function rollingMax(pts, radius) {
+    const n = pts.length;
+    if (!radius || n === 0) return pts;
+    const dq = new Int32Array(n);
+    let head = 0, tail = 0, right = 0;
+    const out = new Array(n);
+    for (let i = 0; i < n; i++) {
+      const winHi = Math.min(n - 1, i + radius);
+      while (right <= winHi) {
+        while (tail > head && pts[dq[tail - 1]][1] <= pts[right][1]) tail--;
+        dq[tail++] = right;
+        right++;
+      }
+      const winLo = Math.max(0, i - radius);
+      while (head < tail && dq[head] < winLo) head++;
+      const best = head < tail ? dq[head] : i;
+      out[i] = [pts[i][0], pts[best][1]];
+    }
+    return out;
+  }
   function movingAvg(pts, radius) {
     if (!radius || pts.length === 0) return pts;
     const n = pts.length;
@@ -80,11 +110,16 @@
     let ctrl = pts;
     if (pts.length > 600) {
       const targetCtrl = 480;
-      const last = pts.length - 1;
+      const n = pts.length;
       ctrl = new Array(targetCtrl);
       for (let i = 0; i < targetCtrl; i++) {
-        const idx = Math.floor((i * last + Math.floor((targetCtrl - 1) / 2)) / (targetCtrl - 1));
-        ctrl[i] = pts[idx];
+        const lo = Math.floor((i * n) / targetCtrl);
+        const hi = Math.min(n, Math.max(lo + 1, Math.floor(((i + 1) * n) / targetCtrl)));
+        let best = pts[lo];
+        for (let k = lo; k < hi; k++) {
+          if (pts[k][1] > best[1]) best = pts[k];
+        }
+        ctrl[i] = best;
       }
     }
     const n = ctrl.length, segs = n - 1;
@@ -104,14 +139,14 @@
   }
   function smoothSeries(ts, values, div, maxOut) {
     const n = values.length;
-    const r = Math.max(1, Math.min(120, Math.round(n / div)));
-    const r2 = Math.max(1, Math.floor((r * 2) / 3));
-    const r3 = Math.max(1, Math.floor(r / 3));
+    const r = Math.max(1, Math.min(48, Math.round(n / div)));
     let pts = new Array(n);
     for (let i = 0; i < n; i++) pts[i] = [ts[i], values[i]];
+    pts = rollingMax(pts, r);
     pts = movingAvg(pts, r);
-    pts = movingAvg(pts, r2);
-    pts = movingAvg(pts, r3);
+    if (r >= 2) {
+      pts = movingAvg(pts, Math.max(1, Math.floor(r / 2)));
+    }
     return catmull(pts, maxOut);
   }
   function clipAndScale(pts, vx0, vx1, k, cap) {
@@ -280,7 +315,7 @@
       ctx.textBaseline = 'alphabetic';
       ctx.textAlign = 'left';
       ctx.fillStyle = AXIS;
-      for (const [yv, py] of yLabelPos) ctx.fillText(fmtB(yv), left + 6, py - 4);
+      for (const [yv, py] of yLabelPos) ctx.fillText(fmtBUnit(yv, opts.bucket || 60), left + 6, py - 4);
       ctx.textAlign = 'center';
       for (const [ts, px, step] of xTicks) {
         if (px > left + 18 && px < left + pw - 18) {
@@ -491,16 +526,16 @@
       if (d.up[i] > rawMax) rawMax = d.up[i];
     }
 
-    const upPts = smoothSeries(d.ts, d.up, 130, 1400);
-    const downPts = smoothSeries(d.ts, d.down, 130, 1400);
+    const upPts = smoothSeries(d.ts, d.up, 200, 1400);
+    const downPts = smoothSeries(d.ts, d.down, 200, 1400);
     const tailCut = d.bucket === 1 && n > 6 ? x1 - 2 : Infinity;
     let renderedMax = 0;
     for (const pt of upPts) if (pt[0] <= tailCut && pt[1] > renderedMax) renderedMax = pt[1];
     for (const pt of downPts) if (pt[0] <= tailCut && pt[1] > renderedMax) renderedMax = pt[1];
-    const targetK = renderedMax > 0 && rawMax > 0 ? rawMax / renderedMax : 1;
+    const targetK = renderedMax > 0 && rawMax > 0 ? Math.max(1.0, Math.min(1.15, rawMax / renderedMax)) : 1.0;
 
-    const miniUp = smoothSeries(d.ts, d.up, 110, 420);
-    const miniDown = smoothSeries(d.ts, d.down, 110, 420);
+    const miniUp = smoothSeries(d.ts, d.up, 140, 420);
+    const miniDown = smoothSeries(d.ts, d.down, 140, 420);
     let miniMax = 0;
     for (const pt of miniUp) if (pt[1] > miniMax) miniMax = pt[1];
     for (const pt of miniDown) if (pt[1] > miniMax) miniMax = pt[1];
@@ -509,6 +544,8 @@
       upPts, downPts, targetK, rawMax, x0, x1, bucket: d.bucket,
       miniUp, miniDown, miniMax: Math.max(miniMax, 1),
     };
+    buildLadder();
+    updateScaleBtn();
 
     // Update summary stats & mini timeline
     drawChart($('mini-chart'), [
@@ -612,7 +649,7 @@
 
     const vx1 = Math.max(minX1, Math.min(liveCeil, state.animX1));
     const vx0 = Math.max(c.x0, vx1 - visSpan);
-    const yTop = Math.max(1024, state.animYTop);
+    const yTop = Math.max(1000, state.animYTop);
     const cap = state.autoScale ? Infinity : state.scaleCap;
 
     const visUp = clipAndScale(c.upPts, vx0, vx1, state.animK, cap);
@@ -621,7 +658,7 @@
     drawChart($('main-chart'), [
       { color: UP, pts: visUp },
       { color: DOWN, pts: visDown },
-    ], { x0: vx0, x1: vx1, yTop: yTop * 1.04, gridStep: niceStep(targetYTop / 8) });
+    ], { x0: vx0, x1: vx1, yTop: yTop * 1.07, gridStep: niceStep(targetYTop / 8), bucket: c.bucket });
 
     if (needMore) scheduleFrame();
   }
@@ -816,8 +853,9 @@
     scheduleFrame();
   });
   function buildLadder() {
+    const unit = bucketUnit(state.cached ? state.cached.bucket : 60);
     $('scale-ladder').innerHTML = LADDER.map(([lbl, val]) =>
-      `<button data-cap="${val}" class="${Math.abs(state.scaleCap - val) < 1 ? 'sel' : ''}">${lbl}</button>`
+      `<button data-cap="${val}" class="${Math.abs(state.scaleCap - val) < 1 ? 'sel' : ''}">${lbl}${unit}</button>`
     ).join('');
   }
   $('scale-ladder').addEventListener('click', (e) => {
@@ -829,9 +867,10 @@
     scheduleFrame();
   });
   function updateScaleBtn() {
+    const unit = bucketUnit(state.cached ? state.cached.bucket : 60);
     $('scale-btn').innerHTML = (state.autoScale
       ? 'Auto-scale'
-      : `cap ${fmtB(state.scaleCap)}`) + ' <span class="caret">▾</span>';
+      : `cap ${fmtB(state.scaleCap)}${unit}`) + ' <span class="caret">▾</span>';
   }
   document.addEventListener('click', closeMenus);
 

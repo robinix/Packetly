@@ -1,4 +1,6 @@
+using System.Net;
 using Microsoft.Data.Sqlite;
+using Packetly.Core;
 
 namespace Packetly.Storage;
 
@@ -119,16 +121,74 @@ internal sealed class Db : IDisposable
 
     // ---- meta / watermarks ----
 
+    private long ReadMetaLongUnlocked(string key, long fallback)
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = "SELECT value FROM meta WHERE key = $k";
+        cmd.Parameters.AddWithValue("$k", key);
+        var v = cmd.ExecuteScalar() as string;
+        return v != null && long.TryParse(v, out var n) ? n : fallback;
+    }
+
     public long GetMetaLong(string key, long fallback)
     {
-        lock (_gate)
+        lock (_gate) return ReadMetaLongUnlocked(key, fallback);
+    }
+
+    /// <summary>
+    /// Builds a read-only subquery over the requested rollup tier PLUS any
+    /// unrolled live tail from finer tiers beyond the aggregator watermark.
+    /// Guarantees zero 1–90s (or hourly/daily) blind spot between traffic_1s
+    /// and traffic_60s / traffic_3600s / traffic_86400s across graphs, totals,
+    /// and selection popups. Caller must hold _gate and bind $f (and $t when
+    /// hasUpperBound is true).
+    /// </summary>
+    private string TrafficSourceSql(string table, bool hasUpperBound)
+    {
+        var upper = hasUpperBound ? " AND ts < $t" : "";
+        if (table == "traffic_1s")
+            return $"(SELECT ts, app_id, host, port, proto, inb, outb FROM traffic_1s WHERE ts >= $f{upper})";
+
+        long wm60 = ReadMetaLongUnlocked("rollup_60s_wm", 0);
+        if (table == "traffic_60s")
         {
-            using var cmd = _conn.CreateCommand();
-            cmd.CommandText = "SELECT value FROM meta WHERE key = $k";
-            cmd.Parameters.AddWithValue("$k", key);
-            var v = cmd.ExecuteScalar() as string;
-            return v != null && long.TryParse(v, out var n) ? n : fallback;
+            return $"""
+                (SELECT ts, app_id, host, port, proto, inb, outb FROM traffic_60s WHERE ts >= $f AND ts < {wm60}{upper}
+                 UNION ALL
+                 SELECT (ts / 60) * 60 AS ts, app_id, host, port, proto, inb, outb FROM traffic_1s WHERE ts >= $f AND ts >= {wm60}{upper})
+                """;
         }
+
+        long wm3600 = ReadMetaLongUnlocked("rollup_3600s_wm", 0);
+        if (table == "traffic_3600s")
+        {
+            long w60 = Math.Max(wm3600, wm60);
+            return $"""
+                (SELECT ts, app_id, host, port, proto, inb, outb FROM traffic_3600s WHERE ts >= $f AND ts < {wm3600}{upper}
+                 UNION ALL
+                 SELECT (ts / 3600) * 3600 AS ts, app_id, host, port, proto, inb, outb FROM traffic_60s WHERE ts >= $f AND ts >= {wm3600} AND ts < {w60}{upper}
+                 UNION ALL
+                 SELECT (ts / 3600) * 3600 AS ts, app_id, host, port, proto, inb, outb FROM traffic_1s WHERE ts >= $f AND ts >= {w60}{upper})
+                """;
+        }
+
+        if (table == "traffic_86400s")
+        {
+            long wm86400 = ReadMetaLongUnlocked("rollup_86400s_wm", 0);
+            long w3600 = Math.Max(wm86400, wm3600);
+            long w60 = Math.Max(w3600, wm60);
+            return $"""
+                (SELECT ts, app_id, host, port, proto, inb, outb FROM traffic_86400s WHERE ts >= $f AND ts < {wm86400}{upper}
+                 UNION ALL
+                 SELECT (ts / 86400) * 86400 AS ts, app_id, host, port, proto, inb, outb FROM traffic_3600s WHERE ts >= $f AND ts >= {wm86400} AND ts < {w3600}{upper}
+                 UNION ALL
+                 SELECT (ts / 86400) * 86400 AS ts, app_id, host, port, proto, inb, outb FROM traffic_60s WHERE ts >= $f AND ts >= {w3600} AND ts < {w60}{upper}
+                 UNION ALL
+                 SELECT (ts / 86400) * 86400 AS ts, app_id, host, port, proto, inb, outb FROM traffic_1s WHERE ts >= $f AND ts >= {w60}{upper})
+                """;
+        }
+
+        throw new ArgumentException($"invalid traffic table '{table}'", nameof(table));
     }
 
     public void SetMetaLong(string key, long value)
@@ -311,11 +371,12 @@ internal sealed class Db : IDisposable
         var list = new List<(string, string?, string?, long, long)>();
         lock (_gate)
         {
+            var src = TrafficSourceSql(table, true);
             using var cmd = _conn.CreateCommand();
             cmd.CommandText = $"""
                 SELECT hex(t.host) AS iphex, h.hostname, h.region, SUM(t.inb), SUM(t.outb)
-                FROM {table} t LEFT JOIN hosts h ON h.ip = t.host
-                WHERE t.ts >= $f AND t.ts < $t AND t.app_id = $id
+                FROM {src} t LEFT JOIN hosts h ON h.ip = t.host
+                WHERE t.app_id = $id
                 GROUP BY t.host ORDER BY SUM(t.inb + t.outb) DESC, t.host ASC LIMIT $l
                 """;
             cmd.Parameters.AddWithValue("$f", from);
@@ -333,11 +394,27 @@ internal sealed class Db : IDisposable
     {
         lock (_gate)
         {
+            var src = TrafficSourceSql(table, true);
             using var cmd = _conn.CreateCommand();
-            cmd.CommandText = $"SELECT SUM(inb), SUM(outb) FROM {table} WHERE ts >= $f AND ts < $t AND app_id = $id";
+            cmd.CommandText = $"SELECT SUM(inb), SUM(outb) FROM {src} WHERE app_id = $id";
             cmd.Parameters.AddWithValue("$f", from);
             cmd.Parameters.AddWithValue("$t", to);
             cmd.Parameters.AddWithValue("$id", appId);
+            using var r = cmd.ExecuteReader();
+            if (!r.Read()) return (0, 0);
+            return (r.IsDBNull(0) ? 0 : r.GetInt64(0), r.IsDBNull(1) ? 0 : r.GetInt64(1));
+        }
+    }
+
+    public (long In, long Out) TotalBytesBetween(string table, long from, long to)
+    {
+        lock (_gate)
+        {
+            var src = TrafficSourceSql(table, true);
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = $"SELECT SUM(inb), SUM(outb) FROM {src}";
+            cmd.Parameters.AddWithValue("$f", from);
+            cmd.Parameters.AddWithValue("$t", to);
             using var r = cmd.ExecuteReader();
             if (!r.Read()) return (0, 0);
             return (r.IsDBNull(0) ? 0 : r.GetInt64(0), r.IsDBNull(1) ? 0 : r.GetInt64(1));
@@ -362,11 +439,11 @@ internal sealed class Db : IDisposable
         var list = new List<(int, string, int, long, long)>();
         lock (_gate)
         {
+            var src = TrafficSourceSql(table, true);
             using var cmd = _conn.CreateCommand();
             cmd.CommandText = $"""
                 SELECT a.id, COALESCE(a.name, a.path), COUNT(DISTINCT t.host), SUM(t.inb), SUM(t.outb)
-                FROM {table} t JOIN apps a ON a.id = t.app_id
-                WHERE t.ts >= $f AND t.ts < $t
+                FROM {src} t JOIN apps a ON a.id = t.app_id
                 GROUP BY a.id ORDER BY SUM(t.inb + t.outb) DESC, a.id ASC LIMIT $l
                 """;
             cmd.Parameters.AddWithValue("$f", from);
@@ -402,6 +479,17 @@ internal sealed class Db : IDisposable
             cmd.Parameters.AddWithValue("$ip", ip);
             cmd.Parameters.AddWithValue("$t", now);
             cmd.ExecuteNonQuery();
+        }
+    }
+
+    public string? GetHostname(byte[] ip)
+    {
+        lock (_gate)
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = "SELECT hostname FROM hosts WHERE ip = $ip";
+            cmd.Parameters.AddWithValue("$ip", ip);
+            return cmd.ExecuteScalar() as string;
         }
     }
 
@@ -516,8 +604,9 @@ internal sealed class Db : IDisposable
         var list = new List<(long, long, long)>();
         lock (_gate)
         {
+            var src = TrafficSourceSql(table, true);
             using var cmd = _conn.CreateCommand();
-            cmd.CommandText = $"SELECT ts, SUM(inb), SUM(outb) FROM {table} WHERE ts >= $f AND ts < $t" + (appId != null ? " AND app_id = $app" : "") + " GROUP BY ts ORDER BY ts";
+            cmd.CommandText = $"SELECT ts, SUM(inb), SUM(outb) FROM {src}" + (appId != null ? " WHERE app_id = $app" : "") + " GROUP BY ts ORDER BY ts";
             cmd.Parameters.AddWithValue("$f", from);
             cmd.Parameters.AddWithValue("$t", to);
             if (appId != null) cmd.Parameters.AddWithValue("$app", appId);
@@ -532,8 +621,9 @@ internal sealed class Db : IDisposable
         var list = new List<(long, int, long, long)>();
         lock (_gate)
         {
+            var src = TrafficSourceSql(table, true);
             using var cmd = _conn.CreateCommand();
-            cmd.CommandText = $"SELECT ts, app_id, SUM(inb), SUM(outb) FROM {table} WHERE ts >= $f AND ts < $t" + (appId != null ? " AND app_id = $app" : "") + " GROUP BY ts, app_id ORDER BY ts";
+            cmd.CommandText = $"SELECT ts, app_id, SUM(inb), SUM(outb) FROM {src}" + (appId != null ? " WHERE app_id = $app" : "") + " GROUP BY ts, app_id ORDER BY ts";
             cmd.Parameters.AddWithValue("$f", from);
             cmd.Parameters.AddWithValue("$t", to);
             if (appId != null) cmd.Parameters.AddWithValue("$app", appId);
@@ -548,11 +638,11 @@ internal sealed class Db : IDisposable
         var list = new List<(string, long, long)>();
         lock (_gate)
         {
+            var src = TrafficSourceSql(table, true);
             using var cmd = _conn.CreateCommand();
             cmd.CommandText = $"""
                 SELECT COALESCE(a.name, a.path), SUM(t.inb), SUM(t.outb)
-                FROM {table} t JOIN apps a ON a.id = t.app_id
-                WHERE t.ts >= $f AND t.ts < $t
+                FROM {src} t JOIN apps a ON a.id = t.app_id
                 GROUP BY t.app_id ORDER BY SUM(t.inb + t.outb) DESC, t.app_id ASC LIMIT $l
                 """;
             cmd.Parameters.AddWithValue("$f", from);
@@ -569,11 +659,11 @@ internal sealed class Db : IDisposable
         var list = new List<(int, string, string, long, long)>();
         lock (_gate)
         {
+            var src = TrafficSourceSql(table, true);
             using var cmd = _conn.CreateCommand();
             cmd.CommandText = $"""
                 SELECT a.id, COALESCE(a.name, a.path), a.path, SUM(t.inb), SUM(t.outb)
-                FROM {table} t JOIN apps a ON a.id = t.app_id
-                WHERE t.ts >= $f AND t.ts < $t
+                FROM {src} t JOIN apps a ON a.id = t.app_id
                 GROUP BY a.id ORDER BY SUM(t.inb + t.outb) DESC, a.id ASC LIMIT $l
                 """;
             cmd.Parameters.AddWithValue("$f", from);
@@ -590,11 +680,11 @@ internal sealed class Db : IDisposable
         var list = new List<(string, string?, string?, long, long)>();
         lock (_gate)
         {
+            var src = TrafficSourceSql(table, true);
             using var cmd = _conn.CreateCommand();
             cmd.CommandText = $"""
                 SELECT hex(t.host) AS iphex, h.hostname, h.region, SUM(t.inb), SUM(t.outb)
-                FROM {table} t LEFT JOIN hosts h ON h.ip = t.host
-                WHERE t.ts >= $f AND t.ts < $t
+                FROM {src} t LEFT JOIN hosts h ON h.ip = t.host
                 GROUP BY t.host ORDER BY SUM(t.inb + t.outb) DESC, t.host ASC LIMIT $l
                 """;
             cmd.Parameters.AddWithValue("$f", from);
@@ -701,15 +791,16 @@ internal sealed class Db : IDisposable
         }
     }
 
-    /// <summary>Per-app totals (in+out) from the 60 s tier since the given second.</summary>
+    /// <summary>Per-app totals (in+out) from the 60 s tier + unrolled live tail since the given second.</summary>
     public Dictionary<int, long> UsageByAppSince(long startTs)
     {
         var map = new Dictionary<int, long>();
         lock (_gate)
         {
+            var src = TrafficSourceSql("traffic_60s", false);
             using var cmd = _conn.CreateCommand();
-            cmd.CommandText = "SELECT app_id, SUM(inb + outb) FROM traffic_60s WHERE ts >= $s GROUP BY app_id";
-            cmd.Parameters.AddWithValue("$s", startTs);
+            cmd.CommandText = $"SELECT app_id, SUM(inb + outb) FROM {src} GROUP BY app_id";
+            cmd.Parameters.AddWithValue("$f", startTs);
             using var r = cmd.ExecuteReader();
             while (r.Read()) map[r.GetInt32(0)] = r.GetInt64(1);
         }
@@ -721,28 +812,28 @@ internal sealed class Db : IDisposable
         var map = new Dictionary<int, long>();
         lock (_gate)
         {
+            var src = TrafficSourceSql("traffic_60s", true);
             using var cmd = _conn.CreateCommand();
-            cmd.CommandText = "SELECT app_id, SUM(inb + outb) FROM traffic_60s WHERE ts >= $s AND ts < $e GROUP BY app_id";
-            cmd.Parameters.AddWithValue("$s", startTs);
-            cmd.Parameters.AddWithValue("$e", endTs);
+            cmd.CommandText = $"SELECT app_id, SUM(inb + outb) FROM {src} GROUP BY app_id";
+            cmd.Parameters.AddWithValue("$f", startTs);
+            cmd.Parameters.AddWithValue("$t", endTs);
             using var r = cmd.ExecuteReader();
             while (r.Read()) map[r.GetInt32(0)] = r.GetInt64(1);
         }
         return map;
     }
 
-    /// <summary>Per-app (in, out) byte breakdown for a given rollup tier and time window.</summary>
+    /// <summary>Per-app (in, out) byte breakdown for a given rollup tier + live tail and time window.</summary>
     public Dictionary<int, (long In, long Out)> UsageSplitByApp(string table, long startTs, long? endTs = null)
     {
         var map = new Dictionary<int, (long In, long Out)>();
         lock (_gate)
         {
+            var src = TrafficSourceSql(table, endTs != null);
             using var cmd = _conn.CreateCommand();
-            cmd.CommandText = endTs == null
-                ? $"SELECT app_id, SUM(inb), SUM(outb) FROM {table} WHERE ts >= $s GROUP BY app_id"
-                : $"SELECT app_id, SUM(inb), SUM(outb) FROM {table} WHERE ts >= $s AND ts < $e GROUP BY app_id";
-            cmd.Parameters.AddWithValue("$s", startTs);
-            if (endTs != null) cmd.Parameters.AddWithValue("$e", endTs.Value);
+            cmd.CommandText = $"SELECT app_id, SUM(inb), SUM(outb) FROM {src} GROUP BY app_id";
+            cmd.Parameters.AddWithValue("$f", startTs);
+            if (endTs != null) cmd.Parameters.AddWithValue("$t", endTs.Value);
             using var r = cmd.ExecuteReader();
             while (r.Read()) map[r.GetInt32(0)] = (r.GetInt64(1), r.GetInt64(2));
         }
@@ -757,8 +848,9 @@ internal sealed class Db : IDisposable
         var list = new List<(long, int, int, long, long)>();
         lock (_gate)
         {
+            var src = TrafficSourceSql(table, true);
             using var cmd = _conn.CreateCommand();
-            cmd.CommandText = $"SELECT ts, port, proto, SUM(inb), SUM(outb) FROM {table} WHERE ts >= $f AND ts < $t GROUP BY ts, port, proto ORDER BY ts";
+            cmd.CommandText = $"SELECT ts, port, proto, SUM(inb), SUM(outb) FROM {src} GROUP BY ts, port, proto ORDER BY ts";
             cmd.Parameters.AddWithValue("$f", from);
             cmd.Parameters.AddWithValue("$t", to);
             using var r = cmd.ExecuteReader();
@@ -772,11 +864,11 @@ internal sealed class Db : IDisposable
         var list = new List<(long, string, long, long)>();
         lock (_gate)
         {
+            var src = TrafficSourceSql(table, true);
             using var cmd = _conn.CreateCommand();
             cmd.CommandText = $"""
                 SELECT t.ts, COALESCE(h.region, ''), SUM(t.inb), SUM(t.outb)
-                FROM {table} t LEFT JOIN hosts h ON h.ip = t.host
-                WHERE t.ts >= $f AND t.ts < $t
+                FROM {src} t LEFT JOIN hosts h ON h.ip = t.host
                 GROUP BY t.ts, h.region ORDER BY t.ts
                 """;
             cmd.Parameters.AddWithValue("$f", from);
@@ -793,6 +885,7 @@ internal sealed class Db : IDisposable
         long li = 0, lo = 0, wi = 0, wo = 0;
         lock (_gate)
         {
+            var src = TrafficSourceSql(table, true);
             using var cmd = _conn.CreateCommand();
             cmd.CommandText = $"""
                 SELECT CASE WHEN substr(host, 1, 1) = x'0A'
@@ -800,7 +893,7 @@ internal sealed class Db : IDisposable
                           OR (substr(host, 1, 1) = x'AC' AND substr(host, 2, 1) >= x'10' AND substr(host, 2, 1) <= x'1F')
                           OR host = x'7F000001' THEN 1 ELSE 0 END AS is_lan,
                        SUM(inb), SUM(outb)
-                FROM {table} WHERE ts >= $f AND ts < $t GROUP BY is_lan
+                FROM {src} GROUP BY is_lan
                 """;
             cmd.Parameters.AddWithValue("$f", from);
             cmd.Parameters.AddWithValue("$t", to);
@@ -901,7 +994,7 @@ internal sealed class Db : IDisposable
         }
     }
 
-    /// <summary>Count of unseen Important alerts (excludes low-severity unknown:pid / name: logs).</summary>
+    /// <summary>Count of unseen Important alerts (excludes low-severity unknown/unidentified/name logs).</summary>
     public long UnseenEventCount()
     {
         lock (_gate)
@@ -911,11 +1004,236 @@ internal sealed class Db : IDisposable
                 SELECT COUNT(*)
                 FROM events e LEFT JOIN apps a ON a.id = e.app_id
                 WHERE e.id > $seen
-                  AND NOT (e.type = 1 AND (COALESCE(a.path, '') LIKE 'unknown:%' OR COALESCE(a.path, '') LIKE 'name:%'))
+                  AND NOT (e.type = 1 AND (
+                      COALESCE(a.path, '') LIKE 'unknown:%'
+                      OR COALESCE(a.path, '') LIKE 'unidentified:%'
+                      OR COALESCE(a.path, '') LIKE 'name:%'
+                  ))
                 """;
-            cmd.Parameters.AddWithValue("$seen", GetMetaLong("events_seen_id", 0));
+            cmd.Parameters.AddWithValue("$seen", ReadMetaLongUnlocked("events_seen_id", 0));
             return (long)(cmd.ExecuteScalar() ?? 0L);
         }
+    }
+
+    /// <summary>
+    /// Consolidates legacy "unknown:pidNNNN" app rows and IP-keyed
+    /// "unidentified:&lt;ip&gt;" rows (whose IPs now have resolved hostnames) into
+    /// clean domain-grouped "unidentified:&lt;domain&gt;" rows, and strips stale
+    /// "name:" prefixes from app display names. Safe and idempotent.
+    /// Returns the list of removed app paths so AppRegistry can drop them.
+    /// </summary>
+    public List<string> ConsolidateUnidentifiedApps()
+    {
+        var removed = new List<string>();
+        lock (_gate)
+        {
+            // Clean legacy "name:svchost.exe" display names
+            using (var fixNames = _conn.CreateCommand())
+            {
+                fixNames.CommandText = "UPDATE apps SET name = substr(name, 6) WHERE name LIKE 'name:%'";
+                fixNames.ExecuteNonQuery();
+            }
+
+            // Load candidate unknown:* and unidentified:* rows
+            var candidates = new List<(int Id, string Path, string? Name, long FirstSeen)>();
+            using (var cmd = _conn.CreateCommand())
+            {
+                cmd.CommandText = "SELECT id, path, name, first_seen FROM apps WHERE path LIKE 'unknown:%' OR path LIKE 'unidentified:%'";
+                using var r = cmd.ExecuteReader();
+                while (r.Read())
+                    candidates.Add((r.GetInt32(0), r.GetString(1), r.IsDBNull(2) ? null : r.GetString(2), r.GetInt64(3)));
+            }
+            if (candidates.Count == 0) return removed;
+
+            using var tx = _conn.BeginTransaction();
+            try
+            {
+                foreach (var (oldId, oldPath, oldName, firstSeen) in candidates)
+                {
+                    string targetGroup;
+                    if (oldPath.StartsWith("unidentified:", StringComparison.OrdinalIgnoreCase))
+                    {
+                        var curKey = oldPath["unidentified:".Length..];
+                        var desiredName = HostGrouping.DisplayName(curKey);
+                        if (!string.Equals(oldName, desiredName, StringComparison.Ordinal))
+                        {
+                            using var upd = _conn.CreateCommand();
+                            upd.Transaction = tx;
+                            upd.CommandText = "UPDATE apps SET name = $n WHERE id = $id";
+                            upd.Parameters.AddWithValue("$n", desiredName);
+                            upd.Parameters.AddWithValue("$id", oldId);
+                            upd.ExecuteNonQuery();
+                        }
+                        if (!HostGrouping.IsIpGroupKey(curKey)) continue;
+                        if (!IPAddress.TryParse(curKey, out var parsedIp)) continue;
+                        var resolvedHost = LookupHostnameUnlocked(tx, parsedIp.GetAddressBytes());
+                        targetGroup = HostGrouping.GroupForHost(resolvedHost, curKey);
+                        if (string.Equals(targetGroup, curKey, StringComparison.OrdinalIgnoreCase)) continue;
+                    }
+                    else
+                    {
+                        var primary = FindPrimaryHostUnlocked(tx, oldId);
+                        targetGroup = primary != null
+                            ? HostGrouping.GroupForHost(primary.Value.Hostname, primary.Value.Ip)
+                            : "general";
+                    }
+
+                    var newPath = $"unidentified:{targetGroup}";
+                    var newName = HostGrouping.DisplayName(targetGroup);
+                    if (string.Equals(newPath, oldPath, StringComparison.OrdinalIgnoreCase)) continue;
+
+                    int targetId = FindOrInsertAppSilentUnlocked(tx, newPath, newName, firstSeen);
+                    if (targetId == oldId) continue;
+
+                    MergeAppIntoUnlocked(tx, oldId, targetId);
+                    removed.Add(oldPath);
+                }
+                tx.Commit();
+            }
+            catch
+            {
+                try { tx.Rollback(); } catch { }
+                throw;
+            }
+        }
+        return removed;
+    }
+
+    private string? LookupHostnameUnlocked(SqliteTransaction tx, byte[] ip)
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.Transaction = tx;
+        cmd.CommandText = "SELECT hostname FROM hosts WHERE ip = $ip";
+        cmd.Parameters.AddWithValue("$ip", ip);
+        return cmd.ExecuteScalar() as string;
+    }
+
+    private (string Ip, string? Hostname)? FindPrimaryHostUnlocked(SqliteTransaction tx, int appId)
+    {
+        foreach (var tbl in new[] { "traffic_60s", "traffic_1s", "traffic_3600s", "traffic_86400s" })
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.Transaction = tx;
+            cmd.CommandText = $"""
+                SELECT t.host, h.hostname
+                FROM {tbl} t LEFT JOIN hosts h ON h.ip = t.host
+                WHERE t.app_id = $id
+                GROUP BY t.host
+                ORDER BY SUM(t.inb + t.outb) DESC
+                LIMIT 1
+                """;
+            cmd.Parameters.AddWithValue("$id", appId);
+            using var r = cmd.ExecuteReader();
+            if (r.Read() && r.GetValue(0) is byte[] ipBytes && (ipBytes.Length == 4 || ipBytes.Length == 16))
+            {
+                var ipStr = new IPAddress(ipBytes).ToString();
+                var hn = r.IsDBNull(1) ? null : r.GetString(1);
+                return (ipStr, hn);
+            }
+        }
+        return null;
+    }
+
+    private int FindOrInsertAppSilentUnlocked(SqliteTransaction tx, string path, string name, long firstSeen)
+    {
+        using (var find = _conn.CreateCommand())
+        {
+            find.Transaction = tx;
+            find.CommandText = "SELECT id FROM apps WHERE path = $p";
+            find.Parameters.AddWithValue("$p", path);
+            var existing = find.ExecuteScalar();
+            if (existing is not null) return Convert.ToInt32(existing);
+        }
+        using var ins = _conn.CreateCommand();
+        ins.Transaction = tx;
+        ins.CommandText = "INSERT INTO apps (path, name, first_seen) VALUES ($p, $n, $t); SELECT last_insert_rowid();";
+        ins.Parameters.AddWithValue("$p", path);
+        ins.Parameters.AddWithValue("$n", name);
+        ins.Parameters.AddWithValue("$t", firstSeen);
+        return Convert.ToInt32(ins.ExecuteScalar() ?? 0L);
+    }
+
+    private void MergeAppIntoUnlocked(SqliteTransaction tx, int srcId, int dstId)
+    {
+        // traffic_1s has no unique index -> direct update
+        using (var c1 = _conn.CreateCommand())
+        {
+            c1.Transaction = tx;
+            c1.CommandText = "UPDATE traffic_1s SET app_id = $dst WHERE app_id = $src";
+            c1.Parameters.AddWithValue("$dst", dstId);
+            c1.Parameters.AddWithValue("$src", srcId);
+            c1.ExecuteNonQuery();
+        }
+
+        // Rollup tables have unique index (ts, app_id, host, port, proto) -> upsert sum & delete source
+        foreach (var tbl in new[] { "traffic_60s", "traffic_3600s", "traffic_86400s" })
+        {
+            using var cm = _conn.CreateCommand();
+            cm.Transaction = tx;
+            cm.CommandText = $"""
+                INSERT INTO {tbl} (ts, app_id, host, port, proto, inb, outb)
+                SELECT ts, $dst, host, port, proto, SUM(inb), SUM(outb)
+                FROM {tbl} WHERE app_id = $src
+                GROUP BY ts, host, port, proto
+                ON CONFLICT(ts, app_id, host, port, proto) DO UPDATE SET
+                    inb = inb + excluded.inb,
+                    outb = outb + excluded.outb;
+                DELETE FROM {tbl} WHERE app_id = $src;
+                """;
+            cm.Parameters.AddWithValue("$dst", dstId);
+            cm.Parameters.AddWithValue("$src", srcId);
+            cm.ExecuteNonQuery();
+        }
+
+        // Deduplicate EvNewApp spam when merging multiple unknown:pid rows into one domain group
+        bool dstHasNewApp;
+        using (var chk = _conn.CreateCommand())
+        {
+            chk.Transaction = tx;
+            chk.CommandText = "SELECT COUNT(*) FROM events WHERE app_id = $dst AND type = 1";
+            chk.Parameters.AddWithValue("$dst", dstId);
+            dstHasNewApp = (long)(chk.ExecuteScalar() ?? 0L) > 0;
+        }
+        if (dstHasNewApp)
+        {
+            using var delEv = _conn.CreateCommand();
+            delEv.Transaction = tx;
+            delEv.CommandText = "DELETE FROM events WHERE app_id = $src AND type = 1";
+            delEv.Parameters.AddWithValue("$src", srcId);
+            delEv.ExecuteNonQuery();
+        }
+        using (var updEv = _conn.CreateCommand())
+        {
+            updEv.Transaction = tx;
+            updEv.CommandText = "UPDATE events SET app_id = $dst WHERE app_id = $src";
+            updEv.Parameters.AddWithValue("$dst", dstId);
+            updEv.Parameters.AddWithValue("$src", srcId);
+            updEv.ExecuteNonQuery();
+        }
+
+        // Quotas: keep target's quota if one already exists for the same period
+        using (var delQ = _conn.CreateCommand())
+        {
+            delQ.Transaction = tx;
+            delQ.CommandText = "DELETE FROM quotas WHERE app_id = $src AND EXISTS (SELECT 1 FROM quotas q2 WHERE q2.app_id = $dst AND q2.period = quotas.period)";
+            delQ.Parameters.AddWithValue("$dst", dstId);
+            delQ.Parameters.AddWithValue("$src", srcId);
+            delQ.ExecuteNonQuery();
+        }
+        using (var updQ = _conn.CreateCommand())
+        {
+            updQ.Transaction = tx;
+            updQ.CommandText = "UPDATE quotas SET app_id = $dst WHERE app_id = $src";
+            updQ.Parameters.AddWithValue("$dst", dstId);
+            updQ.Parameters.AddWithValue("$src", srcId);
+            updQ.ExecuteNonQuery();
+        }
+
+        using var delApp = _conn.CreateCommand();
+        delApp.Transaction = tx;
+        delApp.CommandText = "DELETE FROM apps WHERE id = $src";
+        delApp.Parameters.AddWithValue("$src", srcId);
+        delApp.ExecuteNonQuery();
     }
 
     public void Dispose() => _conn.Dispose();

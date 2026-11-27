@@ -55,9 +55,7 @@ internal static class IconExtractor
     public static byte[]? ExtractPng(string? path)
     {
         if (string.IsNullOrWhiteSpace(path)) return null;
-        if (path.StartsWith("unknown:", StringComparison.OrdinalIgnoreCase)
-            || path.StartsWith("name:", StringComparison.OrdinalIgnoreCase))
-            return null;
+        if (HostGrouping.IsPseudoPath(path)) return null;
         if (!path.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)) return null;
 
         try

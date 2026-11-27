@@ -157,7 +157,7 @@ internal sealed class AlertEngine
     {
         string? version = null;
         string? publisher = null;
-        if (!string.IsNullOrEmpty(path) && !path.StartsWith("unknown:") && !path.StartsWith("name:"))
+        if (!string.IsNullOrEmpty(path) && !HostGrouping.IsPseudoPath(path))
         {
             var meta = ReadExeMeta(path);
             if (meta != null)
@@ -170,7 +170,7 @@ internal sealed class AlertEngine
         var data = JsonSerializer.Serialize(new
         {
             path,
-            name = Path.GetFileName(path),
+            name = HostGrouping.AppDisplayName(path),
             version,
             publisher,
         });

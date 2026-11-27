@@ -69,6 +69,8 @@ internal sealed class TrafficWriter
         foreach (var (k, v) in flows)
         {
             var path = _tracker.GetPath(k.Pid);
+            if (path.Length == 0)
+                path = _tracker.TryResolveLive(k.Pid);
             if (path.Length == 0 && k.Proto == 6 && _ownerFixes.TryGetValue(k.Pid, out var fixedPid) && fixedPid != k.Pid)
                 path = _tracker.GetPath(fixedPid);
             entries.Add((k, v.In, v.Out, path.Length > 0 ? path : null));
@@ -80,6 +82,7 @@ internal sealed class TrafficWriter
         foreach (var e in entries)
         {
             if (e.Path == null && hasResolved.Contains((e.Key.Proto, e.Key.Host, e.Key.Port))) continue;
+            var ipBytes = IPAddress.Parse(e.Key.Host).GetAddressBytes();
             var path = e.Path;
             if (path == null)
             {
@@ -88,22 +91,31 @@ internal sealed class TrafficWriter
                     var fixedPid = e.Key.Pid;
                     try
                     {
-                        if (IPAddress.Parse(e.Key.Host) is { } remote && TcpOwners.Snapshot().TryGetValue((BitConverter.ToUInt32(remote.GetAddressBytes(), 0), (ushort)e.Key.Port), out var owner))
+                        if (ipBytes.Length == 4 && TcpOwners.Snapshot().TryGetValue((BitConverter.ToUInt32(ipBytes, 0), (ushort)e.Key.Port), out var owner))
                             fixedPid = owner;
                     }
                     catch { }
                     _ownerFixes[e.Key.Pid] = fixedPid;
-                    if (fixedPid != e.Key.Pid) path = _tracker.GetPath(fixedPid);
+                    if (fixedPid != e.Key.Pid)
+                    {
+                        var resolved = _tracker.GetPath(fixedPid);
+                        if (resolved.Length == 0) resolved = _tracker.TryResolveLive(fixedPid);
+                        if (resolved.Length > 0) path = resolved;
+                    }
                 }
                 if (path == null)
                 {
+                    // Group unresolved short-lived/kernel PIDs by remote domain/host so
+                    // multiple PIDs talking to the same domain never clutter the UI.
+                    var hostname = _db.GetHostname(ipBytes);
+                    var groupKey = HostGrouping.GroupForHost(hostname, e.Key.Host);
                     if (_diagSeen.Add(e.Key.Pid))
-                        Console.WriteLine($"[diag] pid {e.Key.Pid} (proto={e.Key.Proto}, {e.Key.Host}:{e.Key.Port}) has no live process; recorded as unknown");
-                    path = $"unknown:pid{e.Key.Pid}";
+                        Console.WriteLine($"[diag] pid {e.Key.Pid} (proto={e.Key.Proto}, {e.Key.Host}:{e.Key.Port}) unresolved; grouped under {groupKey}");
+                    path = $"unidentified:{groupKey}";
                 }
             }
             var appId = _registry.GetOrCreate(path, ts);
-            rows.Add((appId, IPAddress.Parse(e.Key.Host).GetAddressBytes(), e.Key.Port, e.Key.Proto, e.In, e.Out));
+            rows.Add((appId, ipBytes, e.Key.Port, e.Key.Proto, e.In, e.Out));
         }
         if (rows.Count > 0) _db.InsertBuckets("traffic_1s", ts, rows);
     }
@@ -145,7 +157,8 @@ internal sealed class TrafficWriter
             .Select(kv =>
             {
                 var path = _tracker.GetPath(kv.Key);
-                return new LiveApp(kv.Key, path.Length > 0 ? Path.GetFileName(path) : $"unknown:pid{kv.Key}", kv.Value.Item1, kv.Value.Item2);
+                var display = path.Length > 0 ? HostGrouping.AppDisplayName(path) : "Background Traffic";
+                return new LiveApp(kv.Key, display, kv.Value.Item1, kv.Value.Item2);
             }).ToList();
         return (pt, ap);
     }

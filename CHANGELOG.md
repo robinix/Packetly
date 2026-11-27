@@ -2,6 +2,59 @@
 
 All notable changes to Packetly are documented here, including technical handoff notes for the local Windows build/verification agent.
 
+## v1.8.2 — Accurate Graph Scale & Selection Counter, Domain-Grouped Unidentified Traffic & Distinct Fallback Icons
+
+### User-facing changes
+- **Fixed Traffic Monitor graph scale vs. selection & side-panel usage counter:**
+  - **Eliminated the live-tail blind spot across rollup tiers:** The collector now seamlessly stitches unrolled live `traffic_1s` (and `60s`/`3600s`) tail buckets onto rollup queries (`3h`, `24h`, `7d`, `30d`, `All Time`), so the graph and side-panel usage totals always agree even during active transfers instead of lagging behind by 1–90 seconds (or up to an hour/day).
+  - **Peak-faithful curve rendering:** Replaced heavy 3-pass box smoothing and stride sampling with a peak-preserving rolling-max envelope (`n/200`, clamp `1..48`), gentle smoothing, bin-max Catmull-Rom downsampling, and bounded normalization (`1.0–1.15×`), so narrow heavy bursts reach their exact real byte height on the left Y-axis without inflating plateaus or dropping spikes.
+  - **Explicit per-interval Y-axis labels & decimal scale caps:** Left Y-axis ticks and scale cap controls now display explicit interval units (`/s`, `/m`, `/h`, `/d`) with base-1000 caps (`50 KB`–`5 GB`) matching byte formatting, making it immediately clear why a multi-interval selection total (e.g. `250 MB+` across several minutes) differs from each individual bucket's peak rate.
+  - **Selection summary strip & live bottom-bar sync:** Drag-selecting a time range on the Traffic Monitor graph now shows a dedicated summary strip (`Total`, `↓ Down`, `↑ Up`, and `Peak` rate matching the left Y-axis) in the selection popup, syncs the bottom summary bar to the selected window (labeled `Selected`), and fixes a bug where the selection popup's **Hosts** list ignored the selected range and showed the last 5 minutes instead.
+- **Replaced `unknown:pidNNNN` spam with domain-grouped entries:**
+  - Improved live Windows process resolution (`ProcessTracker`) to immediately capture system PIDs (`0`/`4` → `System`), retain executable names even when full-path `OpenProcess` is denied, and resolve short-lived processes on demand before they exit.
+  - Any remaining truly unresolved process traffic is now grouped by its remote domain (e.g., `cloudflare.com (System)`, `Local Network (System)`, or `Background Traffic`) instead of creating dozens of separate `unknown:pidNNNN` rows.
+  - Automatically migrates and consolidates legacy `unknown:pid*` database rows on startup and whenever reverse DNS resolves new hostnames, merging duplicate traffic buckets and clearing noisy duplicate alerts.
+- **Two distinct, polished custom fallback icons:**
+  - Replaced the old generic placeholder icons with two clean, visually distinct vector icons across Traffic Monitor, Traffic, Usage, Quotas, Alerts, and App Details:
+    - **Unidentified / domain-grouped system traffic:** Deep indigo-violet rounded badge with a crisp 3-node network constellation icon.
+    - **Real apps without an embedded icon:** Ocean-cyan application window tile with a titlebar, status dots, and `>_` emblem.
+
+### Local agent handoff notes
+- **Files changed:**
+  - `packetly/src/Packetly/Core/HostGrouping.cs` *(new)* — registrable domain extraction (with 2-part TLD & LAN handling), friendly display naming (`{domain} (System)`, `Local Network (System)`, `Background Traffic`), and `IsPseudoPath`/`AppDisplayName` helpers.
+  - `packetly/src/Packetly/Collectors/ProcessTracker.cs` — thread-safe `ConcurrentDictionary`, PID `0`/`4` → `name:System`, immediate `name:<exe>` fallback on attempt 1 while retrying for full path, and on-demand `TryResolveLive(pid)`.
+  - `packetly/src/Packetly/Core/AppRegistry.cs`, `IconExtractor.cs`, `TrafficWriter.cs`, `AlertEngine.cs`, `HostResolver.cs` — domain-grouped `unidentified:<group>` tracking, live DNS resolution callback hook, clean display names, and pseudo-path guards.
+  - `packetly/src/Packetly/Storage/Db.cs` — `TrafficSourceSql` watermark-aware live-tail union across `traffic_60s`/`3600s`/`86400s` for all series, top-app/host, usage, and selection queries; `GetHostname`; `TotalBytesBetween`; idempotent atomic `ConsolidateUnidentifiedApps()`; updated `UnseenEventCount()`.
+  - `packetly/src/Packetly/Program.cs` — startup + post-DNS `ConsolidateUnidentifiedApps()` consolidation with `AppRegistry.InvalidatePaths` and 15s aggregator cadence.
+  - `packetly/src/Packetly/Api/AppApi.cs` — version `1.8.2`; exact `totalIn`/`totalOut` fields on `/api/applist` (backward-compatible).
+  - `packetly-ui/src/main.rs` — peak-preserving `rolling_max` + bin-max `smooth`, interval-labeled Y-axis (`fmt_b_unit`) & decimal scale ladder, fixed `/api/hosts?range=custom` on graph selection, selection popup summary strip (`Total`, `↓ Down`, `↑ Up`, `Peak`) & bottom-bar selection totals, `clean_app_display`, and `AppIconKind` (`draw_unidentified_proc_icon` + `draw_no_icon_app`) wired across all 7 icon sites.
+  - `web/app.js` — chart pipeline, decimal scale ladder, and interval-labeled Y-axis updated in exact lockstep with `packetly-ui/src/main.rs`.
+  - `packetly-ui/Cargo.toml`, `packetly-ui/Cargo.lock`, `package.json` — version bumped to `1.8.2`.
+- **Verify locally on Windows:**
+  1. `git pull`
+  2. `dotnet build packetly/src/Packetly -c Release`
+  3. `cargo build --release --manifest-path packetly-ui/Cargo.toml`
+  4. Confirm `/api/status` reports `"version": "1.8.2"` and ports `8912`/`8913` remain unchanged.
+  5. **Graph scale & selection counter:** Run a short burst download on `5m`, `3h`, and `24h`; verify the peak visually hits the exact left Y-axis value (labeled `/s`, `/m`, `/h`, or `/d`), drag-select around the burst, and verify the selection popup shows `Total` / `↓` / `↑` / `Peak` matching the chart and bottom summary bar (`Selected`), and its **Hosts** tab shows hosts strictly from the selected window.
+  6. **Domain grouping & migration:** Open **Traffic**, **Usage**, and **Alerts**; confirm zero `unknown:pidNNNN` rows remain (legacy rows merged into domain groups like `example.com (System)` or `Background Traffic`), and verify the **indigo network-constellation badge** appears for unidentified/system-domain entries while the **cyan `>_` window tile** appears for real `.exe` apps that lack an embedded icon.
+
+## v1.8.1 — Fix Desktop & Start Menu Shortcut Recreation and Launch Target
+
+### User-facing changes
+- **Stop recreating deleted or moved desktop shortcuts on startup:** Packetly no longer rewrites the `Packetly Dashboard.lnk` Desktop and Start Menu shortcuts on every collector boot/logon. Shortcuts are now created only once during installation (`--install-autostart`), so moving or deleting the desktop icon stays permanent.
+- **Fix broken dashboard shortcut launch:** Changed the shortcut target from `schtasks.exe /run /tn Packetly` (which failed silently when clicked non-elevated against a `RunLevel Highest` task) to launch `packetly-ui.exe` directly with its proper working directory and app icon.
+
+### Local agent handoff notes
+- **Files changed:**
+  - `packetly/src/Packetly/Program.cs` — removed `CreateDashboardShortcuts(port)` from `--serve` startup, moved `CreateDashboardShortcuts()` into `--install-autostart` (only when task registration succeeds), and switched the shortcut target to `NativeUiPath()` (`packetly-ui.exe`) with working directory + icon set.
+  - `packetly/src/Packetly/Api/AppApi.cs`, `packetly-ui/Cargo.toml`, `packetly-ui/Cargo.lock`, `package.json` — version bumped to `1.8.1`.
+- **Verify locally on Windows:**
+  1. `git pull`
+  2. Build and install the `v1.8.1` release zip (or `dotnet build packetly/src/Packetly -c Release` + `cargo build --release --manifest-path packetly-ui/Cargo.toml`).
+  3. Confirm `/api/status` reports `"version": "1.8.1"`.
+  4. Verify the installed Desktop/Start Menu shortcut targets `packetly-ui.exe` directly and opens the dashboard cleanly on click.
+  5. Delete or move the Desktop shortcut, restart the `Packetly` scheduled task (or reboot), and confirm the deleted desktop icon is not recreated.
+
 ## v1.8.0 — Modern Alerts Tab Overhaul, Application Info Monitor & App Details Fix
 
 ### User-facing changes

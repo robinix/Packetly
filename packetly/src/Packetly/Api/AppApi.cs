@@ -54,7 +54,7 @@ internal static class AppApi
             return new
             {
                 app = "packetly",
-                version = "1.8.0",
+                version = "1.8.2",
                 now,
                 startedAt = svc.StartedAt,
                 uptimeSeconds = now - svc.StartedAt,
@@ -282,11 +282,14 @@ internal static class AppApi
         {
             var tier = TierFor(from, to);
             var rows = svc.Db.AppsHostsBetween(tier, from, to, Math.Clamp(limit ?? 100, 1, 500));
+            var (totalIn, totalOut) = svc.Db.TotalBytesBetween(tier, from, to);
             return Results.Json(new
             {
                 from,
                 to,
                 tier,
+                totalIn,
+                totalOut,
                 apps = rows.Select(a => new { appId = a.Id, name = a.Name, hostCount = a.HostCount, inBytes = a.In, outBytes = a.Out }),
             });
         });

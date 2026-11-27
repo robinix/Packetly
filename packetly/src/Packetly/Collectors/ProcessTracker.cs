@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Runtime.InteropServices;
 using System.Text;
 using Packetly.Interop;
@@ -5,27 +6,52 @@ using Packetly.Interop;
 namespace Packetly.Collectors;
 
 /// <summary>
-/// Keeps a live PID → image path map. Full paths come from
-/// QueryFullProcessImageNameW; when a process cannot be opened
-/// (protected processes, races) the snapshot's exe name is used as a
-/// "name:" fallback after a few attempts.
+/// Keeps a thread-safe live PID → image path map. Full paths come from
+/// QueryFullProcessImageNameW; when a process cannot be opened (protected
+/// processes, system services) the snapshot's exe name is recorded immediately
+/// as a "name:" fallback while still retrying full-path resolution up to
+/// MaxResolveAttempts times.
 /// </summary>
 internal sealed class ProcessTracker
 {
     private const int MaxResolveAttempts = 3;
-    private readonly Dictionary<int, string> _paths = new();
-    private readonly Dictionary<int, int> _attempts = new();
+    private readonly ConcurrentDictionary<int, string> _paths = new();
+    private readonly ConcurrentDictionary<int, int> _attempts = new();
+    private volatile Dictionary<int, string> _lastAlive = new();
 
-    public string GetPath(int pid) => _paths.TryGetValue(pid, out var p) ? p : "";
+    public string GetPath(int pid)
+    {
+        if (pid == 0 || pid == 4) return "name:System";
+        return _paths.TryGetValue(pid, out var p) ? p : "";
+    }
 
     public int Count => _paths.Count;
 
     public string? LastDiagnostic { get; private set; }
     public int LastOpenError { get; private set; }
     public int LastQueryError { get; private set; }
-    private Dictionary<int, string> _lastAlive = new();
 
     public bool WasInLastSnapshot(int pid) => _lastAlive.ContainsKey(pid);
+
+    /// <summary>
+    /// Fast on-demand resolution for PIDs that spawned after the last 2s
+    /// snapshot refresh — catches short-lived processes before they exit.
+    /// </summary>
+    public string TryResolveLive(int pid)
+    {
+        if (pid == 0 || pid == 4) return "name:System";
+        if (_paths.TryGetValue(pid, out var existing) && !existing.StartsWith("name:", StringComparison.Ordinal))
+            return existing;
+
+        var full = QueryProcessPath(pid);
+        if (full != null)
+        {
+            _paths[pid] = full;
+            _attempts[pid] = MaxResolveAttempts;
+            return full;
+        }
+        return existing ?? "";
+    }
 
     public void Refresh()
     {
@@ -56,18 +82,26 @@ internal sealed class ProcessTracker
             NativeMethods.CloseHandle(h);
         }
 
-        var dead = _paths.Keys.Where(p => !alive.ContainsKey(p)).ToList();
-        foreach (var pid in dead)
+        foreach (var pid in _paths.Keys)
         {
-            _paths.Remove(pid);
-            _attempts.Remove(pid);
+            if (!alive.ContainsKey(pid))
+            {
+                _paths.TryRemove(pid, out _);
+                _attempts.TryRemove(pid, out _);
+            }
         }
 
         foreach (var (pid, exe) in alive)
         {
+            if (pid == 0 || pid == 4)
+            {
+                _paths[pid] = "name:System";
+                _attempts[pid] = MaxResolveAttempts;
+                continue;
+            }
             if (_paths.TryGetValue(pid, out var known))
             {
-                // Retry the full-path resolution for entries stuck on the name fallback.
+                // Retry the full-path resolution for entries sitting on the name fallback.
                 if (known.StartsWith("name:", StringComparison.Ordinal) && _attempts.GetValueOrDefault(pid) < MaxResolveAttempts)
                     TryResolve(pid, exe);
                 continue;
@@ -76,31 +110,32 @@ internal sealed class ProcessTracker
         }
     }
 
-    private void TryResolve(int pid, string exeName)
+    private string? QueryProcessPath(int pid)
     {
         var sb = new StringBuilder(1024);
         int size = sb.Capacity;
         var h = NativeMethods.OpenProcess(NativeMethods.PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
-        string? full = null;
-        if (h != IntPtr.Zero)
-        {
-            try
-            {
-                if (NativeMethods.QueryFullProcessImageNameW(h, 0, sb, ref size))
-                    full = sb.ToString();
-                else
-                    LastQueryError = Marshal.GetLastWin32Error();
-            }
-            finally
-            {
-                NativeMethods.CloseHandle(h);
-            }
-        }
-        else
+        if (h == IntPtr.Zero)
         {
             LastOpenError = Marshal.GetLastWin32Error();
+            return null;
         }
+        try
+        {
+            if (NativeMethods.QueryFullProcessImageNameW(h, 0, sb, ref size))
+                return sb.ToString();
+            LastQueryError = Marshal.GetLastWin32Error();
+            return null;
+        }
+        finally
+        {
+            NativeMethods.CloseHandle(h);
+        }
+    }
 
+    private void TryResolve(int pid, string exeName)
+    {
+        var full = QueryProcessPath(pid);
         if (full != null)
         {
             _paths[pid] = full;
@@ -110,7 +145,10 @@ internal sealed class ProcessTracker
         {
             var n = _attempts.GetValueOrDefault(pid) + 1;
             _attempts[pid] = n;
-            if (n >= MaxResolveAttempts)
+            // Immediately record the snapshot exe name on attempt 1 so protected
+            // system/Store processes are never misattributed as unknown while
+            // still retrying full-path resolution on subsequent refreshes.
+            if (!string.IsNullOrWhiteSpace(exeName))
                 _paths[pid] = "name:" + exeName;
         }
     }

@@ -16,9 +16,17 @@ internal sealed class AppRegistry
         lock (_lock)
         {
             if (_cache.TryGetValue(path, out var id)) return id;
-            id = _db.FindOrInsertApp(path, Path.GetFileName(path), now);
+            id = _db.FindOrInsertApp(path, HostGrouping.AppDisplayName(path), now);
             _cache[path] = id;
             return id;
+        }
+    }
+
+    public void InvalidatePaths(IEnumerable<string> paths)
+    {
+        lock (_lock)
+        {
+            foreach (var p in paths) _cache.Remove(p);
         }
     }
 }

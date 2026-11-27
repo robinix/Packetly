@@ -11,16 +11,23 @@ namespace Packetly.Core;
 internal sealed class HostResolver
 {
     private readonly Db _db;
+    private readonly Action? _onHostnamesResolved;
     private readonly SemaphoreSlim _slots = new(3);
     private readonly Dictionary<string, DateTimeOffset> _cooldowns = new();
     private static readonly TimeSpan Cooldown = TimeSpan.FromHours(1);
     private const int PerCycleLimit = 40;
+    private int _resolvedInCycle;
 
-    public HostResolver(Db db) => _db = db;
+    public HostResolver(Db db, Action? onHostnamesResolved = null)
+    {
+        _db = db;
+        _onHostnamesResolved = onHostnamesResolved;
+    }
 
     public async Task RunCycleAsync(CancellationToken ct)
     {
         var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        Interlocked.Exchange(ref _resolvedInCycle, 0);
 
         // discover hosts seen in recent traffic and claim them into the table
         var wm = _db.GetMetaLong("hosts_seen_wm", now - 600);
@@ -45,6 +52,10 @@ internal sealed class HostResolver
             tasks.Add(ResolveOne(ipBytes, ip, now, ct));
         }
         await Task.WhenAll(tasks).ConfigureAwait(false);
+        if (Interlocked.CompareExchange(ref _resolvedInCycle, 0, 0) > 0)
+        {
+            try { _onHostnamesResolved?.Invoke(); } catch { }
+        }
     }
 
     private async Task ResolveOne(byte[] ipBytes, IPAddress ip, long now, CancellationToken ct)
@@ -64,7 +75,11 @@ internal sealed class HostResolver
             catch (OperationCanceledException) when (!ct.IsCancellationRequested) { /* resolution timed out */ }
             catch { /* NXDOMAIN / no PTR / socket errors — normal for most IPs */ }
 
-            if (name != null) _db.SetHostname(ipBytes, name, now);
+            if (name != null)
+            {
+                _db.SetHostname(ipBytes, name, now);
+                Interlocked.Increment(ref _resolvedInCycle);
+            }
             else
             {
                 lock (_cooldowns) _cooldowns[ip.ToString()] = DateTimeOffset.UtcNow.Add(Cooldown);

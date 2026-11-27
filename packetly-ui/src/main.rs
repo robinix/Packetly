@@ -702,6 +702,8 @@ struct SelData {
     apps: Vec<SelApp>,
     t0: f64,
     t1: f64,
+    total_in: f64,
+    total_out: f64,
     hosts: Vec<HostRow>,
 }
 
@@ -771,6 +773,47 @@ fn fmt_b(b: f64) -> String {
     } else {
         format!("{:.2} {}", d, s)
     }
+}
+
+fn bucket_unit(bucket: f64) -> &'static str {
+    if bucket <= 1.0 {
+        "/s"
+    } else if bucket <= 60.0 {
+        "/m"
+    } else if bucket <= 3600.0 {
+        "/h"
+    } else {
+        "/d"
+    }
+}
+
+fn fmt_b_unit(b: f64, bucket: f64) -> String {
+    format!("{}{}", fmt_b(b), bucket_unit(bucket))
+}
+
+fn clean_app_display(name: &str) -> String {
+    let s = name.trim();
+    if let Some(rest) = s.strip_prefix("unidentified:") {
+        if rest.is_empty() || rest == "general" {
+            return "Background Traffic".to_string();
+        }
+        if rest == "local-network" {
+            return "Local Network (System)".to_string();
+        }
+        return format!("{} (System)", rest);
+    }
+    if let Some(rest) = s.strip_prefix("name:") {
+        let trimmed = rest.trim();
+        return if trimmed.is_empty() {
+            "System Process".to_string()
+        } else {
+            trimmed.to_string()
+        };
+    }
+    if s.starts_with("unknown:") {
+        return "Background Traffic".to_string();
+    }
+    s.to_string()
 }
 
 fn fmt_rate(b: f64, seconds: f64) -> String {
@@ -1118,6 +1161,44 @@ fn nice_ceil(v: f64) -> f64 {
     s * e
 }
 
+/// Exact O(n) centered sliding-window maximum over `[i - radius ..= i + radius]`.
+/// Preserves true local peak amplitude before box smoothing so narrow heavy
+/// bursts reach their real byte height on the Y-axis without inflating plateaus.
+fn rolling_max(pts: &[[f64; 2]], radius: usize) -> Vec<[f64; 2]> {
+    let n = pts.len();
+    if radius == 0 || n == 0 {
+        return pts.to_vec();
+    }
+    let mut dq: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
+    let mut out = Vec::with_capacity(n);
+    let mut right = 0usize;
+    for i in 0..n {
+        let win_hi = (i + radius).min(n - 1);
+        while right <= win_hi {
+            while let Some(&back) = dq.back() {
+                if pts[back][1] <= pts[right][1] {
+                    dq.pop_back();
+                } else {
+                    break;
+                }
+            }
+            dq.push_back(right);
+            right += 1;
+        }
+        let win_lo = i.saturating_sub(radius);
+        while let Some(&front) = dq.front() {
+            if front < win_lo {
+                dq.pop_front();
+            } else {
+                break;
+            }
+        }
+        let best = dq.front().copied().unwrap_or(i);
+        out.push([pts[i][0], pts[best][1]]);
+    }
+    out
+}
+
 fn moving_avg(pts: &[[f64; 2]], radius: usize) -> Vec<[f64; 2]> {
     if radius == 0 || pts.is_empty() {
         return pts.to_vec();
@@ -1141,16 +1222,23 @@ fn smooth(pts: &[[f64; 2]], max_out: usize) -> Vec<[f64; 2]> {
     if pts.len() < 3 {
         return pts.to_vec();
     }
-    // Bound control points on high-count spans (24h/7d) — already Gaussian-smoothed
-    // well above Nyquist — so Catmull-Rom stays crisp and fast on every range.
+    // Bound control points on high-count spans (24h/7d) using per-bin peak
+    // selection so Catmull-Rom never skips over a narrow spike.
     let sampled_buf: Vec<[f64; 2]>;
     let ctrl: &[[f64; 2]] = if pts.len() > 600 {
         let target_ctrl = 480usize;
-        let last = pts.len() - 1;
+        let n = pts.len();
         sampled_buf = (0..target_ctrl)
             .map(|i| {
-                let idx = (i * last + (target_ctrl - 1) / 2) / (target_ctrl - 1);
-                pts[idx]
+                let lo = i * n / target_ctrl;
+                let hi = (((i + 1) * n) / target_ctrl).max(lo + 1).min(n);
+                let mut best = pts[lo];
+                for &pt in &pts[lo..hi] {
+                    if pt[1] > best[1] {
+                        best = pt;
+                    }
+                }
+                best
             })
             .collect();
         &sampled_buf
@@ -1339,7 +1427,7 @@ fn parse_event_row(e: &serde_json::Value) -> EventRow {
 fn parse_appinfo(d: &serde_json::Value, app_id: i64, f: i64, t: i64) -> AppDetail {
     AppDetail {
         app_id,
-        name: d["name"].as_str().unwrap_or("?").to_string(),
+        name: clean_app_display(d["name"].as_str().unwrap_or("?")),
         path: d["path"].as_str().map(|x| x.to_string()),
         publisher: d["publisher"].as_str().map(|x| x.to_string()),
         version: d["version"].as_str().map(|x| x.to_string()),
@@ -1454,7 +1542,7 @@ fn fetch_snapshot(
                     .iter()
                     .map(|a| AppRow {
                         id: a["id"].as_i64().unwrap_or(0),
-                        name: a["name"].as_str().unwrap_or("?").to_string(),
+                        name: clean_app_display(a["name"].as_str().unwrap_or("?")),
                         icon: None,
                         in_bytes: a["inBytes"].as_f64().unwrap_or(0.0),
                         out_bytes: a["outBytes"].as_f64().unwrap_or(0.0),
@@ -1582,7 +1670,7 @@ fn fetch_snapshot(
                             sum_out += out_b;
                             UsageAppRow {
                                 id: a["appId"].as_i64().unwrap_or(0),
-                                name: a["name"].as_str().unwrap_or("?").to_string(),
+                                name: clean_app_display(a["name"].as_str().unwrap_or("?")),
                                 in_bytes: in_b,
                                 out_bytes: out_b,
                                 total_bytes: total,
@@ -1599,7 +1687,7 @@ fn fetch_snapshot(
                         .iter()
                         .map(|q| QuotaRow {
                             app_id: q["appId"].as_i64(),
-                            app_name: q["appName"].as_str().unwrap_or("All apps").to_string(),
+                            app_name: clean_app_display(q["appName"].as_str().unwrap_or("All apps")),
                             period: q["period"].as_str().unwrap_or("daily").to_string(),
                             limit: q["limitBytes"].as_f64().unwrap_or(1.0),
                             used: q["usedBytes"].as_f64().unwrap_or(0.0),
@@ -1615,7 +1703,7 @@ fn fetch_snapshot(
                         .map(|a| {
                             (
                                 a["id"].as_i64().unwrap_or(0),
-                                a["name"].as_str().unwrap_or("?").to_string(),
+                                clean_app_display(a["name"].as_str().unwrap_or("?")),
                             )
                         })
                         .collect();
@@ -2482,32 +2570,29 @@ impl PacketlyApp {
         );
     }
 
-    /// Universal icon for pseudo-apps (unknown:pidN / name:...) that have no exe.
+    /// Identifies domain-grouped / background / unresolved process entries
+    /// (never treated as normal apps with missing .exe icons).
     fn is_pseudo_app(name: &str) -> bool {
-        name.starts_with("unknown:") || name.starts_with("name:")
+        let s = name.trim();
+        s.starts_with("unknown:")
+            || s.starts_with("unidentified:")
+            || s.starts_with("name:")
+            || s.ends_with(" (System)")
+            || s == "Background Traffic"
     }
 
-    fn unknown_texture(&mut self, ctx: &egui::Context) -> egui::TextureHandle {
-        if let Some(tex) = self.icon_tex.get(&i64::MIN) {
-            return tex.clone();
-        }
-        const PNG: &[u8] = include_bytes!("../../assets/unknown.png");
-        let img = image::load_from_memory(PNG).expect("embedded unknown.png").to_rgba8();
-        let size = [img.width() as usize, img.height() as usize];
-        let color_img = egui::ColorImage::from_rgba_unmultiplied(size, &img.into_raw());
-        let tex = ctx.load_texture("unknown-app", color_img, egui::TextureOptions::LINEAR);
-        self.icon_tex.insert(i64::MIN, tex.clone());
-        tex
-    }
-
-    /// Icon for an app row: the real icon when one exists, the universal
-    /// "?" tile for unknown/unnamed processes, None otherwise (dots for
-    /// categories).
-    fn app_icon_opt(&mut self, ctx: &egui::Context, id: i64, name: &str) -> Option<egui::TextureHandle> {
+    /// Resolves an app's icon into one of three distinct visuals:
+    ///   - Real extracted Windows .exe texture
+    ///   - Unidentified / system / domain-grouped process badge (violet network constellation)
+    ///   - Real app without an embedded icon (sky-blue application window tile)
+    fn resolve_app_icon(&mut self, ctx: &egui::Context, id: i64, name: &str) -> AppIconKind {
         if Self::is_pseudo_app(name) {
-            return Some(self.unknown_texture(ctx));
+            return AppIconKind::Unidentified;
         }
-        self.icon_texture(ctx, id)
+        if let Some(tex) = self.icon_texture(ctx, id) {
+            return AppIconKind::Texture(tex);
+        }
+        AppIconKind::MissingExe
     }
 
     fn icon_texture(&mut self, ctx: &egui::Context, id: i64) -> Option<egui::TextureHandle> {
@@ -2707,13 +2792,25 @@ impl PacketlyApp {
             .frame(egui::Frame::none().fill(t.card).inner_margin(egui::Margin::symmetric(16.0, 8.0)))
             .show(ctx, |ui| {
                 let snap = self.snap.lock().unwrap().clone();
-                let span_secs = snap
-                    .traffic
-                    .as_ref()
-                    .map(|t| (t.to - t.from).max(1.0))
-                    .unwrap_or(1.0);
-                let total_in = snap.lanwan.lan_in + snap.lanwan.wan_in;
-                let total_out = snap.lanwan.lan_out + snap.lanwan.wan_out;
+                let sel_active = self.tab == Tab::Graph && snap.sel.is_some();
+                let (span_secs, total_in, total_out) = if let Some(sd) =
+                    snap.sel.as_ref().filter(|_| self.tab == Tab::Graph)
+                {
+                    (
+                        (sd.t1 - sd.t0).max(1.0),
+                        sd.total_in,
+                        sd.total_out,
+                    )
+                } else {
+                    (
+                        snap.traffic
+                            .as_ref()
+                            .map(|tr| (tr.to - tr.from).max(1.0))
+                            .unwrap_or(1.0),
+                        snap.lanwan.lan_in + snap.lanwan.wan_in,
+                        snap.lanwan.lan_out + snap.lanwan.wan_out,
+                    )
+                };
 
                 ui.horizontal(|ui| {
                     let total = total_in + total_out;
@@ -2746,12 +2843,22 @@ impl PacketlyApp {
                     ui.allocate_space(egui::vec2(74.0, 54.0));
 
                     ui.vertical(|ui| {
-                        ui.label(
-                            egui::RichText::new(format!("down {}", fmt_b(total_in)))
-                                .size(15.0)
-                                .color(t.in_c)
-                                .strong(),
-                        );
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new(format!("down {}", fmt_b(total_in)))
+                                    .size(15.0)
+                                    .color(t.in_c)
+                                    .strong(),
+                            );
+                            if sel_active {
+                                ui.label(
+                                    egui::RichText::new("Selected")
+                                        .size(10.0)
+                                        .color(egui::Color32::from_rgb(110, 205, 165))
+                                        .strong(),
+                                );
+                            }
+                        });
                         ui.weak(egui::RichText::new(fmt_rate(total_in, span_secs)).size(11.0).color(t.dim));
                     });
                     ui.vertical(|ui| {
@@ -2803,22 +2910,21 @@ impl PacketlyApp {
                                     cache.mini.as_ref().map_or(true, |(v, _)| *v != ver);
                                 if stale {
                                     let p = pivot(traffic, t.in_c, t.out_c);
-                                    let mr = ((p.n as f64) / 110.0)
+                                    let mr = ((p.n as f64) / 200.0)
                                         .round()
-                                        .clamp(1.0, 120.0) as usize;
-                                    let r2 = (mr * 2 / 3).max(1);
-                                    let r3 = (mr / 3).max(1);
+                                        .clamp(1.0, 48.0) as usize;
                                     let mut curves: Vec<Vec<[f64; 2]>> = p
                                         .series
                                         .iter()
                                         .map(|s| {
-                                            smooth(
-                                                &moving_avg(
-                                                    &moving_avg(&moving_avg(&s.points, mr), r2),
-                                                    r3,
-                                                ),
-                                                420,
-                                            )
+                                            let dil = rolling_max(&s.points, mr);
+                                            let pass1 = moving_avg(&dil, mr);
+                                            let pass2 = if mr >= 2 {
+                                                moving_avg(&pass1, (mr / 2).max(1))
+                                            } else {
+                                                pass1
+                                            };
+                                            smooth(&pass2, 420)
                                         })
                                         .collect();
                                     let mut m_max = 0.0_f64;
@@ -2828,7 +2934,7 @@ impl PacketlyApp {
                                         }
                                     }
                                     if m_max > 0.0 && p.y_max > 0.0 {
-                                        let mk = p.y_max / m_max;
+                                        let mk = (p.y_max / m_max).clamp(1.0, 1.15);
                                         for pts in &mut curves {
                                             for pt in pts.iter_mut() {
                                                 pt[1] *= mk;
@@ -2925,11 +3031,12 @@ impl PacketlyApp {
                 }
                 let p = self.cache.lock().unwrap().pivot.clone();
 
+                let active_bucket = p.as_ref().map(|pv| pv.bucket).unwrap_or(60.0);
                 ui.horizontal(|ui| {
                     let lbl = if self.auto_scale {
                         "Auto-scale".to_string()
                     } else {
-                        format!("cap {}", fmt_b(self.scale_cap))
+                        format!("cap {}", fmt_b_unit(self.scale_cap, active_bucket))
                     };
                     let resp = ui.button(format!("{lbl} ▾"));
                     if resp.clicked() {
@@ -2959,31 +3066,32 @@ impl PacketlyApp {
                                     );
                                     if !self.auto_scale {
                                         ui.separator();
+                                        let unit = bucket_unit(active_bucket);
                                         egui::ScrollArea::vertical()
                                             .max_height(240.0)
                                             .show(ui, |ui| {
                                                 for (lbl2, val) in [
-                                                    ("50 KB", 51_200.0_f64),
-                                                    ("100 KB", 102_400.0),
-                                                    ("250 KB", 256_000.0),
-                                                    ("500 KB", 512_000.0),
-                                                    ("1 MB", 1_048_576.0),
-                                                    ("2 MB", 2_097_152.0),
-                                                    ("5 MB", 5_242_880.0),
-                                                    ("10 MB", 10_485_760.0),
-                                                    ("25 MB", 26_214_400.0),
-                                                    ("50 MB", 52_428_800.0),
-                                                    ("100 MB", 104_857_600.0),
-                                                    ("250 MB", 262_144_000.0),
-                                                    ("500 MB", 524_288_000.0),
-                                                    ("1 GB", 1_073_741_824.0),
-                                                    ("2 GB", 2_147_483_648.0),
-                                                    ("5 GB", 5_368_709_120.0),
+                                                    ("50 KB", 50_000.0_f64),
+                                                    ("100 KB", 100_000.0),
+                                                    ("250 KB", 250_000.0),
+                                                    ("500 KB", 500_000.0),
+                                                    ("1 MB", 1_000_000.0),
+                                                    ("2 MB", 2_000_000.0),
+                                                    ("5 MB", 5_000_000.0),
+                                                    ("10 MB", 10_000_000.0),
+                                                    ("25 MB", 25_000_000.0),
+                                                    ("50 MB", 50_000_000.0),
+                                                    ("100 MB", 100_000_000.0),
+                                                    ("250 MB", 250_000_000.0),
+                                                    ("500 MB", 500_000_000.0),
+                                                    ("1 GB", 1_000_000_000.0),
+                                                    ("2 GB", 2_000_000_000.0),
+                                                    ("5 GB", 5_000_000_000.0),
                                                 ] {
                                                     if ui
                                                         .selectable_label(
                                                             (self.scale_cap - val).abs() < 1.0,
-                                                            lbl2,
+                                                            format!("{}{}", lbl2, unit),
                                                         )
                                                         .clicked()
                                                     {
@@ -3017,32 +3125,29 @@ impl PacketlyApp {
                                 } else {
                                     self.scale_cap
                                 };
-                                // Sharper proportional 3-pass smoothing (~1.3%-1.8% FWHM across
-                                // every range) preserves distinct bursts & valleys like GlassWire
-                                // instead of merging nearby hills into a single vague blob.
-                                let r = ((p.n as f64) / 130.0).round().clamp(1.0, 120.0) as usize;
+                                // Peak-faithful smoothing: centered rolling-max preserves true
+                                // burst height before box smoothing so narrow heavy spikes
+                                // reach their exact byte value on the Y-axis without inflating
+                                // lower sustained plateaus.
+                                let r = ((p.n as f64) / 200.0).round().clamp(1.0, 48.0) as usize;
                                 let (rendered, target_k) = {
                                     let mut cache = self.cache.lock().unwrap();
                                     let stale = cache.rendered.as_ref().map_or(true, |rd| {
                                         rd.ver != ver.unwrap_or(0) || rd.r != r
                                     });
                                     if stale {
-                                        let r2 = (r * 2 / 3).max(1);
-                                        let r3 = (r / 3).max(1);
                                         let series_pts: Vec<Vec<[f64; 2]>> = p
                                             .series
                                             .iter()
                                             .map(|s| {
-                                                smooth(
-                                                    &moving_avg(
-                                                        &moving_avg(
-                                                            &moving_avg(&s.points, r),
-                                                            r2,
-                                                        ),
-                                                        r3,
-                                                    ),
-                                                    1400,
-                                                )
+                                                let dilated = rolling_max(&s.points, r);
+                                                let pass1 = moving_avg(&dilated, r);
+                                                let pass2 = if r >= 2 {
+                                                    moving_avg(&pass1, (r / 2).max(1))
+                                                } else {
+                                                    pass1
+                                                };
+                                                smooth(&pass2, 1400)
                                             })
                                             .collect();
                                         let tail_cut = if p.bucket == 1.0 && p.n > 6 {
@@ -3059,7 +3164,7 @@ impl PacketlyApp {
                                             }
                                         }
                                         let tk = if rendered_max > 0.0 && p.y_max > 0.0 {
-                                            p.y_max / rendered_max
+                                            (p.y_max / rendered_max).clamp(1.0, 1.15)
                                         } else {
                                             1.0
                                         };
@@ -3074,10 +3179,10 @@ impl PacketlyApp {
                                     (rd.series.clone(), rd.target_k)
                                 };
 
-                                // Scale from the RAW bucket peak (p.y_max): the rendered curve
-                                // is peak-normalized to it so the y-axis stays honest.
+                                // Scale from the RAW bucket peak (p.y_max): every peak now
+                                // stays faithful to its true raw bucket bytes on the Y-axis.
                                 let target_y_top = if self.auto_scale {
-                                    let target = (p.y_max * 1.25).max(1024.0);
+                                    let target = (p.y_max * 1.25).max(1000.0);
                                     let st = nice_step(target / 8.0);
                                     (target / st).ceil() * st
                                 } else {
@@ -3216,7 +3321,7 @@ impl PacketlyApp {
                                     .include_x(view_x0)
                                     .include_x(view_x1)
                                     .include_y(0.0)
-                                    .include_y(y_top * 1.04);
+                                    .include_y(y_top * 1.07);
                                 let dark_theme = t.text.r() > 128;
                                 let presp = plot.show(ui, |_plot_ui| {});
 
@@ -3315,12 +3420,12 @@ impl PacketlyApp {
                                         }
                                     }
 
-                                    // Layer 4: Axis labels (Y on top-left, X cleanly in bottom strip)
+                                    // Layer 4: Axis labels (Y on top-left with interval unit, X cleanly in bottom strip)
                                     for (yv, py) in y_labels {
                                         label_painter.text(
                                             egui::Pos2::new(rect.left() + 6.0, py - 4.0),
                                             egui::Align2::LEFT_BOTTOM,
-                                            fmt_b(yv),
+                                            fmt_b_unit(yv, p.bucket),
                                             egui::FontId::proportional(11.0),
                                             t.axis,
                                         );
@@ -3458,17 +3563,27 @@ impl PacketlyApp {
                                                     .unwrap_or(std::cmp::Ordering::Equal)
                                             }),
                                         }
+                                        let mut sel_peak = 0.0_f64;
+                                        for s in &p.series {
+                                            for pt in &s.points {
+                                                if pt[0] >= sd.t0 - p.bucket * 0.5
+                                                    && pt[0] <= sd.t1 + p.bucket * 0.5
+                                                {
+                                                    sel_peak = sel_peak.max(pt[1]);
+                                                }
+                                            }
+                                        }
                                         let fr = presp.transform.frame();
                                         let pos = egui::Pos2::new(
                                             fr.left() + 12.0,
-                                            (fr.bottom() - 300.0).max(fr.top() + 8.0),
+                                            (fr.bottom() - 325.0).max(fr.top() + 8.0),
                                         );
                                         egui::Area::new(egui::Id::new("sel-popup"))
                                             .order(egui::Order::Foreground)
                                             .fixed_pos(pos)
                                             .show(ctx, |ui| {
                                                 egui::Frame::popup(ui.style()).show(ui, |ui| {
-                                                    ui.set_min_width(330.0);
+                                                    ui.set_min_width(340.0);
                                                     ui.horizontal(|ui| {
                                                         ui.weak(
                                                             egui::RichText::new(format!(
@@ -3488,6 +3603,47 @@ impl PacketlyApp {
                                                                         UiMsg::Selection(None),
                                                                     );
                                                                 }
+                                                            },
+                                                        );
+                                                    });
+                                                    // Selected-period summary strip (cumulative total + peak matching Y-axis)
+                                                    ui.horizontal(|ui| {
+                                                        ui.strong(
+                                                            egui::RichText::new(fmt_b(
+                                                                sd.total_in + sd.total_out,
+                                                            ))
+                                                            .size(12.5)
+                                                            .color(t.text),
+                                                        );
+                                                        ui.label(
+                                                            egui::RichText::new(format!(
+                                                                "↓ {}",
+                                                                fmt_b(sd.total_in)
+                                                            ))
+                                                            .size(11.0)
+                                                            .color(t.in_c),
+                                                        );
+                                                        ui.label(
+                                                            egui::RichText::new(format!(
+                                                                "↑ {}",
+                                                                fmt_b(sd.total_out)
+                                                            ))
+                                                            .size(11.0)
+                                                            .color(t.out_c),
+                                                        );
+                                                        ui.with_layout(
+                                                            egui::Layout::right_to_left(
+                                                                egui::Align::Center,
+                                                            ),
+                                                            |ui| {
+                                                                ui.label(
+                                                                    egui::RichText::new(format!(
+                                                                        "Peak {}",
+                                                                        fmt_b_unit(sel_peak, p.bucket)
+                                                                    ))
+                                                                    .size(10.5)
+                                                                    .color(t.dim),
+                                                                );
                                                             },
                                                         );
                                                     });
@@ -3533,18 +3689,19 @@ impl PacketlyApp {
                                                         .show(ui, |ui| {
                                                             for a in apps.iter().take(20) {
                                                                 ui.horizontal(|ui| {
-                                                                    if let Some(tex) = self
-                                                                        .app_icon_opt(
-                                                                            ctx, a.app_id, &a.name,
-                                                                        )
-                                                                    {
-                                                                        ui.add(
-                                                                            egui::Image::from_texture(&tex)
-                                                                                .max_size(egui::vec2(15.0, 15.0)),
-                                                                        );
-                                                                    } else {
-                                                                        ui.weak("·");
-                                                                    }
+                                                                    let icon = self.resolve_app_icon(
+                                                                        ctx, a.app_id, &a.name,
+                                                                    );
+                                                                    let (ir, _) = ui.allocate_exact_size(
+                                                                        egui::vec2(16.0, 16.0),
+                                                                        egui::Sense::hover(),
+                                                                    );
+                                                                    paint_resolved_app_icon(
+                                                                        ui.painter(),
+                                                                        ir,
+                                                                        &icon,
+                                                                        dark_theme,
+                                                                    );
                                                                     let lbl = ui.add(
                                                                         egui::Label::new(
                                                                             egui::RichText::new(&a.name).size(12.0),
@@ -3928,32 +4085,9 @@ impl PacketlyApp {
                                                 egui::Pos2::new(text_left + 9.0, content_cy),
                                                 egui::vec2(17.0, 17.0),
                                             );
-                                            if let Some(tex) =
-                                                app.app_icon_opt(ui.ctx(), *id, &row.label)
-                                            {
-                                                paint_icon_fit(&painter, &tex, ir);
-                                            } else {
-                                                painter.rect_filled(ir, 3.5, t.card2);
-                                                painter.rect_stroke(
-                                                    ir,
-                                                    3.5,
-                                                    egui::Stroke::new(0.8, t.border),
-                                                );
-                                                let ch = row
-                                                    .label
-                                                    .chars()
-                                                    .next()
-                                                    .unwrap_or('?')
-                                                    .to_uppercase()
-                                                    .to_string();
-                                                painter.text(
-                                                    ir.center(),
-                                                    egui::Align2::CENTER_CENTER,
-                                                    ch,
-                                                    egui::FontId::proportional(10.0),
-                                                    t.dim,
-                                                );
-                                            }
+                                            let icon =
+                                                app.resolve_app_icon(ui.ctx(), *id, &row.label);
+                                            paint_resolved_app_icon(&painter, ir, &icon, dark_theme);
                                             text_left += 24.0;
                                         }
                                         RowIcon::Flag(code) => {
@@ -4565,13 +4699,8 @@ impl PacketlyApp {
                                         egui::Pos2::new(rr.left() + 9.0, rr.center().y),
                                         egui::vec2(18.0, 18.0),
                                     );
-                                    if let Some(tex) = app.app_icon_opt(ui.ctx(), top.id, &top.name)
-                                    {
-                                        paint_icon_fit(&p, &tex, ir);
-                                    } else {
-                                        p.rect_filled(ir, 3.5, inset_fill);
-                                        p.rect_stroke(ir, 3.5, egui::Stroke::new(0.8, t.border));
-                                    }
+                                    let icon = app.resolve_app_icon(ui.ctx(), top.id, &top.name);
+                                    paint_resolved_app_icon(&p, ir, &icon, dark_theme);
                                     let mut job = egui::text::LayoutJob::default();
                                     job.append(
                                         &top.name,
@@ -4732,40 +4861,9 @@ impl PacketlyApp {
                                             egui::Pos2::new(icon_x + 9.5, cy),
                                             egui::vec2(19.0, 19.0),
                                         );
-                                        if let Some(tex) =
-                                            app.app_icon_opt(ui.ctx(), row.id, &row.name)
-                                        {
-                                            paint_icon_fit(&painter, &tex, ir);
-                                        } else {
-                                            let badge_col = color_for(&row.id.to_string());
-                                            painter.rect_filled(
-                                                ir,
-                                                4.0,
-                                                srgb_alpha(badge_col, 0.22),
-                                            );
-                                            painter.rect_stroke(
-                                                ir,
-                                                4.0,
-                                                egui::Stroke::new(
-                                                    0.8,
-                                                    srgb_alpha(badge_col, 0.55),
-                                                ),
-                                            );
-                                            let ch = row
-                                                .name
-                                                .chars()
-                                                .next()
-                                                .unwrap_or('?')
-                                                .to_uppercase()
-                                                .to_string();
-                                            painter.text(
-                                                ir.center(),
-                                                egui::Align2::CENTER_CENTER,
-                                                ch,
-                                                egui::FontId::proportional(10.5),
-                                                badge_col,
-                                            );
-                                        }
+                                        let icon =
+                                            app.resolve_app_icon(ui.ctx(), row.id, &row.name);
+                                        paint_resolved_app_icon(&painter, ir, &icon, dark_theme);
 
                                         let text_left = icon_x + 26.0;
 
@@ -5227,23 +5325,17 @@ impl PacketlyApp {
                                                                 egui::vec2(15.0, 15.0),
                                                                 egui::Sense::hover(),
                                                             );
-                                                            if let Some(tex) = app.app_icon_opt(
+                                                            let icon = app.resolve_app_icon(
                                                                 ui.ctx(),
                                                                 aid,
                                                                 &q.app_name,
-                                                            ) {
-                                                                paint_icon_fit(
-                                                                    ui.painter(),
-                                                                    &tex,
-                                                                    ir,
-                                                                );
-                                                            } else {
-                                                                draw_globe_icon(
-                                                                    ui.painter(),
-                                                                    &ir,
-                                                                    t.dim,
-                                                                );
-                                                            }
+                                                            );
+                                                            paint_resolved_app_icon(
+                                                                ui.painter(),
+                                                                ir,
+                                                                &icon,
+                                                                dark_theme,
+                                                            );
                                                         } else {
                                                             let (ir, _) = ui.allocate_exact_size(
                                                                 egui::vec2(15.0, 15.0),
@@ -6017,9 +6109,9 @@ impl PacketlyApp {
                                             );
                                         }
 
-                                        // Fetch app icon texture before taking painter reference
-                                        let app_tex = e.app_id.and_then(|aid| {
-                                            self.app_icon_opt(ctx, aid, &parsed.app_display)
+                                        // Fetch app icon before taking painter reference
+                                        let app_icon = e.app_id.map(|aid| {
+                                            self.resolve_app_icon(ctx, aid, &parsed.app_display)
                                         });
 
                                         let painter = ui.painter_at(rect);
@@ -6043,12 +6135,12 @@ impl PacketlyApp {
                                             egui::Pos2::new(icon_x + 9.0, cy),
                                             egui::vec2(18.0, 18.0),
                                         );
-                                        if let Some(ref tex) = app_tex {
-                                            paint_icon_fit(&painter, tex, icon_slot);
+                                        if let Some(ref icon) = app_icon {
+                                            paint_resolved_app_icon(&painter, icon_slot, icon, dark);
                                         } else if matches!(e.kind, 2 | 3 | 4) && e.app_id.is_none() {
                                             draw_globe_icon(&painter, &icon_slot, t.accent);
                                         } else {
-                                            draw_default_app_window_icon(&painter, icon_slot, dark);
+                                            draw_no_icon_app(&painter, icon_slot, dark);
                                         }
 
                                         // 3. Right-aligned two-line metadata (category + exact clock time)
@@ -6622,7 +6714,7 @@ fn parse_alert(e: &EventRow) -> ParsedAlert {
         .as_str()
         .or_else(|| d["version"].as_str())
         .map(|s| s.to_string());
-    let app_display = e
+    let raw_display = e
         .app_name
         .clone()
         .or_else(|| d["name"].as_str().map(|s| s.to_string()))
@@ -6630,9 +6722,10 @@ fn parse_alert(e: &EventRow) -> ParsedAlert {
             if matches!(e.kind, 2 | 3 | 4) {
                 "All apps".to_string()
             } else {
-                "Unknown application".to_string()
+                "Background Traffic".to_string()
             }
         });
+    let app_display = clean_app_display(&raw_display);
 
     let mut extra: Option<String> = None;
     let segments: Vec<(String, bool)> = match e.kind {
@@ -6833,26 +6926,146 @@ fn draw_alert_badge(
     }
 }
 
-fn draw_default_app_window_icon(painter: &egui::Painter, slot: egui::Rect, dark: bool) {
-    let r = egui::Rect::from_center_size(slot.center(), egui::vec2(15.0, 13.0));
-    let body = if dark {
-        egui::Color32::from_rgb(232, 238, 248)
+enum AppIconKind {
+    Texture(egui::TextureHandle),
+    Unidentified,
+    MissingExe,
+}
+
+fn paint_resolved_app_icon(
+    painter: &egui::Painter,
+    slot: egui::Rect,
+    icon: &AppIconKind,
+    dark: bool,
+) {
+    match icon {
+        AppIconKind::Texture(tex) => paint_icon_fit(painter, tex, slot),
+        AppIconKind::Unidentified => draw_unidentified_proc_icon(painter, slot, dark),
+        AppIconKind::MissingExe => draw_no_icon_app(painter, slot, dark),
+    }
+}
+
+/// Distinct, polished icon for unidentified / domain-grouped system traffic:
+/// indigo-violet rounded badge with a luminous 3-node network constellation.
+fn draw_unidentified_proc_icon(painter: &egui::Painter, slot: egui::Rect, dark: bool) {
+    let s = slot.width().min(slot.height());
+    let r = egui::Rect::from_center_size(slot.center(), egui::vec2(s, s));
+    let rounding = (s * 0.24).clamp(3.0, 6.0);
+    let (bg, border, ring, spoke, node, core) = if dark {
+        (
+            egui::Color32::from_rgb(44, 34, 76),
+            egui::Color32::from_rgb(132, 102, 232),
+            srgb_alpha(egui::Color32::from_rgb(167, 139, 250), 0.24),
+            egui::Color32::from_rgb(167, 139, 250),
+            egui::Color32::from_rgb(196, 181, 253),
+            egui::Color32::from_rgb(237, 233, 254),
+        )
     } else {
-        egui::Color32::from_rgb(245, 248, 252)
+        (
+            egui::Color32::from_rgb(237, 233, 254),
+            egui::Color32::from_rgb(124, 58, 237),
+            srgb_alpha(egui::Color32::from_rgb(124, 58, 237), 0.20),
+            egui::Color32::from_rgb(124, 58, 237),
+            egui::Color32::from_rgb(109, 40, 217),
+            egui::Color32::from_rgb(91, 33, 182),
+        )
     };
-    let title = egui::Color32::from_rgb(76, 142, 232);
-    let border = if dark {
-        egui::Color32::from_rgb(120, 140, 175)
+    painter.rect_filled(r, rounding, bg);
+    painter.rect_stroke(r, rounding, egui::Stroke::new(1.0, border));
+
+    let c = r.center();
+    let rad = s * 0.28;
+    painter.circle_stroke(c, rad, egui::Stroke::new(0.8, ring));
+
+    // Three satellite endpoints (top, bottom-left, bottom-right)
+    let pts = [
+        egui::Pos2::new(c.x, c.y - rad),
+        egui::Pos2::new(c.x - rad * 0.88, c.y + rad * 0.56),
+        egui::Pos2::new(c.x + rad * 0.88, c.y + rad * 0.56),
+    ];
+    for p in pts {
+        painter.line_segment([c, p], egui::Stroke::new((s * 0.075).max(1.0), spoke));
+        painter.circle_filled(p, (s * 0.105).max(1.5), node);
+    }
+    painter.circle_filled(c, (s * 0.145).max(2.1), core);
+}
+
+/// Distinct, polished icon for real executables that lack an embedded icon:
+/// sleek ocean-cyan application window tile with a titlebar, status dots, and
+/// crisp terminal/code chevron glyph (`>_`) inside.
+fn draw_no_icon_app(painter: &egui::Painter, slot: egui::Rect, dark: bool) {
+    let s = slot.width().min(slot.height());
+    let r = egui::Rect::from_center_size(slot.center(), egui::vec2(s, s * 0.90));
+    let rounding = (s * 0.20).clamp(2.5, 5.0);
+    let (body, title, border, glyph, dot_a, dot_b) = if dark {
+        (
+            egui::Color32::from_rgb(18, 42, 62),
+            egui::Color32::from_rgb(42, 134, 206),
+            egui::Color32::from_rgb(56, 178, 240),
+            egui::Color32::from_rgb(148, 224, 255),
+            egui::Color32::from_rgb(198, 240, 255),
+            egui::Color32::from_rgb(125, 211, 252),
+        )
     } else {
-        egui::Color32::from_rgb(148, 163, 184)
+        (
+            egui::Color32::from_rgb(224, 242, 254),
+            egui::Color32::from_rgb(2, 132, 199),
+            egui::Color32::from_rgb(14, 116, 176),
+            egui::Color32::from_rgb(3, 105, 161),
+            egui::Color32::from_rgb(224, 242, 254),
+            egui::Color32::from_rgb(186, 230, 253),
+        )
     };
-    painter.rect_filled(r, 2.0, body);
+    painter.rect_filled(r, rounding, body);
+
+    let bar_h = (r.height() * 0.30).max(3.6);
+    let bar = egui::Rect::from_min_max(r.min, egui::Pos2::new(r.max.x, r.min.y + bar_h));
     painter.rect_filled(
-        egui::Rect::from_min_max(r.min, egui::Pos2::new(r.max.x, r.min.y + 3.5)),
-        1.5,
+        bar,
+        egui::Rounding {
+            nw: rounding,
+            ne: rounding,
+            sw: 0.0,
+            se: 0.0,
+        },
         title,
     );
-    painter.rect_stroke(r, 2.0, egui::Stroke::new(0.8, border));
+    // Tiny window-bar indicator dots
+    let dot_r = (s * 0.055).max(0.9);
+    let dot_y = bar.center().y;
+    painter.circle_filled(egui::Pos2::new(r.left() + s * 0.19, dot_y), dot_r, dot_a);
+    painter.circle_filled(egui::Pos2::new(r.left() + s * 0.34, dot_y), dot_r, dot_b);
+
+    // Crisp `>_` executable prompt glyph in the window body
+    let body_top = r.min.y + bar_h;
+    let body_cy = (body_top + r.max.y) * 0.5 + 0.3;
+    let stroke = egui::Stroke::new((s * 0.085).max(1.15), glyph);
+    let chev_l = r.left() + s * 0.22;
+    let chev_r = r.left() + s * 0.43;
+    let chev_dy = r.height() * 0.14;
+    painter.line_segment(
+        [
+            egui::Pos2::new(chev_l, body_cy - chev_dy),
+            egui::Pos2::new(chev_r, body_cy),
+        ],
+        stroke,
+    );
+    painter.line_segment(
+        [
+            egui::Pos2::new(chev_r, body_cy),
+            egui::Pos2::new(chev_l, body_cy + chev_dy),
+        ],
+        stroke,
+    );
+    painter.line_segment(
+        [
+            egui::Pos2::new(r.left() + s * 0.52, body_cy + chev_dy),
+            egui::Pos2::new(r.right() - s * 0.20, body_cy + chev_dy),
+        ],
+        stroke,
+    );
+
+    painter.rect_stroke(r, rounding, egui::Stroke::new(0.95, border));
 }
 
 fn draw_calendar_mini_icon(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
@@ -7255,7 +7468,7 @@ fn main() -> eframe::Result {
     let mut theme_kind = ThemeKind::Dark;
     let mut zoom = 1.0_f32;
     let mut auto_scale = true;
-    let mut scale_cap = 1_048_576.0_f64;
+    let mut scale_cap = 1_000_000.0_f64;
     let mut start_minimized = false;
     if let Ok(s) = std::fs::read_to_string(prefs_file()) {
         for line in s.lines() {
@@ -7274,7 +7487,7 @@ fn main() -> eframe::Result {
                 }
                 "zoom" => zoom = v.trim().parse().unwrap_or(1.0),
                 "autoscale" => auto_scale = v.trim() != "0",
-                "scalecap" => scale_cap = v.trim().parse().unwrap_or(1_048_576.0),
+                "scalecap" => scale_cap = v.trim().parse().unwrap_or(1_000_000.0),
                 "startmin" => start_minimized = v.trim() != "0",
                 "theme" => {
                     theme_kind = match v.trim() {
@@ -7349,7 +7562,7 @@ fn main() -> eframe::Result {
                             }
                             Some((t0, t1)) => {
                                 let hosts = fetch_json(&format!(
-                                    "{}/api/hosts?from={}&to={}&limit=4",
+                                    "{}/api/hosts?range=custom&from={}&to={}&limit=4",
                                     API, t0 as i64, t1 as i64
                                 ))
                                 .ok()
@@ -7373,27 +7586,48 @@ fn main() -> eframe::Result {
                                     })
                                 })
                                 .unwrap_or_default();
-                                // apps with host counts for the selection table
-                                let apps = fetch_json(&format!(
+                                // apps with host counts + exact totals for the selected period
+                                let applist_json = fetch_json(&format!(
                                     "{}/api/applist?from={}&to={}&limit=50",
                                     API, t0 as i64, t1 as i64
                                 ))
-                                .ok()
-                                .and_then(|d| {
-                                    d["apps"].as_array().map(|arr| {
-                                        arr.iter()
-                                            .map(|a| SelApp {
-                                                app_id: a["appId"].as_i64().unwrap_or(0),
-                                                name: a["name"].as_str().unwrap_or("?").to_string(),
-                                                host_count: a["hostCount"].as_i64().unwrap_or(0),
-                                                in_bytes: a["inBytes"].as_f64().unwrap_or(0.0),
-                                                out_bytes: a["outBytes"].as_f64().unwrap_or(0.0),
-                                            })
-                                            .collect()
+                                .ok();
+                                let apps: Vec<SelApp> = applist_json
+                                    .as_ref()
+                                    .and_then(|d| {
+                                        d["apps"].as_array().map(|arr| {
+                                            arr.iter()
+                                                .map(|a| SelApp {
+                                                    app_id: a["appId"].as_i64().unwrap_or(0),
+                                                    name: clean_app_display(
+                                                        a["name"].as_str().unwrap_or("?"),
+                                                    ),
+                                                    host_count: a["hostCount"].as_i64().unwrap_or(0),
+                                                    in_bytes: a["inBytes"].as_f64().unwrap_or(0.0),
+                                                    out_bytes: a["outBytes"].as_f64().unwrap_or(0.0),
+                                                })
+                                                .collect()
+                                        })
                                     })
-                                })
-                                .unwrap_or_default();
-                                sel_data = Some(SelData { t0, t1, hosts, apps });
+                                    .unwrap_or_default();
+                                let fallback_in: f64 = apps.iter().map(|a| a.in_bytes).sum();
+                                let fallback_out: f64 = apps.iter().map(|a| a.out_bytes).sum();
+                                let total_in = applist_json
+                                    .as_ref()
+                                    .and_then(|d| d["totalIn"].as_f64())
+                                    .unwrap_or(fallback_in);
+                                let total_out = applist_json
+                                    .as_ref()
+                                    .and_then(|d| d["totalOut"].as_f64())
+                                    .unwrap_or(fallback_out);
+                                sel_data = Some(SelData {
+                                    t0,
+                                    t1,
+                                    total_in,
+                                    total_out,
+                                    hosts,
+                                    apps,
+                                });
                                 paused_dirty = true;
                             }
                         },
@@ -7797,13 +8031,8 @@ impl PacketlyApp {
                                 egui::vec2(24.0, 24.0),
                                 egui::Sense::hover(),
                             );
-                            if let Some(tex) =
-                                self.app_icon_opt(ctx, d.app_id, &d.name)
-                            {
-                                paint_icon_fit(ui.painter(), &tex, icon_rect);
-                            } else {
-                                draw_default_app_window_icon(ui.painter(), icon_rect, dark);
-                            }
+                            let icon = self.resolve_app_icon(ctx, d.app_id, &d.name);
+                            paint_resolved_app_icon(ui.painter(), icon_rect, &icon, dark);
                             ui.strong(egui::RichText::new(&d.name).size(14.0).color(t.text));
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),

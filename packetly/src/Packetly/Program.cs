@@ -266,6 +266,12 @@ static (Db Db, TrafficRing Ring, ProcessTracker Tracker, AppRegistry Registry, T
 StartPipeline(string dbPath, string mode)
 {
     var db = new Db(dbPath);
+    try
+    {
+        var merged = db.ConsolidateUnidentifiedApps();
+        if (merged.Count > 0) Log($"consolidated {merged.Count} legacy unidentified process rows by domain");
+    }
+    catch (Exception ex) { Log($"[consolidate] {ex.Message}"); }
     var tracker = new ProcessTracker();
     tracker.Refresh();
     var registry = new AppRegistry(db);
@@ -425,10 +431,14 @@ async Task<int> RunServeAsync(string dbPath, string mode, int port, bool elevate
     }
     catch { /* nothing serving - continue with a fresh pipeline */ }
 
-    var (db, _, tracker, _, writer, etw, poll, usedMode) = StartPipeline(dbPath, mode);
+    var (db, _, tracker, registry, writer, etw, poll, usedMode) = StartPipeline(dbPath, mode);
     Log($"collector: {usedMode}");
     var aggregator = new Aggregator(db);
-    var resolver = new HostResolver(db);
+    var resolver = new HostResolver(db, () =>
+    {
+        var removed = db.ConsolidateUnidentifiedApps();
+        if (removed.Count > 0) registry.InvalidatePaths(removed);
+    });
     var alerts = new AlertEngine(db);
     var geoip = new GeoIpJob(db);
     db.AppCreated += (id, path) =>
@@ -482,7 +492,7 @@ async Task<int> RunServeAsync(string dbPath, string mode, int port, bool elevate
         while (!ct.IsCancellationRequested)
         {
             try { aggregator.RunCycle(DateTimeOffset.UtcNow.ToUnixTimeSeconds()); } catch (Exception ex) { Log($"[aggregator] {ex.Message}"); }
-            try { await Task.Delay(30000, ct); } catch (OperationCanceledException) { break; }
+            try { await Task.Delay(15000, ct); } catch (OperationCanceledException) { break; }
         }
     });
 
